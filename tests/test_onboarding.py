@@ -65,6 +65,23 @@ def _stub_db(monkeypatch, *, healthy: bool, schema_ok: bool = True) -> None:
     monkeypatch.setattr("inflorescence.db.schema.schema_present", fake_schema)
 
 
+def _stub_scip(monkeypatch, runner: str) -> None:
+    """Pin what `doctor` sees for the SCIP rung.
+
+    Without this the check reads the *host*: a machine with Docker reports "docker",
+    a bare CI runner reports "none". Asserting on that makes the outcome depend on
+    which runner picked the job up — the macOS runner has no Docker and reddened a
+    green suite over a documented, non-critical degradation.
+    """
+
+    def fake_availability(config) -> dict[str, str]:
+        return {"go": runner, "python": runner, "typescript": runner}
+
+    monkeypatch.setattr(
+        "inflorescence.code_indexer.scip_semantic.indexer_availability", fake_availability
+    )
+
+
 async def test_doctor_flags_missing_api_key(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -97,12 +114,34 @@ async def test_doctor_all_green(monkeypatch, tmp_path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("OPENROUTER_API_KEY", "k")
     _stub_db(monkeypatch, healthy=True, schema_ok=True)
+    _stub_scip(monkeypatch, "docker")
 
     from inflorescence.__main__ import _doctor_checks
     from inflorescence.config import Settings
 
     results = await _doctor_checks(Settings())
     assert all(r.ok for r in results)
+
+
+async def test_doctor_stays_green_without_any_scip_indexer(monkeypatch, tmp_path) -> None:
+    """No Docker and no indexer binary is a degradation, not a fault.
+
+    The rung is reported so "why are my CALLS heuristic" has an answer, but it must
+    never be critical: `doctor` still exits 0 on a machine that will index perfectly
+    well through the syntactic ladder.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    _stub_db(monkeypatch, healthy=True, schema_ok=True)
+    _stub_scip(monkeypatch, "none")
+
+    from inflorescence.__main__ import _doctor_checks
+    from inflorescence.config import Settings
+
+    results = {r.name: r for r in await _doctor_checks(Settings())}
+    assert results["SCIP indexers"].ok is False
+    assert results["SCIP indexers"].critical is False
+    assert all(r.ok for r in results.values() if r.critical)
 
 
 def test_cmd_doctor_returns_1_on_critical_failure(monkeypatch, tmp_path, capsys) -> None:
