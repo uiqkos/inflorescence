@@ -1,0 +1,73 @@
+# Auto Claude data directory
+.auto-claude/
+
+# Auto Claude generated files
+.auto-claude-security.json
+.auto-claude-status
+.claude_settings.json
+.worktrees/
+.security-key
+logs/security/
+
+# Local configuration and secrets
+.env
+.mcp.json
+
+# Python/build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+
+# Runtime logs
+*.log
+sess.jsonl
+pi-session-*.html
+
+# Local UI/editor state
+.perles/
+
+# Local fixture repositories used for manual/e2e validation
+test-repos/
+vibe-driven-assistant/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*.swp
+
+# Issue tracker + internal agent planning docs (not part of the public release)
+.beads/
+docs/superpowers/
+
+# Local benchmark dataset — built from personal Claude-trace sessions; contains
+# private paths, emails, and pasted secrets. NEVER publish.
+/eval/claude_trace_dataset/
+
+# Local agent tooling and scratch (not part of the public release)
+.claude/
+.codex/
+cineraria/
+.gstack/
+.playwright-mcp/
+# Agent task briefs and raw review diffs. Only ever protected by a nested
+# .superpowers/sdd/.gitignore before — anything written to .superpowers/ itself,
+# or to a new subdirectory, was one `git add -A` from being committed.
+.superpowers/
+
+# invariant-fix orchestrator run artifacts
+.orchestrator-sessions/
+.orchestrator-logs/
+
+# Design/research memos. Contain client project analysis, personal paths, and
+# third-party names. Untracked but unignored until now, so both `git add -A` and
+# `uv build` (which sweeps everything not ignored into the sdist) picked them up.
+/research/
+
+# Not this project's file. A JS manifest belonging to an unrelated application was
+# committed here once by accident; keep the path ignored so it cannot recur.
+/package.json
+node_modules/

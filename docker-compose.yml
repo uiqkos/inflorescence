@@ -1,0 +1,32 @@
+services:
+  memgraph:
+    image: memgraph/memgraph-mage:latest
+    ports:
+      - "7687:7687"
+    volumes:
+      - mg_data:/var/lib/memgraph
+    command:
+      - "--storage-snapshot-on-exit=true"
+      - "--storage-snapshot-interval-sec=300"
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  lab:
+    image: memgraph/lab:latest
+    ports:
+      - "3000:3000"
+    depends_on:
+      memgraph:
+        condition: service_healthy
+    environment:
+      - QUICK_CONNECT_MG_HOST=memgraph
+      - QUICK_CONNECT_MG_PORT=7687
+    restart: unless-stopped
+
+volumes:
+  mg_data:

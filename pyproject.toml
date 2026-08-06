@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inflorescence"
+dynamic = ["version"]
+description = "MCP server for code intelligence: AST parsing, graph storage in Memgraph, RAG search"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Kirill" }]
+keywords = ["mcp", "code-intelligence", "code-graph", "rag", "memgraph"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mcp[cli]==1.27.0",
+    "neo4j==6.1.0",
+    "openai==2.33.0",
+    "tenacity==9.1.4",
+    "pydantic==2.13.3",
+    "pydantic-settings==2.14.0",
+    "llama-index-core==0.14.21",
+    "tree-sitter==0.25.2",
+    "tree-sitter-javascript==0.25.0",
+    "tree-sitter-typescript==0.23.2",
+    "tree-sitter-go==0.25.0",
+    "tree-sitter-rust==0.24.2",
+    "watchdog==6.0.0",
+    "pathspec==1.1.1",
+    "starlette==1.0.0",
+    "uvicorn==0.46.0",
+    "tree-sitter-language-pack==1.13.7",
+]
+
+[project.scripts]
+inflorescence = "inflorescence.__main__:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "ruff==0.15.12",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/inflorescence"]
+
+# Explicit allowlist. Without it hatchling sweeps every path not matched by
+# .gitignore into the sdist — which silently included local research memos and
+# agent scratch directories. PyPI sdists are immutable, so an accidental include
+# cannot be withdrawn after upload; enumerate what ships instead of excluding
+# what must not.
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/docs",
+    "/docker",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/.env.example",
+    "/docker-compose.yml",
+]
+
+[tool.hatch.version]
+path = "src/inflorescence/__init__.py"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+src = ["src", "tests"]
+extend-exclude = ["test-repos", "vibe-driven-assistant"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

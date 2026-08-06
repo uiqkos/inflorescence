@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inflorescence</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✿</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..600;1,9..144,300..500&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="/static/app.css">
+<script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.11.1/highlight.min.js"></script>
+<script src="/static/vendor/force-graph.min.js"></script>
+<script src="/static/graph-forces.js"></script>
+<script src="/static/graph-record.js"></script>
+</head>
+<body>
+<header id="topbar">
+  <a class="brand" href="#" id="brand"><span class="mark">✿</span>inflorescence</a>
+  <nav id="nav">
+    <a data-view="overview" href="#">Overview</a>
+    <a data-view="explorer" href="#">Explorer</a>
+    <a data-view="graph" href="#">Graph</a>
+    <a data-view="query" href="#">Query</a>
+    <a data-view="tools" href="#">Tools</a>
+  </nav>
+  <select id="project-select" title="Switch project"></select>
+  <span id="live-badge" class="hidden" title="Indexing in progress">
+    <span class="pulse-dot"></span>
+    <span id="live-badge-text">indexing</span>
+    <span class="live-track"><span id="live-fill"></span></span>
+  </span>
+  <div id="search-wrap">
+    <input id="search-input" type="text" placeholder="Search entities   /" autocomplete="off" spellcheck="false">
+    <div id="search-results" class="hidden"></div>
+  </div>
+</header>
+
+<main id="main">
+  <section id="view-empty" class="view hidden">
+    <div class="hero">
+      <div class="hero-mark">✿</div>
+      <h1>No indexed projects yet</h1>
+      <p>Index a repository first, then come back:</p>
+      <pre class="hero-code">inflorescence index /path/to/repo</pre>
+      <p class="dim" id="empty-status"></p>
+    </div>
+  </section>
+
+  <section id="view-overview" class="view hidden"></section>
+
+  <section id="view-explorer" class="view hidden">
+    <aside id="tree-pane">
+      <div id="tree-header">
+        <span>Structure</span>
+        <button id="tree-collapse" class="ghost-btn" title="Collapse all">⊟</button>
+      </div>
+      <div id="tree"></div>
+    </aside>
+    <div id="entity-pane">
+      <div id="entity-content" class="dim pad">Select an entity from the tree.</div>
+    </div>
+  </section>
+
+  <section id="view-graph" class="view hidden">
+    <div id="graph-toolbar">
+      <span class="tb-label" id="graph-scope">Modules overview</span>
+      <span class="tb-sep"></span>
+      <label class="tb-label">level
+        <select id="graph-level">
+          <option value="modules">modules</option>
+          <option value="all">all entities</option>
+        </select>
+      </label>
+      <label class="tb-label" id="depth-wrap">depth
+        <select id="graph-depth"><option>1</option><option selected>2</option><option>3</option></select>
+      </label>
+      <span class="tb-sep"></span>
+      <span id="graph-rels"></span>
+      <span class="tb-sep"></span>
+      <label class="tb-label" title="Show only entities that already have a summary — during indexing the graph grows batch by batch">
+        <input type="checkbox" id="graph-summarized" checked> summarized
+      </label>
+      <span class="tb-sep"></span>
+      <label class="tb-label">layout
+        <select id="graph-layout">
+          <option value="force">force</option>
+          <option value="td">tree</option>
+          <option value="radialout">radial</option>
+        </select>
+      </label>
+      <button id="graph-overview-btn" class="tb-btn">Whole project</button>
+      <button id="graph-fit" class="tb-btn">Fit</button>
+      <button id="graph-gfx" class="tb-btn" title="Display settings — clustering, colours, animation">⚙</button>
+      <button id="graph-replay" class="tb-btn" title="Replay how this graph grew — animation only, nothing is re-read or re-indexed">▶ Replay</button>
+      <button id="graph-rec" class="tb-btn" title="Record the replay to a video file">⏺</button>
+      <button id="graph-png" class="tb-btn">PNG</button>
+      <span id="graph-count" class="tb-label dim"></span>
+    </div>
+    <div id="graph-body">
+      <div id="graph-canvas-wrap">
+        <div id="graph-canvas"></div>
+        <div id="graph-legend"></div>
+        <div id="gfx-panel" class="hidden">
+          <div class="gfx-head">
+            <span class="gfx-title">Display</span>
+            <span class="grow"></span>
+            <button id="gfx-reset" class="ghost-btn" title="Restore defaults">reset</button>
+            <button id="gfx-close" class="ghost-btn" title="Close">✕</button>
+          </div>
+          <div id="gfx-body"></div>
+        </div>
+        <div id="graph-hint" class="dim">Tip: click a node for details · double-click to expand its neighbors</div>
+        <div id="replay-bar" class="hidden">
+          <button id="replay-toggle" class="ghost-btn" title="Pause / resume">❚❚</button>
+          <span class="replay-track"><span id="replay-fill"></span></span>
+          <span id="replay-label" class="mono"></span>
+          <span id="replay-now" class="mono"></span>
+          <label class="tb-label">speed
+            <select id="replay-speed">
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
+              <option value="2">2×</option>
+              <option value="4">4×</option>
+            </select>
+          </label>
+          <button id="replay-stop" class="ghost-btn" title="Stop and restore the graph (Esc)">✕</button>
+        </div>
+      </div>
+      <aside id="graph-side" class="hidden">
+        <div id="graph-side-content"></div>
+      </aside>
+    </div>
+  </section>
+
+  <section id="view-query" class="view hidden">
+    <div id="query-pane">
+      <div id="query-controls">
+        <select id="query-presets"></select>
+        <button id="query-run" class="tb-btn accent">Run ⌘⏎</button>
+        <span class="dim tb-label">read-only · every MATCH must be scoped with <code>{project: $project}</code> · LIMIT is added automatically</span>
+      </div>
+      <textarea id="query-input" rows="6" spellcheck="false">MATCH (n:Code {project: $project})
+RETURN n.name AS name, labels(n) AS labels, n.file_path AS file
+ORDER BY file</textarea>
+      <div id="query-status" class="dim"></div>
+      <div id="query-graph-btn-wrap"></div>
+      <div id="query-results"></div>
+    </div>
+  </section>
+
+  <section id="view-tools" class="view hidden">
+    <aside id="tools-pane">
+      <div id="tools-header">
+        <span>MCP tools</span>
+        <span id="tools-count" class="dim"></span>
+      </div>
+      <div id="tools-list"></div>
+      <div id="tools-runs-header">Recent calls</div>
+      <div id="tools-runs"></div>
+    </aside>
+    <div id="tool-pane">
+      <div id="tool-content" class="dim pad">Select a tool to call it.</div>
+    </div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>
