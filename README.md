@@ -439,11 +439,15 @@ rather than by matching names.
 **You do not install them.** If Docker is available, the indexer runs in a container that
 already carries the toolchain it needs, with the repository mounted **read-only**:
 
-| Language | Indexer | Image | Installed by hand instead |
-|---|---|---|---|
-| Go | `scip-go` | `inflorescence-scip-go` | `go install github.com/scip-code/scip-go/cmd/scip-go@latest` |
-| Python | `scip-python` | `inflorescence-scip-node` | `npm install -g @sourcegraph/scip-python` |
-| TypeScript / JavaScript | `scip-typescript` | `inflorescence-scip-node` | `npm install -g @sourcegraph/scip-typescript` |
+| Language | Indexer | Version | Image | Installed by hand instead |
+|---|---|---|---|---|
+| Go | `scip-go` | 0.2.7 | `inflorescence-scip-go` | `go install github.com/scip-code/scip-go/cmd/scip-go@v0.2.7` |
+| Python | `scip-python` | 0.6.6 | `inflorescence-scip-node` | `npm install -g @sourcegraph/scip-python@0.6.6` |
+| TypeScript / JavaScript | `scip-typescript` | 0.4.0 | `inflorescence-scip-node` | `npm install -g @sourcegraph/scip-typescript@0.4.0` |
+
+The versions are pinned in the Dockerfiles, so a rebuild of the same Dockerfile installs the
+same indexers — that is what makes "build the image yourself" (below) a meaningful
+alternative to pulling ours.
 
 A binary already on `PATH` wins — it is faster, with no container to start. `SCIP_RUNNER`
 pins one rung (`auto`, the default, `native`, or `docker`); `SCIP_IMAGES` overrides an image.
