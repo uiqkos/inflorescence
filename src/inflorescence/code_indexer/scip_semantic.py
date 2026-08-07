@@ -71,8 +71,8 @@ _PROVENANCE = {"go": "scip-go", "python": "scip-python", "typescript": "scip-typ
 # `docker buildx imagetools inspect ghcr.io/uiqkos/inflorescence-scip-go:v1`.
 _SCIP_GO_IMAGE_TAG = "ghcr.io/uiqkos/inflorescence-scip-go:v1"
 _SCIP_NODE_IMAGE_TAG = "ghcr.io/uiqkos/inflorescence-scip-node:v1"
-_SCIP_GO_IMAGE = "ghcr.io/uiqkos/inflorescence-scip-go@sha256:cbe9473b3dff35bbd86c3bca0838304173eb6e1e6bb55110715fcb2f608241dd"
-_SCIP_NODE_IMAGE = "ghcr.io/uiqkos/inflorescence-scip-node@sha256:393d45d7ebb00781094d84498e80254dfe5615c4f75ae9312679f92e0d748c28"
+_SCIP_GO_IMAGE = "ghcr.io/uiqkos/inflorescence-scip-go@sha256:bd6362c43e50f25a6a350842042843b07f9cb7d9d98b09090d2ff3e1dd378758"
+_SCIP_NODE_IMAGE = "ghcr.io/uiqkos/inflorescence-scip-node@sha256:01b1eab646e92bc3fe4b09edc54931368385d54a0f8d23b615ae6ab63394005c"
 _DEFAULT_IMAGE_TAGS: dict[str, str] = {
     "go": _SCIP_GO_IMAGE_TAG,
     "python": _SCIP_NODE_IMAGE_TAG,
