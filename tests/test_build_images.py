@@ -49,7 +49,9 @@ def test_packaged_dockerfiles_pin_indexer_versions() -> None:
     assert "@sourcegraph/scip-typescript@" in node, "scip-typescript is not version-pinned"
     assert "@sourcegraph/scip-python@" in node, "scip-python is not version-pinned"
     for text, name in ((go, "scip-go"), (node, "scip-node")):
-        assert "@latest" not in text, f"{name}.Dockerfile still installs @latest"
+        # comments may discuss @latest; the instructions themselves must not use it
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        assert "@latest" not in code, f"{name}.Dockerfile still installs @latest"
 
 
 def test_build_argv_tags_exactly_what_the_docker_rung_expects() -> None:
