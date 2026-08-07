@@ -8,9 +8,11 @@
 # would be the wrong call, since musl forces source builds where manylinux wheels exist.
 FROM node:22-alpine
 
+# Versions pinned so that two builds of this file produce the same indexers — "build it
+# yourself and compare" is meaningless against a moving latest.
 RUN npm install -g --omit=dev \
-      @sourcegraph/scip-typescript \
-      @sourcegraph/scip-python \
+      @sourcegraph/scip-typescript@0.4.0 \
+      @sourcegraph/scip-python@0.6.6 \
  && npm cache clean --force
 
 # scip-python shells out to `pip list` to enumerate the environment and to `git` for version

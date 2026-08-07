@@ -12,8 +12,10 @@
 FROM golang:1.25-alpine
 
 # git: the module loader fetches dependencies of the repository being indexed.
+# The indexer version is pinned so that two builds of this file produce the same binary —
+# "build it yourself and compare" is meaningless against a moving @latest.
 RUN apk add --no-cache git ca-certificates \
- && go install github.com/scip-code/scip-go/cmd/scip-go@latest \
+ && go install github.com/scip-code/scip-go/cmd/scip-go@v0.2.7 \
  && rm -rf /go/pkg/mod /root/.cache/go-build
 
 # The repository is mounted read-only, so every cache has to live somewhere writable. These

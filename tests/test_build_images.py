@@ -38,6 +38,20 @@ def test_dockerfiles_ship_inside_the_package() -> None:
         assert "src/inflorescence/docker" in str(dockerfile) or "inflorescence/docker" in str(dockerfile)
 
 
+def test_packaged_dockerfiles_pin_indexer_versions() -> None:
+    """@latest would make "build it yourself and compare" meaningless. CI runs this from
+    the committed tree, so a pin that exists only in a working copy fails here."""
+    from inflorescence.__main__ import packaged_dockerfile
+
+    go = packaged_dockerfile("scip-go").read_text()
+    assert "/scip-go@v" in go, "scip-go install is not version-pinned"
+    node = packaged_dockerfile("scip-node").read_text()
+    assert "@sourcegraph/scip-typescript@" in node, "scip-typescript is not version-pinned"
+    assert "@sourcegraph/scip-python@" in node, "scip-python is not version-pinned"
+    for text, name in ((go, "scip-go"), (node, "scip-node")):
+        assert "@latest" not in text, f"{name}.Dockerfile still installs @latest"
+
+
 def test_build_argv_tags_exactly_what_the_docker_rung_expects() -> None:
     from inflorescence.__main__ import build_image_argv
     from inflorescence.code_indexer import scip_semantic as ss
