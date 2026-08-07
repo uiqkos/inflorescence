@@ -155,6 +155,48 @@ def test_digest_pin_is_used_when_no_local_tag_exists(monkeypatch, tmp_path: Path
     assert digest in invocation.argv
 
 
+def test_default_pins_are_digests_and_tags_are_tags() -> None:
+    """The pull path must be immutable (a registry tag can be re-pointed, a digest cannot);
+    the human path must stay a tag (it is what `build-images` creates and docs show)."""
+    from inflorescence.code_indexer import scip_semantic as ss
+
+    for language, pin in ss._DEFAULT_IMAGES.items():
+        assert "@sha256:" in pin, f"{language} pin is not a digest reference: {pin}"
+    for language, tag in ss._DEFAULT_IMAGE_TAGS.items():
+        assert "@" not in tag and tag.endswith(":v1"), f"{language} tag is not a plain tag: {tag}"
+        # digest and tag must name the same repository, or the local-tag preference
+        # would silently switch to a different image
+        assert ss._DEFAULT_IMAGES[language].split("@")[0] == tag.split(":")[0]
+
+
+def test_image_availability_dedups_the_shared_node_image(monkeypatch) -> None:
+    """python and typescript run the same image; `doctor` must show one row for it, and
+    the go image separately, each with its locality."""
+    from inflorescence.code_indexer import scip_semantic as ss
+    from inflorescence.code_indexer.models import IndexerConfig
+
+    monkeypatch.setattr(ss.shutil, "which", lambda name: None)
+    monkeypatch.setattr(ss, "docker_cli_present", lambda: True)
+    monkeypatch.setattr(ss, "_local_image_present", lambda image: True)
+
+    report = {s.image: s for s in ss.image_availability(IndexerConfig())}
+    assert len(report) == 2
+    node = report[ss._DEFAULT_IMAGE_TAGS["python"]]
+    assert sorted(node.languages) == ["python", "typescript"]
+    assert node.local is True
+    assert report[ss._DEFAULT_IMAGE_TAGS["go"]].languages == ["go"]
+
+
+def test_image_availability_is_empty_without_a_docker_rung(monkeypatch) -> None:
+    from inflorescence.code_indexer import scip_semantic as ss
+    from inflorescence.code_indexer.models import IndexerConfig
+
+    monkeypatch.setattr(ss.shutil, "which", lambda name: "/usr/local/bin/anything")
+    monkeypatch.setattr(ss, "docker_cli_present", lambda: False)
+
+    assert ss.image_availability(IndexerConfig()) == []
+
+
 def test_scip_images_override_is_never_rewritten_to_a_local_tag(monkeypatch, tmp_path: Path) -> None:
     """`SCIP_IMAGES` is the user's word; the local-tag preference applies only to our own
     default pin."""

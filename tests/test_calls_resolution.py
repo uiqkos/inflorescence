@@ -10,6 +10,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from inflorescence.code_indexer import scip_semantic as _scip_semantic
 from inflorescence.code_indexer.graph_builder import _merge_semantic_calls
 from inflorescence.code_indexer.models import (
     CallResolution,
@@ -32,6 +35,18 @@ from inflorescence.code_indexer.scip_semantic import (
     run_scip_indexer,
     semantic_calls_pass,
 )
+
+
+@pytest.fixture(autouse=True)
+def _no_docker_probe(monkeypatch):
+    """Keep unit tests off the host's docker daemon.
+
+    With the default images pinned by digest, choosing the docker rung consults the local
+    daemon for a locally built tag (`_prefer_local_tag`). Real daemon state would make
+    the resolved reference depend on which machine ran the suite — same reason
+    `_stub_scip` exists in test_onboarding.py.
+    """
+    monkeypatch.setattr(_scip_semantic, "_local_image_present", lambda image: False)
 
 
 def _parse_project(parser, root: Path, files: list[Path]):

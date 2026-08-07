@@ -64,14 +64,15 @@ _PROVENANCE = {"go": "scip-go", "python": "scip-python", "typescript": "scip-typ
 # never pulls the Go image.
 #
 # Two forms of the same reference. The tag is what `inflorescence build-images` creates and
-# what the documentation shows; the pin is what gets pulled when nothing local exists. Once
-# the pin is a digest (after a CI build; update with
-# `docker buildx imagetools inspect ghcr.io/uiqkos/inflorescence-scip-go:v1`), the two
-# diverge: a tag can be silently re-pointed in the registry, a digest cannot.
+# what the documentation shows; the digest pin is what gets pulled when nothing local
+# exists — a tag can be silently re-pointed in the registry, a digest cannot. The digests
+# are the manifest-list digests of the CI build (.github/workflows/images.yml); after
+# rebuilding there, update them from the workflow's "Print the digest to pin" step, or with
+# `docker buildx imagetools inspect ghcr.io/uiqkos/inflorescence-scip-go:v1`.
 _SCIP_GO_IMAGE_TAG = "ghcr.io/uiqkos/inflorescence-scip-go:v1"
 _SCIP_NODE_IMAGE_TAG = "ghcr.io/uiqkos/inflorescence-scip-node:v1"
-_SCIP_GO_IMAGE = _SCIP_GO_IMAGE_TAG
-_SCIP_NODE_IMAGE = _SCIP_NODE_IMAGE_TAG
+_SCIP_GO_IMAGE = "ghcr.io/uiqkos/inflorescence-scip-go@sha256:cbe9473b3dff35bbd86c3bca0838304173eb6e1e6bb55110715fcb2f608241dd"
+_SCIP_NODE_IMAGE = "ghcr.io/uiqkos/inflorescence-scip-node@sha256:393d45d7ebb00781094d84498e80254dfe5615c4f75ae9312679f92e0d748c28"
 _DEFAULT_IMAGE_TAGS: dict[str, str] = {
     "go": _SCIP_GO_IMAGE_TAG,
     "python": _SCIP_NODE_IMAGE_TAG,
@@ -459,6 +460,42 @@ def indexer_availability(config: IndexerConfig) -> dict[str, str]:
         invocation = resolve_scip_invocation(language, Path("."), Path("."), config)
         availability[language] = invocation.runner if invocation else "none"
     return availability
+
+
+@dataclass
+class ImageStatus:
+    """One container image the docker rung would run, for `doctor` to show.
+
+    `local` is the line that answers "what exactly will execute on my machine": a locally
+    present reference is used by `docker run` with no registry contact at all, an absent
+    one is pulled once on first use.
+    """
+
+    image: str
+    languages: list[str]
+    local: bool
+
+
+def image_availability(config: IndexerConfig) -> list[ImageStatus]:
+    """The images the docker rung would actually run, deduplicated, with local presence.
+
+    Only languages whose chosen rung is "docker" contribute — a native binary on PATH or a
+    wholly unavailable rung says nothing about images. The reference reported is the one
+    `docker run` would receive, after the same local-tag preference the real run applies.
+    """
+    statuses: dict[str, ImageStatus] = {}
+    for language, how in indexer_availability(config).items():
+        if how != "docker":
+            continue
+        image = config.scip_images.get(language) or _DEFAULT_IMAGES.get(language)
+        if not image:
+            continue
+        chosen = _prefer_local_tag(language, image)
+        if chosen in statuses:
+            statuses[chosen].languages.append(language)
+        else:
+            statuses[chosen] = ImageStatus(image=chosen, languages=[language], local=_local_image_present(chosen))
+    return list(statuses.values())
 
 
 # ---------------------------------------------------------------------------
