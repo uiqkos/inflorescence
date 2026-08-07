@@ -126,6 +126,20 @@ def build_parser() -> argparse.ArgumentParser:
     # `inflorescence doctor` — health checklist
     sub.add_parser("doctor", help="Check config, API key, Memgraph, and schema")
 
+    # `inflorescence build-images` — build the SCIP indexer images from the packaged Dockerfiles
+    bld = sub.add_parser(
+        "build-images",
+        help="Build the SCIP indexer images locally from the Dockerfiles shipped in this package",
+    )
+    bld.add_argument("--tag", default="v1", help="Image tag (default: v1)")
+    bld.add_argument("--registry", default="ghcr.io/uiqkos", help="Registry prefix (default: ghcr.io/uiqkos)")
+    bld.add_argument(
+        "--language",
+        choices=["go", "node", "all"],
+        default="all",
+        help="Which image to build: go (scip-go), node (scip-typescript + scip-python), all (default)",
+    )
+
     return parser
 
 
@@ -205,6 +219,8 @@ def main() -> None:
         run_dashboard(host=args.host, port=args.port, open_browser=not args.no_browser)
     elif args.command == "init":
         sys.exit(_cmd_init(args))
+    elif args.command == "build-images":
+        sys.exit(_cmd_build_images(args))
     elif args.command == "doctor":
         from inflorescence.config import Settings
 
@@ -350,6 +366,49 @@ def _cmd_doctor(settings: Settings) -> int:
     exit_code = 1 if failed_critical else 0
     print("\nDoctor: " + ("OK" if exit_code == 0 else "problems found"))
     return exit_code
+
+
+# --language values -> image base names. "node" carries both scip-typescript and
+# scip-python (they are both Node programs); there is no per-target-language image.
+_IMAGE_NAMES: dict[str, str] = {"go": "scip-go", "node": "scip-node"}
+
+
+def packaged_dockerfile(name: str) -> Path:
+    """Path to a Dockerfile shipped inside the package (works from a wheel install)."""
+    return Path(__file__).resolve().parent / "docker" / f"{name}.Dockerfile"
+
+
+def build_image_argv(name: str, *, registry: str, tag: str) -> list[str]:
+    """The `docker build` invocation for one image.
+
+    The resulting reference must be exactly what the docker rung looks for
+    (`_DEFAULT_IMAGE_TAGS` in scip_semantic.py): `docker run` uses a locally present tag
+    without contacting any registry, so building under the expected name is what makes
+    this a fully local path rather than a convenience wrapper.
+    """
+    dockerfile = packaged_dockerfile(name)
+    image = f"{registry}/inflorescence-{name}:{tag}"
+    return ["docker", "build", "-t", image, "-f", str(dockerfile), str(dockerfile.parent)]
+
+
+def _cmd_build_images(args: argparse.Namespace) -> int:
+    if not shutil.which("docker"):
+        print(
+            "Error: docker not found on PATH. Install Docker, or skip containers entirely: "
+            "a native indexer on PATH is used as-is, and without either the CALLS ladder "
+            "degrades to the syntactic rungs.",
+            file=sys.stderr,
+        )
+        return 1
+    names = list(_IMAGE_NAMES.values()) if args.language == "all" else [_IMAGE_NAMES[args.language]]
+    for name in names:
+        argv = build_image_argv(name, registry=args.registry, tag=args.tag)
+        print(f"==> {argv[3]}")
+        proc = subprocess.run(argv, check=False)
+        if proc.returncode != 0:
+            print(f"Error: docker build failed for {argv[3]} (exit {proc.returncode})", file=sys.stderr)
+            return proc.returncode or 1
+    return 0
 
 
 def render_env_content(api_key: str) -> str:

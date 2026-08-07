@@ -62,8 +62,21 @@ _PROVENANCE = {"go": "scip-go", "python": "scip-python", "typescript": "scip-typ
 # and scip-python are Node programs — so the image must ship the toolchain, not just the
 # executable. Split by toolchain rather than by language, so indexing a Python repository
 # never pulls the Go image.
-_SCIP_GO_IMAGE = "ghcr.io/uiqkos/inflorescence-scip-go:v1"
-_SCIP_NODE_IMAGE = "ghcr.io/uiqkos/inflorescence-scip-node:v1"
+#
+# Two forms of the same reference. The tag is what `inflorescence build-images` creates and
+# what the documentation shows; the pin is what gets pulled when nothing local exists. Once
+# the pin is a digest (after a CI build; update with
+# `docker buildx imagetools inspect ghcr.io/uiqkos/inflorescence-scip-go:v1`), the two
+# diverge: a tag can be silently re-pointed in the registry, a digest cannot.
+_SCIP_GO_IMAGE_TAG = "ghcr.io/uiqkos/inflorescence-scip-go:v1"
+_SCIP_NODE_IMAGE_TAG = "ghcr.io/uiqkos/inflorescence-scip-node:v1"
+_SCIP_GO_IMAGE = _SCIP_GO_IMAGE_TAG
+_SCIP_NODE_IMAGE = _SCIP_NODE_IMAGE_TAG
+_DEFAULT_IMAGE_TAGS: dict[str, str] = {
+    "go": _SCIP_GO_IMAGE_TAG,
+    "python": _SCIP_NODE_IMAGE_TAG,
+    "typescript": _SCIP_NODE_IMAGE_TAG,
+}
 _DEFAULT_IMAGES: dict[str, str] = {
     "go": _SCIP_GO_IMAGE,
     "python": _SCIP_NODE_IMAGE,
@@ -266,6 +279,37 @@ def _expand_output(command: list[str], output: str) -> list[str]:
     return argv
 
 
+def _local_image_present(image: str) -> bool:
+    """True when the local docker daemon already holds *image*. Never contacts a registry."""
+    try:
+        proc = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _prefer_local_tag(language: str, image: str) -> str:
+    """Resolve the default reference for *language*: a locally present tag wins over the pin.
+
+    A digest reference always names the registry's bytes — `docker run` on it ignores any
+    locally built image and pulls, which is the opposite of what `inflorescence build-images`
+    promises. So when the default pin is a digest, the human-friendly tag is consulted on the
+    local daemon first (inspect only — an absent tag is not pulled, it falls through to the
+    pinned digest). An explicit `SCIP_IMAGES` override is used verbatim, never rewritten.
+    """
+    if image != _DEFAULT_IMAGES.get(language):
+        return image
+    tag = _DEFAULT_IMAGE_TAGS.get(language)
+    if tag and tag != image and _local_image_present(tag):
+        return tag
+    return image
+
+
 def _docker_user() -> str | None:
     """Run the container as the invoking user, so the index it writes is not root-owned."""
     getuid = getattr(os, "getuid", None)
@@ -347,6 +391,7 @@ def resolve_scip_invocation(
         if rung == "docker":
             image = config.scip_images.get(language) or _DEFAULT_IMAGES.get(language)
             if image and docker_cli_present():
+                image = _prefer_local_tag(language, image)
                 argv = docker_scip_argv(
                     image, scip_root, host_output_dir, command,
                     user=_docker_user(), extra_env=config.scip_env,
