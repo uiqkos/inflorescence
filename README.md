@@ -460,6 +460,66 @@ Containerizing this rung is not only about setup. A SCIP indexer necessarily exe
 reason to trust when you point this tool at someone else's repository to read it. In the
 container it sees one read-only mount and nothing else of your machine.
 
+### Three ways to run this rung — pick your trust level
+
+Pulling a container image from a stranger's personal namespace is a fair thing to hesitate
+over. All three paths below are first-class; nothing degrades except as documented.
+
+1. **Build the images yourself.**
+
+   ```bash
+   inflorescence build-images
+   ```
+
+   The Dockerfiles ship inside the package (readable in
+   [`src/inflorescence/docker/`](src/inflorescence/docker)), with the indexer versions
+   pinned — a rebuild installs the same tools, versions in the table above. The command
+   tags the result with exactly the references the docker rung looks for, and `docker run`
+   uses a locally present tag without contacting any registry — after building, no pull
+   ever happens. To be precise about what "local" means: the *build* itself still
+   downloads — the base image from Docker Hub, `scip-go` sources via proxy.golang.org, the
+   two npm indexers from npm — but every ingredient is named in a recipe you can read,
+   instead of arriving as one opaque blob.
+
+2. **Pull the published images and check who built them.** They are built multi-arch and
+   pushed by [CI](.github/workflows/images.yml) from a visible commit of this repository —
+   not from anyone's laptop — and carry GitHub artifact attestations (Sigstore under the
+   hood). Verify before first use:
+
+   ```bash
+   gh attestation verify oci://ghcr.io/uiqkos/inflorescence-scip-go:v1 --owner uiqkos
+   gh attestation verify oci://ghcr.io/uiqkos/inflorescence-scip-node:v1 --owner uiqkos
+   ```
+
+   The code references these images by immutable digest, not by tag: a tag can be silently
+   re-pointed in the registry, a digest cannot. `inflorescence doctor` prints the exact
+   reference that will run on your machine and whether it is already local.
+
+3. **Turn the rung off.**
+
+   ```bash
+   USE_SCIP_SEMANTIC=false
+   ```
+
+   No containers start at all. `CALLS` edges come from the syntactic ladder — 100%
+   precision in our measurements, with recall of 84.5% on Go and 66% on Python — and
+   everything it cannot resolve is recorded honestly in `external_calls` /
+   `unresolved_calls` rather than guessed.
+
+Worth stating plainly: the alternative to the container is not "everything stays local" —
+it is `go install` / `npm install -g` of the same third-party indexer **with no sandbox at
+all**, and an indexer, wherever it runs, executes the build configuration of the repository
+being indexed. The container is the contained option: repository mounted read-only, index
+written to a separate mount, `--rm`, your uid, and nothing else of the host exposed
+(`docker_scip_argv` in
+[`scip_semantic.py`](src/inflorescence/code_indexer/scip_semantic.py)).
+
+Sizes, measured: scip-go — 243 MB on disk, 76 MB of network transfer; scip-node — 310 MB
+and 100 MB. Two images rather than one because a merged image would cost ~545 MB and
+~170 MB of transfer for *everyone*, including a user who only ever indexes Python; only a
+polyglot repository would come out ahead, and then by about 6 MB. (A future Rust indexer
+would push a unified image past a gigabyte.)
+
 None of this is required. A missing indexer, a project that does not build, or a timeout
 degrades that language to the syntactic ladder — the index still succeeds, and every `CALLS`
 edge records which rung resolved it in its `resolution` property, so you can always tell

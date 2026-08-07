@@ -30,3 +30,10 @@ First public release.
 - **Setup** — `inflorescence init` writes the config and registers the MCP server;
   `inflorescence doctor` checks config, key, database and schema; Memgraph and the SCIP
   indexers start as containers on demand.
+- **Image supply chain** — the SCIP indexer images are reproducible (indexer versions
+  pinned in the Dockerfiles) and buildable locally from Dockerfiles shipped inside the
+  package: `inflorescence build-images` tags them exactly as the docker rung expects, and a
+  locally present tag is used with no registry contact. Published images are built
+  multi-arch by CI with build provenance attestations and referenced by immutable digest in
+  code (`SCIP_IMAGES` still overrides); `doctor` names the image that will run and whether
+  it is already local.
