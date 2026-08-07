@@ -65,20 +65,33 @@ def _stub_db(monkeypatch, *, healthy: bool, schema_ok: bool = True) -> None:
     monkeypatch.setattr("inflorescence.db.schema.schema_present", fake_schema)
 
 
-def _stub_scip(monkeypatch, runner: str) -> None:
+def _stub_scip(monkeypatch, runner: str, *, images_local: bool = True) -> None:
     """Pin what `doctor` sees for the SCIP rung.
 
     Without this the check reads the *host*: a machine with Docker reports "docker",
     a bare CI runner reports "none". Asserting on that makes the outcome depend on
     which runner picked the job up — the macOS runner has no Docker and reddened a
-    green suite over a documented, non-critical degradation.
+    green suite over a documented, non-critical degradation. `image_availability`
+    shells out to `docker image inspect`, so it is pinned for the same reason.
     """
+    from inflorescence.code_indexer.scip_semantic import ImageStatus
 
     def fake_availability(config) -> dict[str, str]:
         return {"go": runner, "python": runner, "typescript": runner}
 
+    def fake_images(config) -> list[ImageStatus]:
+        if runner != "docker":
+            return []
+        return [
+            ImageStatus("ghcr.io/uiqkos/inflorescence-scip-go:v1", ["go"], images_local),
+            ImageStatus("ghcr.io/uiqkos/inflorescence-scip-node:v1", ["python", "typescript"], images_local),
+        ]
+
     monkeypatch.setattr(
         "inflorescence.code_indexer.scip_semantic.indexer_availability", fake_availability
+    )
+    monkeypatch.setattr(
+        "inflorescence.code_indexer.scip_semantic.image_availability", fake_images
     )
 
 
@@ -142,6 +155,53 @@ async def test_doctor_stays_green_without_any_scip_indexer(monkeypatch, tmp_path
     assert results["SCIP indexers"].ok is False
     assert results["SCIP indexers"].critical is False
     assert all(r.ok for r in results.values() if r.critical)
+
+
+async def test_doctor_names_the_image_and_where_it_comes_from(monkeypatch, tmp_path) -> None:
+    """The docker rung must not be a black box: `doctor` says which reference will run
+    and whether `docker run` will touch the network for it."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    _stub_db(monkeypatch, healthy=True, schema_ok=True)
+    _stub_scip(monkeypatch, "docker", images_local=True)
+
+    from inflorescence.__main__ import _doctor_checks
+    from inflorescence.config import Settings
+
+    results = {r.name: r for r in await _doctor_checks(Settings())}
+    go_row = results["SCIP image (go)"]
+    assert go_row.ok is True and go_row.critical is False
+    assert "ghcr.io/uiqkos/inflorescence-scip-go:v1" in go_row.detail
+    assert "present locally" in go_row.detail
+    # python and typescript share the node image — one row, not two
+    node_row = results["SCIP image (python, typescript)"]
+    assert "inflorescence-scip-node" in node_row.detail
+
+
+async def test_doctor_says_when_the_image_would_be_pulled(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    _stub_db(monkeypatch, healthy=True, schema_ok=True)
+    _stub_scip(monkeypatch, "docker", images_local=False)
+
+    from inflorescence.__main__ import _doctor_checks
+    from inflorescence.config import Settings
+
+    results = {r.name: r for r in await _doctor_checks(Settings())}
+    assert "will be pulled" in results["SCIP image (go)"].detail
+
+
+async def test_doctor_shows_no_image_rows_when_the_rung_is_not_docker(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    _stub_db(monkeypatch, healthy=True, schema_ok=True)
+    _stub_scip(monkeypatch, "native")
+
+    from inflorescence.__main__ import _doctor_checks
+    from inflorescence.config import Settings
+
+    results = await _doctor_checks(Settings())
+    assert not any(r.name.startswith("SCIP image (") for r in results)
 
 
 def test_cmd_doctor_returns_1_on_critical_failure(monkeypatch, tmp_path, capsys) -> None:

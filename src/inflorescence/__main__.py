@@ -336,9 +336,10 @@ async def _doctor_checks(settings: Settings) -> list[CheckResult]:
     # is otherwise only answerable by reading the log.
     if settings.use_scip_semantic:
         from inflorescence.code_indexer.models import IndexerConfig
-        from inflorescence.code_indexer.scip_semantic import indexer_availability
+        from inflorescence.code_indexer.scip_semantic import image_availability, indexer_availability
 
-        availability = indexer_availability(IndexerConfig.from_settings(settings))
+        config = IndexerConfig.from_settings(settings)
+        availability = indexer_availability(config)
         results.append(
             CheckResult(
                 "SCIP indexers",
@@ -348,6 +349,19 @@ async def _doctor_checks(settings: Settings) -> list[CheckResult]:
                 hint="Start Docker for zero-install SCIP, or install the binaries yourself (see README)",
             )
         )
+        # Which image each docker rung would run, and whether `docker run` will touch the
+        # network for it. Informational, never failing: the answer to "what exactly will
+        # execute on my machine", not a health problem.
+        for status in image_availability(config):
+            results.append(
+                CheckResult(
+                    "SCIP image (" + ", ".join(status.languages) + ")",
+                    True,
+                    False,
+                    status.image
+                    + (" — present locally, no pull" if status.local else " — will be pulled on first use"),
+                )
+            )
 
     return results
 
