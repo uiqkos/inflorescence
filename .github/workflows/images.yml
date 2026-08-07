@@ -1,0 +1,84 @@
+# Build and publish the SCIP indexer images, with build provenance.
+#
+# The point is to move trust from "someone pushed these from a laptop" to "GitHub built
+# these from this commit of a visible Dockerfile". Verification, once the repository and
+# the packages are public:
+#
+#   gh attestation verify oci://ghcr.io/uiqkos/inflorescence-scip-go:v1 --owner uiqkos
+#
+# Both architectures are mandatory: users split roughly evenly between arm64 Macs and
+# amd64 Linux, and a single-arch image fails at `docker run` time for the other half.
+#
+# Release tags are `images-v*`, deliberately distinct from `v*` — that one publishes the
+# Python package to PyPI (release.yml).
+name: Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to push"
+        default: "v1"
+  push:
+    tags: ["images-v*"]
+
+jobs:
+  build:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: inflorescence-scip-go
+            dockerfile: src/inflorescence/docker/scip-go.Dockerfile
+          - image: inflorescence-scip-node
+            dockerfile: src/inflorescence/docker/scip-node.Dockerfile
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: src/inflorescence/docker
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ inputs.tag || 'v1' }}
+
+      - name: Print the digest to pin
+        run: |
+          echo "Pin in scip_semantic.py:"
+          echo "  ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}"
+
+      - name: Attest build provenance
+        # Attestations for a *private* repository need GitHub Enterprise, so this step is
+        # skipped while the repository is private and activates on its own once it goes
+        # public. Publishing flow: flip the repository public, re-run this workflow, then
+        # re-pin the fresh digests in scip_semantic.py.
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
