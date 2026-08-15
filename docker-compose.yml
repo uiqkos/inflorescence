@@ -2,7 +2,10 @@ services:
   memgraph:
     image: memgraph/memgraph-mage:latest
     ports:
-      - "7687:7687"
+      # Loopback only: Memgraph runs without authentication and holds the source code of
+      # every indexed repository; docker's default of binding 0.0.0.0 would hand both to
+      # anyone on the same network. Same stance as docker_env.py.
+      - "127.0.0.1:7687:7687"
     volumes:
       - mg_data:/var/lib/memgraph
     command:
@@ -19,7 +22,7 @@ services:
   lab:
     image: memgraph/lab:latest
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       memgraph:
         condition: service_healthy

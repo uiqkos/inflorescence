@@ -43,8 +43,7 @@ Thumbs.db
 .beads/
 docs/superpowers/
 
-# Local benchmark dataset — built from personal Claude-trace sessions; contains
-# private paths, emails, and pasted secrets. NEVER publish.
+# Local benchmark dataset (not part of the public release)
 /eval/claude_trace_dataset/
 
 # Local agent tooling and scratch (not part of the public release)
@@ -53,21 +52,15 @@ docs/superpowers/
 cineraria/
 .gstack/
 .playwright-mcp/
-# Agent task briefs and raw review diffs. Only ever protected by a nested
-# .superpowers/sdd/.gitignore before — anything written to .superpowers/ itself,
-# or to a new subdirectory, was one `git add -A` from being committed.
 .superpowers/
 
 # invariant-fix orchestrator run artifacts
 .orchestrator-sessions/
 .orchestrator-logs/
 
-# Design/research memos. Contain client project analysis, personal paths, and
-# third-party names. Untracked but unignored until now, so both `git add -A` and
-# `uv build` (which sweeps everything not ignored into the sdist) picked them up.
+# Local design/research memos (not part of the public release)
 /research/
 
-# Not this project's file. A JS manifest belonging to an unrelated application was
-# committed here once by accident; keep the path ignored so it cannot recur.
+# Not this project's file; keep the path ignored
 /package.json
 node_modules/

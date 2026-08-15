@@ -53,8 +53,7 @@ dev = [
 packages = ["src/inflorescence"]
 
 # Explicit allowlist. Without it hatchling sweeps every path not matched by
-# .gitignore into the sdist — which silently included local research memos and
-# agent scratch directories. PyPI sdists are immutable, so an accidental include
+# .gitignore into the sdist. PyPI sdists are immutable, so an accidental include
 # cannot be withdrawn after upload; enumerate what ships instead of excluding
 # what must not.
 [tool.hatch.build.targets.sdist]
