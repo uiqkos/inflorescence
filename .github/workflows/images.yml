@@ -1,13 +1,15 @@
 # Build and publish the SCIP indexer images, with build provenance.
 #
 # The point is to move trust from "someone pushed these from a laptop" to "GitHub built
-# these from this commit of a visible Dockerfile". Verification, once the repository and
-# the packages are public:
+# these from this commit of a visible Dockerfile". Verification:
 #
 #   gh attestation verify oci://ghcr.io/uiqkos/inflorescence-scip-go:v1 --owner uiqkos
 #
 # Both architectures are mandatory: users split roughly evenly between arm64 Macs and
 # amd64 Linux, and a single-arch image fails at `docker run` time for the other half.
+# Each arch builds on its own native runner — QEMU emulation was an order of magnitude
+# slower and crashed with SIGILL inside npm — then one manifest list is stitched from the
+# two per-arch digests and attested as a whole.
 #
 # Release tags are `images-v*`, deliberately distinct from `v*` — that one publishes the
 # Python package to PyPI (release.yml).
@@ -24,27 +26,34 @@ on:
 
 jobs:
   build:
-    name: ${{ matrix.image }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.image }} · ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - image: inflorescence-scip-go
             dockerfile: src/inflorescence/docker/scip-go.Dockerfile
+            arch: amd64
+            runner: ubuntu-latest
+          - image: inflorescence-scip-go
+            dockerfile: src/inflorescence/docker/scip-go.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
           - image: inflorescence-scip-node
             dockerfile: src/inflorescence/docker/scip-node.Dockerfile
+            arch: amd64
+            runner: ubuntu-latest
+          - image: inflorescence-scip-node
+            dockerfile: src/inflorescence/docker/scip-node.Dockerfile
+            arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
@@ -56,29 +65,85 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build and push
+      # Pushed by digest only; the human-facing tag is applied by the merge job to the
+      # combined manifest list, never to a single-arch image.
+      - name: Build and push by digest
         id: build
         uses: docker/build-push-action@v6
         with:
           context: src/inflorescence/docker
           file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ inputs.tag || 'v1' }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=true
 
-      - name: Print the digest to pin
+      - name: Export digest for the merge job
         run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.image }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: manifest · ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [inflorescence-scip-go, inflorescence-scip-node]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          pattern: digests-${{ matrix.image }}-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create the multi-arch manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ inputs.tag || 'v1' }}" \
+            $(printf 'ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@sha256:%s ' *)
+
+      - name: Resolve the digest to pin
+        id: digest
+        run: |
+          digest=$(docker buildx imagetools inspect \
+            "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ inputs.tag || 'v1' }}" \
+            --format '{{.Manifest.Digest}}')
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
           echo "Pin in scip_semantic.py:"
-          echo "  ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${{ steps.build.outputs.digest }}"
+          echo "  ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}@${digest}"
 
       - name: Attest build provenance
-        # Attestations for a *private* repository need GitHub Enterprise, so this step is
-        # skipped while the repository is private and activates on its own once it goes
-        # public. Publishing flow: flip the repository public, re-run this workflow, then
-        # re-pin the fresh digests in scip_semantic.py.
+        # Attestations for a *private* repository need GitHub Enterprise; while private
+        # this step is skipped and activates on its own once the repository is public.
         if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@v2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
           push-to-registry: true
