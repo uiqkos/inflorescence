@@ -67,6 +67,21 @@ _EXT_TO_LANGUAGE: dict[str, str] = {
 
 _TEXT_EXTENSIONS: frozenset[str] = frozenset({".md", ".rst", ".txt", ".adoc", ".tex"})
 
+# Extension -> language stamped on a document chunk. Cosmetic (it labels search results
+# and lets a Cypher query filter by it); the chunking itself is identical for all of them.
+_DOCUMENT_LANGUAGES: dict[str, str] = {
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".mdx": "markdown",
+    ".rst": "restructuredtext",
+    ".adoc": "asciidoc",
+    ".asciidoc": "asciidoc",
+    ".org": "org",
+    ".tex": "latex",
+    ".txt": "text",
+    ".text": "text",
+}
+
 _BINARY_EXTENSIONS: frozenset[str] = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp",
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
@@ -128,8 +143,15 @@ class Chunker:
 
         if language:
             return self._chunk_code(text, rel, language)
-        if ext in _TEXT_EXTENSIONS:
-            return self._chunk_text(text, rel)
+        if ext in _DOCUMENT_LANGUAGES or ext in _TEXT_EXTENSIONS:
+            # Same windows the pipeline gives a Document node, so this entry point and
+            # chunk_repository can't drift into chunking the same README two ways.
+            return self._chunk_text(
+                text, rel,
+                language=_DOCUMENT_LANGUAGES.get(ext, "text"),
+                chunk_size=self.config.document_chunk_size,
+                chunk_overlap=self.config.document_chunk_overlap,
+            )
         return self._chunk_text(text, rel)
 
     def chunk_repository(
@@ -178,6 +200,12 @@ class Chunker:
                 logger.debug("Cannot read %s during chunking, keeping prior chunks stale", full_path)
                 if unreadable_out is not None:
                     unreadable_out.add(rel_path)
+                continue
+            document = next((n for n in file_nodes if n.node_type == NodeType.DOCUMENT), None)
+            if document is not None:
+                # A document owns no symbols, so there is nothing to hang per-node chunks
+                # off: the file body itself is chunked, with overlap (see _document_chunks).
+                chunks.extend(self._document_chunks(document, text))
                 continue
             lines = text.splitlines()
             language = _EXT_TO_LANGUAGE.get(full_path.suffix.lower(), "text")
@@ -299,21 +327,31 @@ class Chunker:
             ))
         return chunks
 
-    def _chunk_text(self, text: str, rel_path: str, language: str = "") -> list[Chunk]:
-        """Sentence-boundary splitting via SentenceSplitter; falls back to naive split."""
+    def _chunk_text(
+        self,
+        text: str,
+        rel_path: str,
+        language: str = "",
+        chunk_size: int | None = None,
+        chunk_overlap: int | None = None,
+    ) -> list[Chunk]:
+        """Sentence-boundary splitting via SentenceSplitter; falls back to naive split.
+
+        *chunk_size* / *chunk_overlap* override the configured code sizes — documents use
+        their own, smaller window (see :meth:`_document_chunks`).
+        """
+        size = self.config.chunk_size if chunk_size is None else chunk_size
+        overlap = self.config.chunk_overlap if chunk_overlap is None else chunk_overlap
         try:
             from llama_index.core.node_parser import SentenceSplitter  # type: ignore[import-untyped]
             from llama_index.core.schema import Document  # type: ignore[import-untyped]
 
-            splitter = SentenceSplitter(
-                chunk_size=self.config.chunk_size,
-                chunk_overlap=self.config.chunk_overlap,
-            )
+            splitter = SentenceSplitter(chunk_size=size, chunk_overlap=overlap)
             doc = Document(text=text)
             nodes = splitter.get_nodes_from_documents([doc])
         except Exception:
             logger.debug("SentenceSplitter failed for %s, using simple split", rel_path)
-            return self._simple_split(text, rel_path, language)
+            return self._simple_split(text, rel_path, language, size, overlap)
 
         chunks: list[Chunk] = []
         for idx, node in enumerate(nodes):
@@ -331,11 +369,20 @@ class Chunker:
             ))
         return chunks
 
-    def _simple_split(self, text: str, rel_path: str, language: str = "") -> list[Chunk]:
+    def _simple_split(
+        self,
+        text: str,
+        rel_path: str,
+        language: str = "",
+        chunk_size: int | None = None,
+        chunk_overlap: int | None = None,
+    ) -> list[Chunk]:
         """Last-resort fallback: split by character count with overlap."""
         chunks: list[Chunk] = []
-        size = self.config.chunk_size
-        overlap = self.config.chunk_overlap
+        size = max(1, self.config.chunk_size if chunk_size is None else chunk_size)
+        # The step must advance: an overlap >= size (a mis-set knob) would otherwise
+        # rewind `pos` forever and hang the indexer on a single file.
+        overlap = min(self.config.chunk_overlap if chunk_overlap is None else chunk_overlap, size - 1)
         idx = 0
         pos = 0
         while pos < len(text):
@@ -398,6 +445,31 @@ class Chunker:
             node.id,
             "class_context",
         )
+
+    def _document_chunks(self, node: CodeNode, text: str) -> list[Chunk]:
+        """Chunk a whole prose file into overlapping windows, attached to its document node.
+
+        Deliberately structure-blind: no heading parsing, no section tree. Markdown headings
+        are a typographic convention, not a reliable outline (a README may have one ``#`` and
+        2000 words under it, or forty), so splitting on them yields chunks whose size is set
+        by the author's formatting habits. Sentence-boundary windows of a fixed size are
+        predictable, and the *overlap* is what makes them safe: a passage the window boundary
+        cuts in half still appears whole inside its neighbour, so it stays retrievable.
+        """
+        language = _DOCUMENT_LANGUAGES.get(Path(node.file_path).suffix.lower(), "text")
+        chunks = self._chunk_text(
+            text,
+            node.file_path,
+            language=language,
+            chunk_size=self.config.document_chunk_size,
+            chunk_overlap=self.config.document_chunk_overlap,
+        )
+        for chunk in chunks:
+            # _chunk_text keys chunks by path; bind them to the document node so search
+            # results resolve to a real entity (the Code node the chunk HAS_CHUNK hangs off).
+            chunk.node_id = node.id
+            chunk.chunk_kind = "document"
+        return chunks
 
     def _body_chunks(self, node: CodeNode, lines: list[str], language: str, chunk_kind: str) -> list[Chunk]:
         start = max(node.line_start, 1)

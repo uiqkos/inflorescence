@@ -374,14 +374,18 @@ class _BackfillConnection:
 
 @pytest.mark.asyncio
 async def test_backfill_node_type_sets_property_from_label_when_missing() -> None:
+    from inflorescence.code_indexer.models import NodeType
     from inflorescence.db.schema import backfill_node_type
 
     conn = _BackfillConnection([{"id": "pkg/a.py::run"}])
     updated = await backfill_node_type(conn)
 
-    assert updated == 9  # one SET per node-type label group
+    # One SET per node-type label group — derived, so adding a NodeType extends the
+    # backfill instead of failing this assertion on a hardcoded count.
+    assert updated == len(NodeType)
     assert any("MATCH (n:Function) WHERE n.node_type IS NULL SET n.node_type = 'function'" in q for q in conn.writes)
     assert any("MATCH (n:Module) WHERE n.node_type IS NULL SET n.node_type = 'module'" in q for q in conn.writes)
+    assert any("MATCH (n:Document) WHERE n.node_type IS NULL SET n.node_type = 'document'" in q for q in conn.writes)
     assert all("SET n.node_type = '" in q for q in conn.writes)
 
 

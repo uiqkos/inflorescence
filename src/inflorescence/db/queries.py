@@ -12,6 +12,7 @@ MERGE (n:Code {{id: $id, project: $project}})
 WITH n, ($summary = '' AND coalesce(n.summary, '') <> '') AS keep_stored
 REMOVE n:Directory
 REMOVE n:Module
+REMOVE n:Document
 REMOVE n:Class
 REMOVE n:Function
 REMOVE n:Method
@@ -50,6 +51,7 @@ MERGE (n:Code {{id: row.id, project: $project}})
 WITH n, row, (row.summary = '' AND coalesce(n.summary, '') <> '') AS keep_stored
 REMOVE n:Directory
 REMOVE n:Module
+REMOVE n:Document
 REMOVE n:Class
 REMOVE n:Function
 REMOVE n:Method
@@ -77,8 +79,13 @@ SET n.node_type = row.node_type,
 # Checksum operations
 # ---------------------------------------------------------------------------
 
+# One node per file carries that file's checksum: its module node, or — for a prose file,
+# which has no module — its document node. Matching only :Module would leave every indexed
+# document without a readable checksum, so every scan would see it as changed and re-parse,
+# re-summarize and re-embed it on every update (INV-5: unchanged content costs nothing).
 GET_CHECKSUMS = """
-MATCH (n:Code:Module {project: $project})
+MATCH (n:Code {project: $project})
+WHERE n:Module OR n:Document
 RETURN n.file_path AS file_path, n.checksum AS checksum
 """
 
@@ -204,8 +211,9 @@ ORDER BY n.file_path, n.line_start, n.id
 # run re-chunks the file. A legacy graph indexed before the marker existed has NULL
 # here and is re-chunked once — cheap: unchanged content reuses stored embeddings (0 API).
 GET_FILES_WITH_STALE_CHUNKS = """
-MATCH (m:Code:Module {project: $project})
-WHERE m.file_path IS NOT NULL AND m.file_path <> ''
+MATCH (m:Code {project: $project})
+WHERE (m:Module OR m:Document)
+  AND m.file_path IS NOT NULL AND m.file_path <> ''
   AND (m.chunks_checksum IS NULL OR m.chunks_checksum <> m.checksum)
 RETURN m.file_path AS file_path
 """
@@ -214,7 +222,8 @@ RETURN m.file_path AS file_path
 # content checksum. Set together with (i.e. equal to) the file's stored checksum.
 MARK_CHUNKS_COVERED = """
 UNWIND $rows AS row
-MATCH (m:Code:Module {project: $project, file_path: row.file_path})
+MATCH (m:Code {project: $project, file_path: row.file_path})
+WHERE m:Module OR m:Document
 SET m.chunks_checksum = row.checksum
 RETURN count(*) AS written
 """
@@ -243,8 +252,10 @@ MATCH (root:Code {project: $project, id: $node_id})
 RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary
 """
 
+# The node that stands for a whole file: its module, or its document node for a prose file.
 GET_STRUCTURE_ROOT_BY_FILE = """
-MATCH (root:Code:Module {project: $project, file_path: $file_path})
+MATCH (root:Code {project: $project, file_path: $file_path})
+WHERE root:Module OR root:Document
 RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary
 """
 

@@ -9,7 +9,7 @@
 const TYPE_COLORS = {
   directory: "#9a9c8f", module: "#5a93c9", class: "#3fa588", function: "#d9a24e",
   method: "#6faf5a", interface: "#9a90de", enum: "#dd7d6b", struct: "#cd7ba3",
-  trait: "#cf8455", code: "#7d7f73",
+  trait: "#cf8455", document: "#c8bd8e", code: "#7d7f73",
 };
 const REL_COLORS = {
   CALLS: "#6f9fd0", IMPORTS: "#5fae86", INHERITS: "#9a90de",
@@ -20,7 +20,7 @@ const CANVAS = { ink: "#0c0e0b", halo: "rgba(12,14,11,0.72)", label: "#a9ac9d", 
 const REL_TYPES = ["CALLS", "IMPORTS", "INHERITS", "IMPLEMENTS", "CONTAINS"];
 const CHIP_TEXT = {
   directory: "dir", module: "mod", class: "cls", function: "fn", method: "mth",
-  interface: "if", enum: "enum", struct: "st", trait: "tr", code: "?",
+  interface: "if", enum: "enum", struct: "st", trait: "tr", document: "doc", code: "?",
 };
 
 // Display settings for the graph view. Every one of these is presentation only —

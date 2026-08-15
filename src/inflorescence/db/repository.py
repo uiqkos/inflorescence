@@ -56,7 +56,12 @@ _NODE_TYPE_LABEL_BY_VALUE = {
     NodeType.ENUM.value: "Enum",
     NodeType.STRUCT.value: "Struct",
     NodeType.TRAIT.value: "Trait",
+    # Prose files. Labelled apart from :Module so "list the modules" doesn't return
+    # READMEs, and so the file-level queries below can address both explicitly.
+    NodeType.DOCUMENT.value: "Document",
 }
+# Invariant (guarded by a test): every NodeType has an entry here. upsert_nodes indexes
+# this map by value, so a type added without a label raises KeyError on its first node.
 _NODE_TYPE_VALUE_BY_LABEL = {label: value for value, label in _NODE_TYPE_LABEL_BY_VALUE.items()}
 
 # Memgraph's vector_search.search has no filtered variant: it returns the GLOBAL

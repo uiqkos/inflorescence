@@ -50,6 +50,22 @@ DEFAULT_EXCLUDE_PATTERNS: list[str] = [
     ".cache",
 ]
 
+# Prose files indexed as whole documents: one node per file, body chunked with overlap,
+# no structure parsing (see parser/document_parser.py). Deliberately excludes data/config
+# formats (.json, .yaml, .csv): those carry no prose an LLM summary or a semantic query can
+# use, and a large lockfile would be paid for in summaries and embeddings for nothing.
+DEFAULT_DOCUMENT_EXTENSIONS: list[str] = [
+    ".md",
+    ".markdown",
+    ".mdx",
+    ".rst",
+    ".txt",
+    ".text",
+    ".adoc",
+    ".asciidoc",
+    ".org",
+]
+
 GENERATED_FILE_PATTERNS: list[str] = [
     # protobuf / gRPC (many of these lack an in-file marker, esp. JS/TS/Python)
     "*.pb.go", "*.pb.gw.go", "*_grpc.pb.go", "*_pb.go",           # Go
@@ -103,6 +119,12 @@ class Settings(BaseSettings):
     # Chunking
     chunk_size: int = 3000
     chunk_overlap: int = 1000
+    # Documents (.md/.txt/...) are chunked as overlapping sentence windows over the whole
+    # file rather than by structure, so these are the only knobs that decide their
+    # retrieval granularity. Smaller than the code window on purpose: a prose window that
+    # spans several sections embeds into a vector that matches nothing precisely.
+    document_chunk_size: int = 800
+    document_chunk_overlap: int = 200
     # RAG streaming window: chunks/summaries are embedded and stored this many at a
     # time so peak embedding-vector memory stays bounded and each window persists.
     rag_index_batch_size: int = 256
@@ -115,6 +137,12 @@ class Settings(BaseSettings):
     max_file_size_bytes: int = 262144
     skip_generated: bool = True
     use_llm_summaries: bool = True
+    # Index prose documents (README, docs/**.md, notes.txt) alongside code. They are the
+    # part of a repository that says *why*, which no amount of AST parsing recovers — but
+    # they are also summarized and embedded like code, so this is an off switch for a repo
+    # where documentation is huge, generated, or not worth the spend.
+    index_documents: bool = True
+    document_extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_DOCUMENT_EXTENSIONS))
     # Rows per UNWIND write to Memgraph (nodes/edges/chunks/summaries/checksums).
     db_write_batch_size: int = 500
 

@@ -25,6 +25,7 @@ from inflorescence.code_indexer.models import (
     NodeType,
 )
 from inflorescence.code_indexer.parser.ast_parser import PythonAstParser
+from inflorescence.code_indexer.parser.document_parser import DocumentParser
 from inflorescence.code_indexer.parser.llm_parser import parse_file_with_llm
 from inflorescence.code_indexer.parser.registry import ParserRegistry
 from inflorescence.code_indexer.parser.resolver import resolve_edges
@@ -76,10 +77,17 @@ class BuildResult:
         yield self.edges
 
 
-def _build_default_registry() -> ParserRegistry:
+def _build_default_registry(config: IndexerConfig | None = None) -> ParserRegistry:
     """Create a registry with all available parsers."""
+    config = config or IndexerConfig()
     registry = ParserRegistry()
     registry.register(PythonAstParser())
+    if config.index_documents:
+        # Registered like a language parser on purpose: everything downstream — the scan,
+        # the watcher's extension filter, the cost preview, and the reconcile's
+        # "is this file's parser still available?" check — keys off the registry, so
+        # documents are covered by all of it without a parallel code path.
+        registry.register(DocumentParser(config.document_extensions))
     try:
         from inflorescence.code_indexer.parser.javascript_parser import JavaScriptParser
 
@@ -207,8 +215,10 @@ class GraphBuilder:
         self._repo = repo
         self._llm = llm
         self._settings = settings or Settings()
-        self._registry = registry or _build_default_registry()
+        # Config first: the default registry is derived from it (which document
+        # extensions to scan, whether to scan them at all).
         self._config = config or IndexerConfig()
+        self._registry = registry or _build_default_registry(self._config)
         # LLM-fallback parse results keyed by "{rel}:{md5}". Content-addressed, so a
         # concurrent build of another project writes different keys (never a clobber, unlike
         # the mutable per-run fields audit finding 2 removed), and re-parsing an unchanged
@@ -887,6 +897,17 @@ _PREVIEW_LANGUAGES: dict[str, str] = {
     ".tsx": "typescript",
     ".go": "go",
     ".rs": "rust",
+    # Documents, grouped by kind rather than by extension, so the pre-flight breakdown
+    # reads "markdown: 40 files" instead of splitting the same prose across .md/.mdx.
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".mdx": "markdown",
+    ".rst": "restructuredtext",
+    ".adoc": "asciidoc",
+    ".asciidoc": "asciidoc",
+    ".org": "org",
+    ".txt": "text",
+    ".text": "text",
 }
 
 
@@ -991,6 +1012,11 @@ def _matches_patterns(rel_path: str, name: str, patterns: list[str]) -> bool:
     return False
 
 
+# Node types that stand for a whole file, and so hang directly off a directory node.
+# A document is one of them: it is a file with no symbols inside it, not a symbol.
+_FILE_NODE_TYPES = frozenset({NodeType.MODULE, NodeType.DOCUMENT})
+
+
 _LANGUAGE_BY_SUFFIX = {
     ".go": "go", ".py": "python", ".ts": "typescript", ".tsx": "typescript",
     ".js": "javascript", ".jsx": "javascript", ".rs": "rust",
@@ -1071,7 +1097,7 @@ def _build_directory_nodes(nodes: list[CodeNode], edges: list[Edge]) -> None:
     dir_paths: set[str] = set()
     module_dir: dict[str, str] = {}
     for n in nodes:
-        if n.node_type == NodeType.MODULE:
+        if n.node_type in _FILE_NODE_TYPES:
             parts = n.file_path.split("/")
             module_dir[n.file_path] = "/".join(parts[:-1]) if len(parts) > 1 else ""
             for i in range(1, len(parts)):
@@ -1102,7 +1128,7 @@ def _build_directory_nodes(nodes: list[CodeNode], edges: list[Edge]) -> None:
     nodes.extend(dir_nodes.values())
 
     for n in nodes:
-        if n.node_type == NodeType.MODULE and n.file_path in module_dir:
+        if n.node_type in _FILE_NODE_TYPES and n.file_path in module_dir:
             dp = module_dir[n.file_path]
             if dp in dir_nodes:
                 n.parent_id = dir_nodes[dp].id

@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 from inflorescence.code_indexer import prompts
-from inflorescence.code_indexer.models import CodeNode, Edge, EdgeType
+from inflorescence.code_indexer.models import CodeNode, Edge, EdgeType, NodeType
 from inflorescence.llm_client import LLMClient
 from inflorescence.progress import ProgressReporter, resolve
 
@@ -273,16 +273,29 @@ async def _summarize_leaf(
     if not source:
         return node.docstring or ""
 
-    if len(source) <= max_source_chars:
+    # A document is prose, not code: the code prompts ask for call graphs, side effects and
+    # return values it has none of, and answering that question about a README produces a
+    # summary that indexes badly. Same shape, different prompts.
+    if node.node_type == NodeType.DOCUMENT:
+        system_prompt = prompts.DOCUMENT_SYSTEM_PROMPT
+        map_prompt, reduce_prompt = prompts.DOCUMENT_MAP_SYSTEM_PROMPT, prompts.DOCUMENT_REDUCE_SYSTEM_PROMPT
+        prompt = f"Summarize this document, the file '{node.file_path}':\n\n{source}"
+    else:
+        system_prompt = prompts.LEAF_SYSTEM_PROMPT
+        map_prompt, reduce_prompt = prompts.MAP_SYSTEM_PROMPT, prompts.REDUCE_SYSTEM_PROMPT
         prompt = (
             f"Summarize this {node.node_type.value} named '{node.name}':\n\n"
             f"Signature: {node.signature}\n"
             f"Docstring: {node.docstring}\n\n"
             f"```\n{source}\n```"
         )
-        summary = await llm.generate(prompt, system_prompt=prompts.LEAF_SYSTEM_PROMPT)
+
+    if len(source) <= max_source_chars:
+        summary = await llm.generate(prompt, system_prompt=system_prompt)
     else:
-        summary = await _map_reduce_summarize(node, source, llm, max_source_chars)
+        summary = await _map_reduce_summarize(
+            node, source, llm, max_source_chars, map_prompt=map_prompt, reduce_prompt=reduce_prompt
+        )
 
     return summary.strip()
 
@@ -369,6 +382,8 @@ async def _map_reduce_summarize(
     source: str,
     llm: LLMClient,
     max_chars: int,
+    map_prompt: str = prompts.MAP_SYSTEM_PROMPT,
+    reduce_prompt: str = prompts.REDUCE_SYSTEM_PROMPT,
 ) -> str:
     """Summarize large source code via map-reduce: chunk, summarize each in parallel, then combine."""
     overlap = int(max_chars * 0.2)
@@ -387,7 +402,7 @@ async def _map_reduce_summarize(
             f"Summarize chunk {i + 1}/{len(chunks)} of {node.node_type.value} '{node.name}':\n\n"
             f"```\n{chunk}\n```"
         )
-        result = await llm.generate(prompt, system_prompt=prompts.MAP_SYSTEM_PROMPT)
+        result = await llm.generate(prompt, system_prompt=map_prompt)
         return result.strip()
 
     chunk_summaries = await asyncio.gather(*[_map_chunk(i, c) for i, c in enumerate(chunks)])
@@ -398,7 +413,7 @@ async def _map_reduce_summarize(
         f"Combine these partial summaries of {node.node_type.value} '{node.name}' "
         f"into a final summary:\n\n{combined}"
     )
-    return await llm.generate(prompt, system_prompt=prompts.REDUCE_SYSTEM_PROMPT)
+    return await llm.generate(prompt, system_prompt=reduce_prompt)
 
 
 def node_source(node: CodeNode, root_path: Path) -> str:

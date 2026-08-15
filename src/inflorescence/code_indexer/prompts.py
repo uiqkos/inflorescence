@@ -7,8 +7,10 @@ for information density and searchable, concrete terms — not prose.
 
 - LEAF ........ a function/method/class summarized from its own source.
 - CONTAINER ... a file/module/package/directory summarized from its children's summaries.
+- DOCUMENT .... a prose file (README, design note) summarized from its own text.
 - MAP / REDUCE  the two halves of map-reduce for a single leaf whose source is larger
-                than ``summary_max_source_chars`` (split -> summarize each chunk -> merge).
+                than ``summary_max_source_chars`` (split -> summarize each chunk -> merge);
+                documents have their own pair.
 
 Edit the strings below to change behavior; nothing else needs to change.
 """
@@ -52,6 +54,41 @@ CONTAINER_MAP_SYSTEM_PROMPT = (
     "sentences, state what this group of elements collectively does, the key libraries/APIs/datastores/"
     "types they use, and any notable side effects (DB/network/filesystem/state). Name the most important "
     "elements. Plain prose, no markdown. Return only the summary."
+)
+
+# A prose document (README, design note, changelog), summarized from its own text. The code
+# leaf prompt would be actively wrong here — it asks for call graphs and side effects a
+# document doesn't have — and the resulting summary is what an agent reads when deciding
+# whether this file answers a "why is it built this way" question.
+DOCUMENT_SYSTEM_PROMPT = (
+    "You write index entries for a documentation search engine used by AI coding agents. The agent "
+    "reads your summary — not the document — to decide whether opening it will answer its question, "
+    "and finds it by semantic similarity. Be information-dense and concrete.\n\n"
+    "For the given document, write 2-4 sentences covering, in this order:\n"
+    "1. what the document is (guide, API reference, design rationale, changelog, runbook, spec) and "
+    "the subject it covers;\n"
+    "2. the specific things it names — components, commands, config keys, endpoints, file paths, "
+    "environment variables, error messages — using their exact spelling, since those are what an "
+    "agent will search for;\n"
+    "3. the questions it actually answers or the decisions it records.\n\n"
+    "Plain prose, present tense. Do not begin with \"This document\", \"The purpose\", or \"A guide "
+    "that\"; do not repeat the file name; no markdown or bullets. If the document is a stub, "
+    "boilerplate, or a license, say so plainly in one sentence. Return only the summary."
+)
+
+# MAP half of map-reduce for an oversized document.
+DOCUMENT_MAP_SYSTEM_PROMPT = (
+    "You summarize one fragment of a longer document for a search index. In 2-3 sentences, state what "
+    "this fragment covers and the specific names it introduces — components, commands, config keys, "
+    "endpoints, paths, errors — with their exact spelling. Plain prose, no markdown. Return only the "
+    "summary."
+)
+
+# REDUCE half: merge the per-fragment summaries into the final document summary.
+DOCUMENT_REDUCE_SYSTEM_PROMPT = (
+    "You are given ordered partial summaries of consecutive fragments of ONE document. Merge them into "
+    "a single 2-4 sentence entry: what the document is and covers, the specific names it uses, and the "
+    "questions it answers. Do not begin with \"This document\"; no markdown. Return only the summary."
 )
 
 # MAP half of map-reduce: one chunk of an oversized single leaf.

@@ -25,6 +25,7 @@ PROPERTY_INDEXES: list[tuple[str, str]] = [
     ("Code", "node_type"),
     ("Directory", "project"),
     ("Module", "project"),
+    ("Document", "project"),
     ("Class", "project"),
     ("Function", "project"),
     ("Method", "project"),

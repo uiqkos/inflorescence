@@ -39,6 +39,7 @@
   --t-enum:      #dd7d6b;
   --t-struct:    #cd7ba3;
   --t-trait:     #cf8455;
+  --t-document:  #c8bd8e;
   --t-code:      #7d7f73;
 
   /* Relations */
@@ -275,6 +276,7 @@ a:hover { color: var(--accent); }
 .chip.enum      { --chip-c: var(--t-enum); }
 .chip.struct    { --chip-c: var(--t-struct); }
 .chip.trait     { --chip-c: var(--t-trait); }
+.chip.document  { --chip-c: var(--t-document); }
 .chip.code      { --chip-c: var(--t-code); }
 
 /* ---------------------------------------------------------------- buttons */

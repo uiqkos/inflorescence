@@ -43,6 +43,7 @@ It combines three views of your code, all kept in sync incrementally:
 | | |
 |---|---|
 | **Multi-language parsing** | Python (stdlib `ast`), JavaScript / TypeScript / Go / Rust (tree-sitter); a Python file that fails to parse falls back to an LLM extractor |
+| **Documentation too** | READMEs, design notes and `docs/**.md` are indexed whole — one node per file, body split into overlapping chunks — so the *why* is searchable next to the code |
 | **Real relationship graph** | Cross-file call/import/inheritance resolution — not just a symbol dump |
 | **Dual RAG** | Code chunks *and* LLM summaries embedded separately, then fused and deduped per entity |
 | **3-level summaries** | node → module → directory hierarchical summaries, generated once and reused |
@@ -121,10 +122,12 @@ flowchart LR
 ```mermaid
 flowchart TD
     DIR["Directory"] -->|CONTAINS| MOD["Module"]
+    DIR -->|CONTAINS| DOC["Document<br/>(README.md, notes.txt)"]
     MOD -->|CONTAINS| CLS["Class / Struct"]
     MOD -->|CONTAINS| FN["Function"]
     CLS -->|CONTAINS| METH["Method"]
     FN -->|HAS_CHUNK| CH["CodeChunk"]
+    DOC -->|HAS_CHUNK| CH
 
     METH -.->|CALLS| FN
     FN -.->|CALLS| FN
@@ -140,7 +143,7 @@ flowchart TD
     classDef chunk fill:#ffedd5,stroke:#ea580c,color:#1e293b
     classDef ext fill:#fef9c3,stroke:#ca8a04,color:#1e293b
     class DIR,MOD container
-    class CLS,FN,METH,IFACE entity
+    class CLS,FN,METH,IFACE,DOC entity
     class CH chunk
     class EXT ext
 ```
@@ -148,6 +151,14 @@ flowchart TD
 Solid edges are containment — the spine you traverse to browse the tree. Dashed edges are the
 real relationships between entities. Every node also carries its signature, docstring, source
 range and an embedded summary.
+
+**`Document`** nodes are prose files — `README.md`, `docs/**.md`, `notes.txt`. They sit in the
+containment tree beside modules, but they are leaves: a heading is not a symbol and nothing
+calls a paragraph, so no structure is invented above them. Their content reaches search as
+overlapping chunks of the file body, and their summary is written by a prompt that asks what
+the document answers rather than what it calls. Filter them in or out like any other type —
+`search_semantic(..., node_types=["document"])`, or `node_types=["function", "method"]` to
+exclude them.
 
 **`External`** nodes are the exception: a package the project imports or a base class it
 inherits from, which lives outside the indexed tree. They are deliberately *not* labelled
@@ -232,8 +243,9 @@ docker run -d --name inflorescence-memgraph \
 ```
 </details>
 
-> **Installing from PyPI** — `uv tool install inflorescence` will be the one-line path from the
-> first tagged release onward. It is not published yet, so use the source install above.
+> **Installing without a checkout** — `uv tool install git+https://github.com/uiqkos/inflorescence`
+> installs the CLI in one line; `uv tool install inflorescence` (PyPI) will follow from the
+> first tagged release.
 
 The server runs over stdio and is registered for you by `init`. To run it by hand:
 
@@ -368,6 +380,7 @@ All settings are environment variables (or a `.env` file). The ones you are like
 | `CODE_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Code-chunk embeddings |
 | `SUMMARY_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Summary embeddings |
 | `USE_LLM_SUMMARIES` | `true` | Set `false` for a graph-only index that sends nothing to an LLM |
+| `INDEX_DOCUMENTS` | `true` | Index prose files (`.md`, `.txt`, …) as whole documents. `false` leaves them out of the scan entirely |
 | `MAX_FILE_SIZE_BYTES` | `262144` | Skip files larger than this |
 | `MAX_INDEX_COST_USD` | `10.0` | Cost cap on a first index **and** on every watcher update. Set empty to remove the cap |
 | `REQUIRE_SEARCH_INDEXES` | `true` | Refuse to index against a Memgraph that cannot host vector indexes, instead of paying for unsearchable embeddings |
@@ -575,10 +588,17 @@ The design, the per-rung precision measurements and the known limits are written
 | JavaScript / TypeScript | tree-sitter |
 | Go | tree-sitter |
 | Rust | tree-sitter |
+| Prose documents | `.md`, `.markdown`, `.mdx`, `.rst`, `.txt`, `.text`, `.adoc`, `.asciidoc`, `.org` — indexed whole, not parsed |
 
 Only these extensions are scanned; files in other languages are skipped today. The
 parser layer is pluggable (`ParserRegistry` maps an extension to a parser), so broad
 tree-sitter coverage is a natural next step — see the note below.
+
+Documents are deliberately *not* parsed for structure: each file becomes one `Document`
+node and its body is split into overlapping windows (`DOCUMENT_CHUNK_SIZE` /
+`DOCUMENT_CHUNK_OVERLAP`), which is what keeps a passage in the middle of a long guide
+retrievable. They are summarized and embedded like code, so they cost money like code —
+set `INDEX_DOCUMENTS=false` to leave them out entirely, or narrow `DOCUMENT_EXTENSIONS`.
 
 ## Development
 

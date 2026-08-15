@@ -39,9 +39,18 @@ class RAGIndexer:
         self._repo = repo
         self._settings = settings
         self._batch_size = max(1, settings.rag_index_batch_size)
-        # Keep the chunker's size limit in lockstep with the graph scanner's, so a
-        # file large enough to index still gets code chunks (not just summaries).
-        self._chunker = chunker or Chunker(config=RAGConfig(max_file_size_bytes=settings.max_file_size_bytes))
+        # Every knob comes from Settings, so the documented env vars actually reach the
+        # splitters (CHUNK_SIZE / CHUNK_OVERLAP used to stop at Settings and never be
+        # threaded here — the RAGConfig defaults happened to match, which hid it). The
+        # size limit is kept in lockstep with the graph scanner's, so a file large enough
+        # to index still gets code chunks and not just summaries.
+        self._chunker = chunker or Chunker(config=RAGConfig(
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+            document_chunk_size=settings.document_chunk_size,
+            document_chunk_overlap=settings.document_chunk_overlap,
+            max_file_size_bytes=settings.max_file_size_bytes,
+        ))
         self._code_embedder = EmbeddingClient(
             settings=settings,
             model=settings.code_embedding_model,

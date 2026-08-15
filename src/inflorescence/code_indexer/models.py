@@ -8,7 +8,12 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, model_validator
 
-from inflorescence.config import DEFAULT_EXCLUDE_PATTERNS, GENERATED_FILE_PATTERNS, Settings
+from inflorescence.config import (
+    DEFAULT_DOCUMENT_EXTENSIONS,
+    DEFAULT_EXCLUDE_PATTERNS,
+    GENERATED_FILE_PATTERNS,
+    Settings,
+)
 
 
 class NodeType(StrEnum):
@@ -21,6 +26,11 @@ class NodeType(StrEnum):
     ENUM = "enum"
     STRUCT = "struct"
     TRAIT = "trait"
+    # A prose file (README, docs/*.md, notes.txt) indexed whole: it has no symbols to
+    # contain and no calls to resolve, so it is a leaf of the containment tree and its
+    # body is chunked with overlap instead of being parsed. Kept apart from MODULE so a
+    # search for modules doesn't return documentation and vice versa.
+    DOCUMENT = "document"
 
 
 class EdgeType(StrEnum):
@@ -237,6 +247,11 @@ class IndexerConfig(BaseModel):
     generated_patterns: list[str] = Field(default_factory=lambda: list(GENERATED_FILE_PATTERNS))
     use_llm_summaries: bool = True
     use_llm_fallback_parser: bool = True
+    # Prose documents (.md/.txt/...) are scanned, stored as one node per file, and chunked
+    # with overlap. Turning this off removes their extensions from the scan entirely, so
+    # nothing about them is read, summarized, or embedded.
+    index_documents: bool = True
+    document_extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_DOCUMENT_EXTENSIONS))
     enabled_languages: list[str] = Field(
         default_factory=lambda: ["python", "javascript", "typescript", "go", "rust"]
     )
@@ -267,6 +282,8 @@ class IndexerConfig(BaseModel):
             max_file_size_bytes=settings.max_file_size_bytes,
             skip_generated=settings.skip_generated,
             use_llm_summaries=settings.use_llm_summaries,
+            index_documents=settings.index_documents,
+            document_extensions=settings.document_extensions,
             use_scip_semantic=settings.use_scip_semantic,
             scip_timeout_seconds=settings.scip_timeout_seconds,
             scip_runner=settings.scip_runner,
