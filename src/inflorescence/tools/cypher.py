@@ -243,6 +243,14 @@ def register_cypher_tools(mcp: FastMCP, manager: ProjectManager, conn: MemgraphC
           MATCH (n:Code {project: $project}) WHERE n.node_type = 'method' RETURN n.name
         Relationships: CONTAINS, CALLS, IMPORTS, INHERITS, IMPLEMENTS, HAS_CHUNK.
 
+        Unlike the entity tools, rows are raw graph data; freshness is not checked here —
+        a row may name a file that has changed or been deleted since indexing.
+
+        If `directory` is a git worktree of an already-indexed checkout that has not been
+        indexed yet, this first call indexes it before answering and can take noticeably
+        longer than a normal query (parsing and graph writes; summaries and embeddings are
+        reused from the main checkout, so there is no LLM spend). Later calls are fast.
+
         Args:
             directory: Absolute path of the indexed project.
             query: Cypher query string (read-only).
@@ -252,15 +260,19 @@ def register_cypher_tools(mcp: FastMCP, manager: ProjectManager, conn: MemgraphC
             code = "invalid_argument" if "limit/offset" in validation_error else "unsafe_query"
             return error_response(code, validation_error)
 
-        project = manager.get_project(directory)
         # A path that was never indexed synthesises a valid-but-empty project id; a scoped
         # query then returns an empty page indistinguishable from "no rows matched". Surface
         # it distinctly so the caller indexes first rather than trusting silence (finding T5).
-        if not await manager.project_is_indexed(project):
+        # The manager decides whether the directory can instead be indexed on the spot (a
+        # fresh worktree of an indexed checkout seeds from it for free) and, when it cannot,
+        # supplies the reason — including "auto-index attempted and failed: …", which must
+        # reach the caller as this same structured error, never as an exception (INV-7).
+        project, reason = await manager.ensure_indexed_for_query(directory)
+        if reason is not None:
             return error_response(
                 "project_not_indexed",
-                f"No index found for {directory!r} (project '{project}'). Index it with "
-                "index_directory first — this is different from a query that matched no rows.",
+                f"No index found for {directory!r} (project '{project}') — {reason}. This is "
+                "different from a query that matched no rows.",
             )
         bounded_limit = clamp_limit(limit)
         bounded_offset = clamp_offset(offset)
@@ -292,6 +304,7 @@ def register_cypher_tools(mcp: FastMCP, manager: ProjectManager, conn: MemgraphC
         Returns the node labels, node-type values, relationship types, the property keys on
         Code/CodeChunk nodes, the named vector/text indexes, the read-only query rules, and a
         few worked examples. No graph scan — this is a static description of the schema.
+        Rows a cypher_query returns are raw graph data; freshness is not checked here.
 
         Args:
             directory: Absolute path of the indexed project (used to echo the project id).

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -14,7 +15,9 @@ from inflorescence.db.schema import setup_schema
 from inflorescence.rag.chunker import Chunk
 from inflorescence.rag.embeddings import EmbeddingClient
 from inflorescence.rag.indexer import RAGIndexer
+from inflorescence.tools import freshness
 from inflorescence.tools.cypher import register_cypher_tools
+from inflorescence.tools.freshness import FreshnessChecker
 from inflorescence.tools.graph import register_graph_tools
 from inflorescence.tools.indexing import register_indexing_tools
 from inflorescence.tools.path_filters import PathFilterConfig, path_is_allowed
@@ -1384,6 +1387,25 @@ def entity(
     }
 
 
+class StoredChecksums:
+    """The ``get_checksums`` every entity-returning tool calls once, for freshness.
+
+    Empty by default, which lands every path in ``index_freshness.unknown`` — the honest
+    answer for a fake project whose files were never really indexed, and the one status
+    that puts no flag on an item, so the tool tests above keep asserting bare entity refs.
+    Tests that care set ``repo.checksums``; ``checksum_calls`` guards the one-call budget.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.checksums: dict[str, str] = {}
+        self.checksum_calls = 0
+
+    async def get_checksums(self, project: str) -> dict[str, str]:
+        self.checksum_calls += 1
+        return dict(self.checksums)
+
+
 class FakeEmbedder:
     def __init__(self, embeddings: list[list[float] | None]) -> None:
         self.model = "fake-model"
@@ -1481,6 +1503,17 @@ class FakeManager:
         # short-circuits genuinely unindexed projects, which these tests never exercise.
         return True
 
+    async def ensure_indexed_for_query(self, directory: str) -> tuple[str, str | None]:
+        """What the read tools actually call: (project, reason-it-cannot-be-queried).
+
+        Mirrors the real manager for the fakes' case — an indexed project, nothing to
+        auto-index. Subclasses below stand in for the unindexed ones.
+        """
+        project = self.get_project(directory)
+        if await self.project_is_indexed(project):
+            return project, None
+        return project, "index it with index_directory first"
+
 
 class FakeIndexManager(FakeManager):
     async def index_directory(
@@ -1510,8 +1543,9 @@ class FakeWatcher:
         self.started.append((project, path))
 
 
-class FakeGraphRepositoryV2:
+class FakeGraphRepositoryV2(StoredChecksums):
     def __init__(self) -> None:
+        super().__init__()
         self.root = entity("pkg/a.py", "a", "module", "pkg/a.py", 1, 30, "Module.")
         self.pages: list[list[dict[str, object]]] | None = None
         self.list_calls: list[tuple[int, int]] = []
@@ -1584,7 +1618,7 @@ class FakeGraphRepositoryV2:
         return [entity()]
 
 
-class FakeContextRepository(FakeManager):
+class FakeContextRepository(StoredChecksums, FakeManager):
     async def get_entity_context(
         self,
         project: str,
@@ -1607,8 +1641,9 @@ class FakeContextRepository(FakeManager):
         }
 
 
-class FakeSearchRepository:
+class FakeSearchRepository(StoredChecksums):
     def __init__(self) -> None:
+        super().__init__()
         self.code_searches = 0
 
     async def search_code_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
@@ -1650,8 +1685,9 @@ class FakeSearchRepository:
         ]
 
 
-class FakeTextSearchRepository:
+class FakeTextSearchRepository(StoredChecksums):
     def __init__(self) -> None:
+        super().__init__()
         self.summary_calls = 0
         self.symbol_calls = 0
         self.code_calls = 0
@@ -1676,7 +1712,7 @@ class FakeTextSearchRepository:
         return self.code_rows
 
 
-class FakeFailingTextRepository:
+class FakeFailingTextRepository(StoredChecksums):
     async def search_summary_text(self, project: str, query: str, top_k: int) -> list[dict[str, object]]:
         raise RuntimeError("text index summary_text does not exist")
 
@@ -1687,7 +1723,7 @@ class FakeFailingTextRepository:
         return []
 
 
-class FakeConnectionErrorTextRepository:
+class FakeConnectionErrorTextRepository(StoredChecksums):
     async def search_summary_text(self, project: str, query: str, top_k: int) -> list[dict[str, object]]:
         raise RuntimeError("Connection to Memgraph was lost")
 
@@ -2037,7 +2073,14 @@ async def test_get_entity_context_tool_paginates_and_trims_sections() -> None:
     ]
     assert payload["sections"]["incoming"]["page"] == page_dict(1, 0, None, False)
     assert payload["sections"]["outgoing"]["items"] == []
-    assert payload["meta"] == {"project": "project-id", "node_id": "pkg/a.py::Worker", "relation_types": ["CALLS"]}
+    assert payload["meta"] == {
+        "project": "project-id",
+        "node_id": "pkg/a.py::Worker",
+        "relation_types": ["CALLS"],
+        # /tmp/project holds no such files, and the fake stored no checksums: every path
+        # on the page is 'unknown', which is meta-only and flags no item.
+        "index_freshness": {"checked": 2, "stale": [], "missing": [], "unknown": ["pkg/a.py", "pkg/b.py"]},
+    }
 
 
 @pytest.mark.asyncio
@@ -2058,6 +2101,80 @@ async def test_get_related_entities_tool_returns_compact_related_refs() -> None:
     assert payload["meta"]["project"] == "project-id"
     assert payload["meta"]["direction"] == "both"
     assert "content" not in str(payload)
+
+
+class RecordingDirectionRepository(FakeGraphRepositoryV2):
+    """Records the direction value the tool actually passes to the repository."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_directions: list[str] = []
+
+    async def get_related_entities(
+        self,
+        project: str,
+        node_id: str,
+        direction: str,
+        relation_types: list[str] | None,
+        limit: int,
+        offset: int,
+    ) -> list[dict[str, object]]:
+        self.seen_directions.append(direction)
+        return [{"relation": "CONTAINS", "direction": "outgoing", "entity": entity()}]
+
+
+@pytest.mark.asyncio
+async def test_get_related_entities_tool_normalizes_direction_aliases_case_insensitively() -> None:
+    mcp = FastMCP("test")
+    repo = RecordingDirectionRepository()
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    cases = [
+        ("both", "both"),
+        ("BOTH", "both"),
+        ("outgoing", "outgoing"),
+        ("out", "outgoing"),
+        ("Out", "outgoing"),
+        ("incoming", "incoming"),
+        ("in", "incoming"),
+        ("IN", "incoming"),
+        ("INCOMING", "incoming"),
+    ]
+
+    for raw_direction, expected in cases:
+        payload = _payload(
+            await mcp.call_tool(
+                "get_related_entities",
+                {"directory": "/tmp/project", "node_id": "pkg/a.py::Worker", "direction": raw_direction},
+            )
+        )
+        assert "error" not in payload, f"direction={raw_direction!r} unexpectedly errored: {payload}"
+        assert payload["meta"]["direction"] == expected
+
+    assert repo.seen_directions == [expected for _, expected in cases]
+
+
+@pytest.mark.asyncio
+async def test_get_related_entities_tool_rejects_invalid_direction_without_querying_db() -> None:
+    mcp = FastMCP("test")
+    repo = RecordingDirectionRepository()
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(
+        await mcp.call_tool(
+            "get_related_entities",
+            {"directory": "/tmp/project", "node_id": "pkg/a.py::Worker", "direction": "sideways"},
+        )
+    )
+
+    assert payload["error"]["code"] == "invalid_direction"
+    assert "sideways" in payload["error"]["message"]
+    assert "both" in payload["error"]["message"]
+    assert "incoming" in payload["error"]["message"]
+    assert "outgoing" in payload["error"]["message"]
+    # Bug regression: an invalid direction must not silently reach the DB and
+    # come back as an indistinguishable empty page (INV-7).
+    assert repo.seen_directions == []
 
 
 @pytest.mark.asyncio
@@ -2204,10 +2321,11 @@ def test_get_entity_context_query_uses_offset_and_relation_types() -> None:
     assert "[0..$limit]" not in q
 
 
-class _SaturatingSearchRepo:
+class _SaturatingSearchRepo(StoredChecksums):
     """A repo whose vector search fills the candidate pool with rows outside any filter."""
 
     def __init__(self, count: int) -> None:
+        super().__init__()
         self.count = count
 
     def _rows(self, top_k: int) -> list[dict[str, object]]:
@@ -2292,7 +2410,7 @@ async def test_list_entities_flags_truncation_when_scan_hits_the_cap() -> None:
     # can tell "scan capped" from "no such entities".
     from inflorescence.tools.graph import MAX_FILTER_SCAN_ROWS
 
-    class _NeverMatchRepo(FakeManager):
+    class _NeverMatchRepo(StoredChecksums, FakeManager):
         async def list_entities(self, project, node_types, limit, offset):
             # Always a full page of non-matching rows -> the scan never exhausts.
             return [{"id": str(offset + i), "file_path": f"other/x{offset + i}.py"} for i in range(limit)]
@@ -2308,3 +2426,672 @@ async def test_list_entities_flags_truncation_when_scan_hits_the_cap() -> None:
     assert payload["items"] == []
     assert payload["page"]["truncated"] is True
     assert MAX_FILTER_SCAN_ROWS == 5000
+
+
+# ---------------------------------------------------------------------------
+# Read tools and the auto-index gate. A tool never decides what may be indexed — it asks
+# the manager and either queries or reports the manager's reason (INV-7: no silent empty
+# page, no raised exception where a structured error is the contract).
+# ---------------------------------------------------------------------------
+
+
+class _AutoIndexingManager(FakeManager):
+    """Stands in for a worktree the manager indexes inline on the first query."""
+
+    def __init__(self) -> None:
+        self.ensured: list[str] = []
+
+    async def project_is_indexed(self, project: str) -> bool:
+        # Deliberately still False: a tool that consulted this instead of the ensure
+        # method would refuse a query the manager just made answerable.
+        return False
+
+    async def ensure_indexed_for_query(self, directory: str) -> tuple[str, str | None]:
+        self.ensured.append(directory)
+        return self.get_project(directory), None
+
+
+class _RefusingManager(FakeManager):
+    """Stands in for a directory that cannot be queried, for the manager's stated reason."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    async def project_is_indexed(self, project: str) -> bool:
+        return False
+
+    async def ensure_indexed_for_query(self, directory: str) -> tuple[str, str | None]:
+        return self.get_project(directory), self.reason
+
+
+@pytest.mark.asyncio
+async def test_search_text_answers_after_the_manager_auto_indexes_the_directory() -> None:
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    repo.symbol_rows = [{**entity("pkg/a.py::a", "a", "function", "pkg/a.py", 1, 2, "Alpha."), "score": 5.0}]
+    manager = _AutoIndexingManager()
+    register_search_tools(mcp, manager, repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/wt", "query": "a"}))
+
+    assert manager.ensured == ["/tmp/wt"]
+    assert [item["entity"]["id"] for item in payload["items"]] == ["pkg/a.py::a"]
+    assert "error" not in payload
+
+
+@pytest.mark.asyncio
+async def test_search_text_reports_a_failed_auto_index_as_not_indexed() -> None:
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    manager = _RefusingManager("auto-index attempted and failed: OPENROUTER_API_KEY is not set")
+    register_search_tools(mcp, manager, repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/wt", "query": "a"}))
+
+    assert payload["error"]["code"] == "project_not_indexed"
+    assert "auto-index attempted and failed: OPENROUTER_API_KEY is not set" in payload["error"]["message"]
+    assert repo.symbol_calls == 0                  # refused before touching the graph
+
+
+@pytest.mark.asyncio
+async def test_search_text_still_refuses_a_never_indexed_directory() -> None:
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    register_search_tools(mcp, _RefusingManager("index it with index_directory first"), repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/nope", "query": "a"}))
+
+    assert payload["error"]["code"] == "project_not_indexed"
+    assert "index_directory" in payload["error"]["message"]
+    assert repo.symbol_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_search_semantic_and_hybrid_and_code_share_the_auto_index_gate(monkeypatch) -> None:
+    mcp = FastMCP("test")
+    manager = _RefusingManager("auto-index attempted and failed: boom")
+    register_search_tools(mcp, manager, FakeSearchRepository(), Settings(_env_file=None))
+    for name in ("search_code", "search_semantic", "search_hybrid"):
+        tool = mcp._tool_manager.get_tool(name)
+        monkeypatch.setattr(_closure_cell_with_attr(tool.fn, "model"), "embed", lambda texts: [[0.1, 0.2]])
+        payload = _payload(await mcp.call_tool(name, {"directory": "/tmp/wt", "query": "q"}))
+        assert payload["error"]["code"] == "project_not_indexed", name
+        assert "auto-index attempted and failed: boom" in payload["error"]["message"], name
+
+
+@pytest.mark.asyncio
+async def test_cypher_query_answers_after_the_manager_auto_indexes_the_directory() -> None:
+    mcp = FastMCP("test")
+    conn = FakeConnection()
+    conn.records = [{"count": 1}]
+    manager = _AutoIndexingManager()
+    register_cypher_tools(mcp, manager, conn)
+
+    payload = _payload(await mcp.call_tool(
+        "cypher_query",
+        {"directory": "/tmp/wt", "query": "MATCH (n:Code {project: $project}) RETURN count(n) AS count"},
+    ))
+
+    assert manager.ensured == ["/tmp/wt"]
+    assert payload["items"] == [{"count": 1}]
+
+
+@pytest.mark.asyncio
+async def test_cypher_query_reports_a_failed_auto_index_as_not_indexed() -> None:
+    mcp = FastMCP("test")
+    conn = FakeConnection()
+    manager = _RefusingManager("auto-index attempted and failed: cost cap exceeded")
+    register_cypher_tools(mcp, manager, conn)
+
+    payload = _payload(await mcp.call_tool(
+        "cypher_query",
+        {"directory": "/tmp/wt", "query": "MATCH (n:Code {project: $project}) RETURN n.name"},
+    ))
+
+    assert payload["error"]["code"] == "project_not_indexed"
+    assert "auto-index attempted and failed: cost cap exceeded" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_cypher_query_still_refuses_a_never_indexed_directory() -> None:
+    mcp = FastMCP("test")
+    conn = FakeConnection()
+    register_cypher_tools(mcp, _RefusingManager("index it with index_directory first"), conn)
+
+    payload = _payload(await mcp.call_tool(
+        "cypher_query",
+        {"directory": "/tmp/nope", "query": "MATCH (n:Code {project: $project}) RETURN n.name"},
+    ))
+
+    assert payload["error"]["code"] == "project_not_indexed"
+    assert "index_directory" in payload["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# The navigation tools share the same two pre-DB guards as the search tools:
+# the auto-index gate (INV-7: a typo'd directory or a fresh worktree must never
+# read as "no matches") and node_type validation.
+# ---------------------------------------------------------------------------
+
+
+class _CountingGraphRepository(FakeGraphRepositoryV2):
+    """Counts every read the tools issue, and records the node_types they pass down."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads = 0
+        self.seen_node_types: list[list[str] | None] = []
+
+    async def list_entities(self, project, node_types, limit, offset):
+        self.reads += 1
+        self.seen_node_types.append(node_types)
+        return await super().list_entities(project, node_types, limit, offset)
+
+    async def get_structure_root(self, project, node_id=None, file_path=None):
+        self.reads += 1
+        return await super().get_structure_root(project, node_id=node_id, file_path=file_path)
+
+    async def get_entity_structure(self, project, root_id, depth, node_types, limit, offset):
+        self.reads += 1
+        self.seen_node_types.append(node_types)
+        return await super().get_entity_structure(project, root_id, depth, node_types, limit, offset)
+
+    async def get_entity_context(self, project, node_id, relation_types, limit, offset):
+        self.reads += 1
+        return await super().get_entity_context(project, node_id, relation_types, limit, offset)
+
+    async def get_related_entities(self, project, node_id, direction, relation_types, limit, offset):
+        self.reads += 1
+        return await super().get_related_entities(project, node_id, direction, relation_types, limit, offset)
+
+    async def search_entities(self, project, query, node_types, limit, offset):
+        self.reads += 1
+        self.seen_node_types.append(node_types)
+        return await super().search_entities(project, query, node_types, limit, offset)
+
+
+_GRAPH_TOOL_ARGS = {
+    "list_entities": {},
+    "get_entity_structure": {"file_path": "pkg/a.py"},
+    "get_entity_context": {"node_id": "pkg/a.py::Worker"},
+    "get_related_entities": {"node_id": "pkg/a.py::Worker"},
+    "search_entities": {"query": "Worker"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", sorted(_GRAPH_TOOL_ARGS))
+async def test_graph_tools_refuse_a_never_indexed_directory(tool_name: str) -> None:
+    mcp = FastMCP("test")
+    repo = _CountingGraphRepository()
+    register_graph_tools(mcp, _RefusingManager("index it with index_directory first"), repo)
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": "/tmp/nope", **_GRAPH_TOOL_ARGS[tool_name]}))
+
+    assert payload["error"]["code"] == "project_not_indexed", payload
+    assert "index_directory" in payload["error"]["message"]
+    assert repo.reads == 0  # refused before touching the graph
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", sorted(_GRAPH_TOOL_ARGS))
+async def test_graph_tools_answer_after_the_manager_auto_indexes_the_directory(tool_name: str) -> None:
+    mcp = FastMCP("test")
+    repo = _CountingGraphRepository()
+    manager = _AutoIndexingManager()
+    register_graph_tools(mcp, manager, repo)
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": "/tmp/wt", **_GRAPH_TOOL_ARGS[tool_name]}))
+
+    # project_is_indexed still says False: only ensure_indexed_for_query makes this answerable.
+    assert manager.ensured == ["/tmp/wt"]
+    assert "error" not in payload, payload
+    assert repo.reads > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", sorted(_GRAPH_TOOL_ARGS))
+async def test_graph_tools_report_a_failed_auto_index_as_not_indexed(tool_name: str) -> None:
+    mcp = FastMCP("test")
+    repo = _CountingGraphRepository()
+    manager = _RefusingManager("auto-index attempted and failed: boom")
+    register_graph_tools(mcp, manager, repo)
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": "/tmp/wt", **_GRAPH_TOOL_ARGS[tool_name]}))
+
+    assert payload["error"]["code"] == "project_not_indexed", payload
+    assert "auto-index attempted and failed: boom" in payload["error"]["message"]
+
+
+# --- node_types validation -------------------------------------------------
+
+
+_NODE_TYPE_GRAPH_TOOLS = {
+    "list_entities": {},
+    "get_entity_structure": {"file_path": "pkg/a.py"},
+    "search_entities": {"query": "Worker"},
+}
+
+
+def _assert_invalid_node_type(payload: dict, bad_value: str) -> None:
+    assert payload["error"]["code"] == "invalid_node_type", payload
+    message = payload["error"]["message"]
+    assert bad_value in message
+    for valid in NodeType:
+        assert valid.value in message, message
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", sorted(_NODE_TYPE_GRAPH_TOOLS))
+async def test_graph_tools_reject_an_unknown_node_type_with_the_valid_list(tool_name: str) -> None:
+    mcp = FastMCP("test")
+    repo = _CountingGraphRepository()
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(
+        await mcp.call_tool(tool_name, {"directory": "/tmp/project", "node_types": ["func"], **_NODE_TYPE_GRAPH_TOOLS[tool_name]})
+    )
+
+    _assert_invalid_node_type(payload, "func")
+    assert repo.reads == 0  # rejected before the query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", sorted(["search_code", "search_semantic", "search_hybrid"]))
+async def test_vector_search_tools_reject_an_unknown_node_type_before_embedding(tool_name: str) -> None:
+    mcp = FastMCP("test")
+    repo = FakeSearchRepository()
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": "/tmp/project", "query": "q", "node_types": ["Func"]}))
+
+    _assert_invalid_node_type(payload, "Func")
+    assert repo.code_searches == 0
+
+
+@pytest.mark.asyncio
+async def test_search_text_rejects_an_unknown_node_type_before_querying() -> None:
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/project", "query": "q", "node_types": ["klass"]}))
+
+    _assert_invalid_node_type(payload, "klass")
+    assert repo.symbol_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_list_entities_normalizes_node_type_case_before_querying() -> None:
+    mcp = FastMCP("test")
+    repo = _CountingGraphRepository()
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(
+        await mcp.call_tool("list_entities", {"directory": "/tmp/project", "node_types": ["FUNCTION", "Method"]})
+    )
+
+    assert repo.seen_node_types == [["function", "method"]]
+    assert payload["meta"]["node_types"] == ["function", "method"]
+
+
+@pytest.mark.asyncio
+async def test_search_text_normalizes_node_type_case_before_filtering() -> None:
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    repo.symbol_rows = [{**entity("pkg/a.py::run", "run", "function", "pkg/a.py", 1, 2, "Runs."), "score": 5.0}]
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+
+    payload = _payload(
+        await mcp.call_tool("search_text", {"directory": "/tmp/project", "query": "run", "node_types": ["Function"]})
+    )
+
+    assert [item["entity"]["id"] for item in payload["items"]] == ["pkg/a.py::run"]
+    assert payload["meta"]["node_types"] == ["function"]
+
+
+@pytest.mark.asyncio
+async def test_list_entities_without_node_types_still_passes_none_to_the_repository() -> None:
+    mcp = FastMCP("test")
+    repo = _CountingGraphRepository()
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": "/tmp/project"}))
+
+    assert repo.seen_node_types == [None]
+    assert payload["meta"]["node_types"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", sorted(_NODE_TYPE_GRAPH_TOOLS))
+async def test_node_type_docs_stay_in_sync_with_the_enum(tool_name: str) -> None:
+    """The docstrings spell the node types out; a new NodeType must not leave them stale."""
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), _CountingGraphRepository())
+
+    description = mcp._tool_manager.get_tool(tool_name).description
+
+    for node_type in NodeType:
+        assert node_type.value in description, f"{tool_name} does not document {node_type.value}"
+
+
+# ---------------------------------------------------------------------------
+# Freshness. Every entity-returning tool re-hashes the files behind the page it
+# is about to return, so an unflagged item means "checked, unchanged" — never
+# "not checked". The meta block is therefore unconditional; the item flags are not.
+# ---------------------------------------------------------------------------
+
+
+def _write_file(root: Path, rel: str, text: str) -> str:
+    """Write a file under *root* and return the MD5 an index would have stored for it."""
+    path = root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return hashlib.md5(path.read_bytes()).hexdigest()  # noqa: S324 — matches the indexer
+
+
+def test_freshness_checker_classifies_fresh_stale_missing_and_unknown(tmp_path: Path) -> None:
+    stored = {
+        "pkg/fresh.py": _write_file(tmp_path, "pkg/fresh.py", "unchanged\n"),
+        "pkg/stale.py": _write_file(tmp_path, "pkg/stale.py", "before\n"),
+        "pkg/gone.py": _write_file(tmp_path, "pkg/gone.py", "doomed\n"),
+    }
+    (tmp_path / "pkg/stale.py").write_text("after the index ran\n")
+    (tmp_path / "pkg/gone.py").unlink()
+    _write_file(tmp_path, "pkg/unstored.py", "no checksum was ever stored\n")
+    checker = FreshnessChecker(tmp_path, stored)
+
+    items: list[dict[str, object]] = [
+        {"id": "1", "file_path": "pkg/fresh.py"},
+        {"id": "2", "file_path": "pkg/stale.py"},
+        {"id": "3", "file_path": "pkg/gone.py"},
+        {"id": "4", "file_path": "pkg/unstored.py"},
+        {"id": "5"},  # no file_path: nothing to check, nothing to count
+    ]
+    checker.annotate_items(items)
+
+    assert items[0] == {"id": "1", "file_path": "pkg/fresh.py"}  # fresh = untouched
+    assert items[1]["stale"] is True
+    assert items[2]["file_missing"] is True
+    assert "stale" not in items[3] and "file_missing" not in items[3]  # unknown: meta only
+    assert items[4] == {"id": "5"}
+    assert checker.meta() == {
+        "checked": 4,
+        "stale": ["pkg/stale.py"],
+        "missing": ["pkg/gone.py"],
+        "unknown": ["pkg/unstored.py"],
+    }
+
+
+def test_freshness_calls_an_unreadable_file_unknown_rather_than_missing(tmp_path: Path, monkeypatch) -> None:
+    """A file that is there but cannot be read is not evidence of a ghost node."""
+    stored = {"a.py": _write_file(tmp_path, "a.py", "x\n")}
+    monkeypatch.setattr(freshness.FileChecksum, "try_compute", staticmethod(lambda path, root=None: None))
+
+    checker = FreshnessChecker(tmp_path, stored)
+
+    assert checker.status("a.py") == "unknown"
+    assert checker.meta() == {"checked": 1, "stale": [], "missing": [], "unknown": ["a.py"]}
+
+
+def test_freshness_hashes_each_file_once_per_page(tmp_path: Path, monkeypatch) -> None:
+    digest = _write_file(tmp_path, "pkg/a.py", "def run(): ...\n")
+    read_paths: list[Path] = []
+    real_try_compute = freshness.FileChecksum.try_compute
+
+    def counting_try_compute(path: Path, root: Path | None = None):
+        read_paths.append(path)
+        return real_try_compute(path, root)
+
+    monkeypatch.setattr(freshness.FileChecksum, "try_compute", staticmethod(counting_try_compute))
+    checker = FreshnessChecker(tmp_path, {"pkg/a.py": digest})
+
+    checker.annotate_items([
+        {"id": "pkg/a.py::run", "file_path": "pkg/a.py"},
+        {"id": "pkg/a.py::Worker", "file_path": "pkg/a.py"},
+        {"relation": "CALLS", "entity": {"id": "pkg/a.py::Worker.run", "file_path": "pkg/a.py"}},
+    ])
+
+    assert len(read_paths) == 1
+    assert checker.meta()["checked"] == 1
+
+
+@pytest.mark.asyncio
+async def test_list_entities_reports_a_fresh_page_with_no_item_flags(tmp_path: Path) -> None:
+    mcp = FastMCP("test")
+    repo = FakeGraphRepositoryV2()
+    repo.checksums = {
+        "pkg/a.py": _write_file(tmp_path, "pkg/a.py", "def run(): ...\n"),
+        "tests/test_a.py": _write_file(tmp_path, "tests/test_a.py", "def test_run(): ...\n"),
+    }
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": str(tmp_path), "limit": 10}))
+
+    assert payload["meta"]["index_freshness"] == {"checked": 2, "stale": [], "missing": [], "unknown": []}
+    assert payload["items"] == [
+        entity("pkg/a.py::run", "run", "function", "pkg/a.py", 2, 4, "Runs."),
+        entity("tests/test_a.py::test_run", "test_run", "function", "tests/test_a.py", 1, 3, "Tests."),
+    ]
+    assert repo.checksum_calls == 1  # one get_checksums per tool call, whole project
+
+
+@pytest.mark.asyncio
+async def test_list_entities_flags_only_the_entities_of_the_changed_file(tmp_path: Path) -> None:
+    mcp = FastMCP("test")
+    repo = FakeGraphRepositoryV2()
+    repo.checksums = {
+        "pkg/a.py": _write_file(tmp_path, "pkg/a.py", "def run(): ...\n"),
+        "tests/test_a.py": _write_file(tmp_path, "tests/test_a.py", "def test_run(): ...\n"),
+    }
+    (tmp_path / "pkg" / "a.py").write_text("def run():\n    return 'edited since the index ran'\n")
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": str(tmp_path), "limit": 10}))
+
+    assert payload["meta"]["index_freshness"] == {
+        "checked": 2,
+        "stale": ["pkg/a.py"],
+        "missing": [],
+        "unknown": [],
+    }
+    assert payload["items"][0]["id"] == "pkg/a.py::run"
+    assert payload["items"][0]["stale"] is True
+    assert "stale" not in payload["items"][1]  # the untouched file's entity stays unflagged
+
+
+@pytest.mark.asyncio
+async def test_search_text_reports_a_deleted_file_as_missing(tmp_path: Path) -> None:
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    repo.summary_rows = [{**entity(), "score": 3.0}]  # pkg/module.py — deleted below
+    repo.symbol_rows = [
+        {**entity("pkg/other.py::other", "other", "function", "pkg/other.py", 1, 2, "Other."), "score": 1.0}
+    ]
+    repo.checksums = {
+        "pkg/module.py": _write_file(tmp_path, "pkg/module.py", "class Worker: ...\n"),
+        "pkg/other.py": _write_file(tmp_path, "pkg/other.py", "def other(): ...\n"),
+    }
+    (tmp_path / "pkg" / "module.py").unlink()
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": str(tmp_path), "query": "worker"}))
+
+    assert payload["meta"]["index_freshness"] == {
+        "checked": 2,
+        "stale": [],
+        "missing": ["pkg/module.py"],
+        "unknown": [],
+    }
+    assert payload["items"][0]["entity"]["file_path"] == "pkg/module.py"
+    assert payload["items"][0]["entity"]["file_missing"] is True
+    assert "file_missing" not in payload["items"][1]["entity"]
+    assert repo.checksum_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_search_semantic_leaves_files_without_a_stored_checksum_unflagged(tmp_path: Path, monkeypatch) -> None:
+    """No stored checksum (a node that is not a module/document) is 'unknown', not 'stale'."""
+    mcp = FastMCP("test")
+    repo = FakeSearchRepository()  # checksums stay empty
+    _write_file(tmp_path, "pkg/module.py", "class Worker: ...\n")
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool("search_semantic", {"directory": str(tmp_path), "query": "worker"}))
+
+    assert payload["meta"]["index_freshness"] == {
+        "checked": 3,
+        "stale": [],
+        "missing": [],
+        "unknown": ["pkg/low.py", "pkg/module.py", "tests/test_module.py"],
+    }
+    assert all("stale" not in item["entity"] for item in payload["items"])
+    assert all("file_missing" not in item["entity"] for item in payload["items"])
+
+
+@pytest.mark.asyncio
+async def test_get_entity_context_annotates_entity_parent_and_sections(tmp_path: Path) -> None:
+    mcp = FastMCP("test")
+    repo = FakeContextRepository()
+    repo.checksums = {
+        "pkg/a.py": _write_file(tmp_path, "pkg/a.py", "class Worker: ...\n"),
+        "pkg/b.py": _write_file(tmp_path, "pkg/b.py", "def call(): ...\n"),
+    }
+    (tmp_path / "pkg" / "a.py").write_text("class Worker:\n    pass\n")
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(
+        await mcp.call_tool(
+            "get_entity_context",
+            {"directory": str(tmp_path), "node_id": "pkg/a.py::Worker", "limit": 5},
+        )
+    )
+
+    assert payload["entity"]["stale"] is True
+    assert payload["parent"]["stale"] is True
+    assert payload["sections"]["children"]["items"][0]["stale"] is True
+    assert "stale" not in payload["sections"]["incoming"]["items"][0]["entity"]  # pkg/b.py is fresh
+    assert payload["meta"]["index_freshness"] == {
+        "checked": 2,
+        "stale": ["pkg/a.py"],
+        "missing": [],
+        "unknown": [],
+    }
+    assert repo.checksum_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_get_entity_structure_annotates_its_root_too(tmp_path: Path) -> None:
+    mcp = FastMCP("test")
+    repo = FakeGraphRepositoryV2()
+    repo.checksums = {"pkg/a.py": _write_file(tmp_path, "pkg/a.py", "class Worker: ...\n")}
+    (tmp_path / "pkg" / "a.py").write_text("class Worker:\n    def run(self): ...\n")
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(
+        await mcp.call_tool(
+            "get_entity_structure",
+            {"directory": str(tmp_path), "file_path": "pkg/a.py", "limit": 10},
+        )
+    )
+
+    assert payload["root"]["stale"] is True
+    assert all(item["stale"] is True for item in payload["items"])
+    assert payload["meta"]["index_freshness"]["stale"] == ["pkg/a.py"]
+    assert payload["meta"]["index_freshness"]["checked"] == 1  # root and items share one file
+
+
+@pytest.mark.asyncio
+async def test_get_related_entities_flags_the_related_entity_itself(tmp_path: Path) -> None:
+    mcp = FastMCP("test")
+    repo = FakeGraphRepositoryV2()
+    repo.checksums = {"pkg/module.py": _write_file(tmp_path, "pkg/module.py", "class Worker: ...\n")}
+    (tmp_path / "pkg" / "module.py").write_text("class Worker:\n    pass\n")
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(
+        await mcp.call_tool(
+            "get_related_entities",
+            {"directory": str(tmp_path), "node_id": "pkg/a.py::Worker", "limit": 10},
+        )
+    )
+
+    assert payload["items"][0]["entity"]["stale"] is True
+    assert payload["items"][0]["relation"] == "CONTAINS"
+    assert payload["meta"]["index_freshness"]["stale"] == ["pkg/module.py"]
+
+
+class _FreshnessSearchRepository(StoredChecksums):
+    """Answers every read any search tool issues with the same single entity."""
+
+    _ROW = {**entity(), "score": 0.9}
+
+    async def search_code_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+        return [{**self._ROW, "chunk_id": "chunk:1", "chunk_kind": "function_body", "match_start_line": 1, "match_end_line": 2}]
+
+    async def search_summary_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+        return [dict(self._ROW)]
+
+    async def search_summary_text(self, project: str, query: str, top_k: int) -> list[dict[str, object]]:
+        return [dict(self._ROW)]
+
+    async def search_symbol_text(self, project: str, query: str, top_k: int) -> list[dict[str, object]]:
+        return []
+
+    async def search_code_text(self, project: str, query: str, top_k: int) -> list[dict[str, object]]:
+        return []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["search_code", "search_hybrid", "search_semantic", "search_text"])
+async def test_search_tools_always_report_index_freshness(tool_name: str, tmp_path: Path, monkeypatch) -> None:
+    mcp = FastMCP("test")
+    repo = _FreshnessSearchRepository()
+    repo.checksums = {"pkg/module.py": _write_file(tmp_path, "pkg/module.py", "class Worker: ...\n")}
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": str(tmp_path), "query": "worker"}))
+
+    assert payload["meta"]["index_freshness"] == {"checked": 1, "stale": [], "missing": [], "unknown": []}
+    assert repo.checksum_calls == 1, "one get_checksums per tool call"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", sorted(_GRAPH_TOOL_ARGS))
+async def test_graph_tools_always_report_index_freshness(tool_name: str, tmp_path: Path) -> None:
+    mcp = FastMCP("test")
+    repo = _CountingGraphRepository()  # no stored checksums: every path lands in 'unknown'
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": str(tmp_path), **_GRAPH_TOOL_ARGS[tool_name]}))
+
+    block = payload["meta"]["index_freshness"]
+    assert set(block) == {"checked", "stale", "missing", "unknown"}
+    assert block["checked"] >= 1 and block["stale"] == [] and block["missing"] == []
+    assert repo.checksum_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_search_text_reports_freshness_even_for_an_empty_query(tmp_path: Path) -> None:
+    """The block is unconditional: a page with no entities still says it checked nothing."""
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": str(tmp_path), "query": "***"}))
+
+    assert payload["items"] == []
+    assert payload["meta"]["index_freshness"] == {"checked": 0, "stale": [], "missing": [], "unknown": []}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["cypher_query", "graph_schema"])
+async def test_raw_graph_tools_document_that_they_do_not_check_freshness(tool_name: str) -> None:
+    mcp = FastMCP("test")
+    register_cypher_tools(mcp, FakeManager(), FakeConnection())
+
+    description = mcp._tool_manager.get_tool(tool_name).description
+
+    assert "freshness is not checked here" in description

@@ -11,6 +11,8 @@ from inflorescence.config import Settings
 from inflorescence.db.repository import GraphRepository
 from inflorescence.project_manager import ProjectManager
 from inflorescence.rag.embeddings import EmbeddingClient
+from inflorescence.tools.freshness import build_checker, unchecked_empty_page
+from inflorescence.tools.gates import ensure_indexed, normalize_node_types
 from inflorescence.tools.path_filters import PathFilterConfig, filter_records_by_path
 from inflorescence.tools.responses import (
     MAX_SEARCH_LIMIT,
@@ -132,23 +134,6 @@ def _page_hits(
     return paginated_response(hits[offset : offset + limit + 1], limit, offset, meta, truncated=truncated)
 
 
-async def _not_indexed_error(manager: ProjectManager, project: str, directory: str) -> dict | None:
-    """Return a distinct error when *directory* was never indexed, else None.
-
-    ``get_project`` synthesises a valid id from any path, so a typo or an adjacent directory
-    otherwise yields an empty result indistinguishable from a genuine "no matches" (audit
-    finding T5 / INV-7). Surfacing it as an error tells the caller to index first instead of
-    trusting a silent empty page.
-    """
-    if not await manager.project_is_indexed(project):
-        return error_response(
-            "project_not_indexed",
-            f"No index found for {directory!r} (project '{project}'). Index it with index_directory "
-            "first — this is different from an indexed project that simply has no matches.",
-        )
-    return None
-
-
 def _embed_one(embedder: EmbeddingClient, query: str, label: str) -> list[float] | dict[str, dict[str, str]]:
     try:
         embeddings = embedder.embed([query])
@@ -187,12 +172,32 @@ def register_search_tools(
     ) -> dict:
         """Search code chunk embeddings and return entity hits.
 
+        ``query`` is embedded into the same vector space as the indexed code, which is
+        English-dominated: phrase it in English — a query in another language lands far from
+        that space and returns an irrelevant top result, not an error. For exact strings,
+        identifiers, or non-English text, use ``search_text`` (BM25 keyword search) instead.
+
         Chunks are embedded in the final phase of an index run: while a first-time index
         is still running this finds nothing yet — that is "not indexed yet", not "no
         matches". ``search_entities`` (name-based) works as soon as the run starts.
+
+        A first query against a git worktree of an indexed checkout that is not indexed
+        yet indexes it inline before answering: that one call is noticeably slower
+        (parsing and graph writes only — summaries and embeddings are reused from the
+        main checkout, so no LLM spend), and every later call is normal speed.
+
+        ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
+        this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
+        their entity — so an unflagged hit was checked and still matches the index. This is
+        file-level: "stale" means the file changed after indexing (lines may have shifted,
+        the summary may describe older code), not that this entity changed.
         """
-        project = manager.get_project(directory)
-        not_indexed = await _not_indexed_error(manager, project, directory)
+        # Argument validation first: rejecting a typo'd node type must not trigger the
+        # manager's inline (donor-seeded) index of a fresh worktree.
+        node_types = normalize_node_types(node_types)
+        if isinstance(node_types, dict):
+            return node_types
+        project, not_indexed = await ensure_indexed(manager, directory)
         if not_indexed is not None:
             return not_indexed
         bounded_limit = clamp_limit(limit, MAX_SEARCH_LIMIT)
@@ -206,7 +211,8 @@ def register_search_tools(
         raw_rows = await repo.search_code_vectors(project, embedding, candidate_k)
         truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types)
         rows = _filter_node_types(filter_records_by_path(raw_rows, filters), node_types)
-        return _page_hits(
+        checker = await build_checker(repo, project, directory)
+        return checker.stamp(_page_hits(
             _code_hits(rows, min_score),
             bounded_limit,
             bounded_offset,
@@ -218,7 +224,7 @@ def register_search_tools(
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
-        )
+        ))
 
     @mcp.tool()
     async def search_semantic(
@@ -236,11 +242,31 @@ def register_search_tools(
         Use this to find code by *what it does* even when the wording differs. For exact
         identifier / string-literal / error-text matches, use ``search_text`` instead.
 
+        Summaries and their embeddings are English-only, so phrase ``query`` in English —
+        a query in another language (e.g. Russian) embeds far from the English summary
+        space and returns an irrelevant top result, not an error. For exact strings,
+        identifiers, or non-English text, use ``search_text`` (BM25 keyword search) instead.
+
         While an index run is in progress, only nodes whose summaries already landed are
         searchable — fewer hits then means "not summarized yet", not "no matches".
+
+        A first query against a git worktree of an indexed checkout that is not indexed
+        yet indexes it inline before answering: that one call is noticeably slower
+        (parsing and graph writes only — summaries and embeddings are reused from the
+        main checkout, so no LLM spend), and every later call is normal speed.
+
+        ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
+        this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
+        their entity — so an unflagged hit was checked and still matches the index. This is
+        file-level: "stale" means the file changed after indexing (lines may have shifted,
+        the summary may describe older code), not that this entity changed.
         """
-        project = manager.get_project(directory)
-        not_indexed = await _not_indexed_error(manager, project, directory)
+        # Argument validation first: rejecting a typo'd node type must not trigger the
+        # manager's inline (donor-seeded) index of a fresh worktree.
+        node_types = normalize_node_types(node_types)
+        if isinstance(node_types, dict):
+            return node_types
+        project, not_indexed = await ensure_indexed(manager, directory)
         if not_indexed is not None:
             return not_indexed
         bounded_limit = clamp_limit(limit, MAX_SEARCH_LIMIT)
@@ -254,7 +280,8 @@ def register_search_tools(
         raw_rows = await repo.search_summary_vectors(project, embedding, candidate_k)
         truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types)
         rows = _filter_node_types(filter_records_by_path(raw_rows, filters), node_types)
-        return _page_hits(
+        checker = await build_checker(repo, project, directory)
+        return checker.stamp(_page_hits(
             _summary_hits(rows, min_score),
             bounded_limit,
             bounded_offset,
@@ -266,7 +293,7 @@ def register_search_tools(
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
-        )
+        ))
 
     @mcp.tool()
     async def search_hybrid(
@@ -281,11 +308,32 @@ def register_search_tools(
     ) -> dict:
         """Search code and summary embeddings, deduplicated by entity.
 
+        Summary embeddings (and code identifiers they're matched against) are
+        English-only, so phrase ``query`` in English — a non-English query (e.g.
+        Russian) embeds far from that space and returns an irrelevant top result,
+        not an error. For exact strings, identifiers, or non-English text, use
+        ``search_text`` (BM25 keyword search) instead.
+
         While an index run is in progress, coverage is partial: summary vectors exist only
         for already-summarized nodes, and code-chunk vectors land in the run's final phase.
+
+        A first query against a git worktree of an indexed checkout that is not indexed
+        yet indexes it inline before answering: that one call is noticeably slower
+        (parsing and graph writes only — summaries and embeddings are reused from the
+        main checkout, so no LLM spend), and every later call is normal speed.
+
+        ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
+        this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
+        their entity — so an unflagged hit was checked and still matches the index. This is
+        file-level: "stale" means the file changed after indexing (lines may have shifted,
+        the summary may describe older code), not that this entity changed.
         """
-        project = manager.get_project(directory)
-        not_indexed = await _not_indexed_error(manager, project, directory)
+        # Argument validation first: rejecting a typo'd node type must not trigger the
+        # manager's inline (donor-seeded) index of a fresh worktree.
+        node_types = normalize_node_types(node_types)
+        if isinstance(node_types, dict):
+            return node_types
+        project, not_indexed = await ensure_indexed(manager, directory)
         if not_indexed is not None:
             return not_indexed
         bounded_limit = clamp_limit(limit, MAX_SEARCH_LIMIT)
@@ -325,7 +373,8 @@ def register_search_tools(
         for hit in hits:
             if hit["source_type"] != "hybrid" and hit["matches"]:
                 hit["source_type"] = "hybrid"
-        return _page_hits(
+        checker = await build_checker(repo, project, directory)
+        return checker.stamp(_page_hits(
             hits,
             bounded_limit,
             bounded_offset,
@@ -337,7 +386,7 @@ def register_search_tools(
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
-        )
+        ))
 
     @mcp.tool()
     async def search_text(
@@ -363,9 +412,24 @@ def register_search_tools(
 
         While an index run is in progress, summary and raw-code fields cover only what has
         already landed; name/signature hits are complete as soon as the skeleton is stored.
+
+        A first query against a git worktree of an indexed checkout that is not indexed
+        yet indexes it inline before answering: that one call is noticeably slower
+        (parsing and graph writes only — summaries and embeddings are reused from the
+        main checkout, so no LLM spend), and every later call is normal speed.
+
+        ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
+        this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
+        their entity — so an unflagged hit was checked and still matches the index. This is
+        file-level: "stale" means the file changed after indexing (lines may have shifted,
+        the summary may describe older code), not that this entity changed.
         """
-        project = manager.get_project(directory)
-        not_indexed = await _not_indexed_error(manager, project, directory)
+        # Argument validation first: rejecting a typo'd node type must not trigger the
+        # manager's inline (donor-seeded) index of a fresh worktree.
+        node_types = normalize_node_types(node_types)
+        if isinstance(node_types, dict):
+            return node_types
+        project, not_indexed = await ensure_indexed(manager, directory)
         if not_indexed is not None:
             return not_indexed
         bounded_limit = clamp_limit(limit, MAX_SEARCH_LIMIT)
@@ -381,6 +445,9 @@ def register_search_tools(
         }
         text_query = _sanitize_text_query(query)
         if not text_query:
+            # Nothing to search, so nothing to hash — but the block still ships, since a
+            # caller may only read the item flags as "fresh" if it is always present.
+            meta["index_freshness"] = unchecked_empty_page()
             return _page_hits([], bounded_limit, bounded_offset, meta)
         try:
             summary_rows = await repo.search_summary_text(project, text_query, top_k)
@@ -405,10 +472,11 @@ def register_search_tools(
         symbol_rows = _filter_node_types(filter_records_by_path(symbol_rows, filters), node_types)
         code_rows = _filter_node_types(filter_records_by_path(code_rows, filters), node_types)
 
-        return _page_hits(
+        checker = await build_checker(repo, project, directory)
+        return checker.stamp(_page_hits(
             _merge_text_hits(summary_rows, symbol_rows, code_rows, min_score),
             bounded_limit,
             bounded_offset,
             meta,
             truncated=truncated,
-        )
+        ))

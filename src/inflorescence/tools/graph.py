@@ -8,6 +8,8 @@ from mcp.server.fastmcp import FastMCP
 
 from inflorescence.db.repository import GraphRepository
 from inflorescence.project_manager import ProjectManager
+from inflorescence.tools.freshness import build_checker
+from inflorescence.tools.gates import ensure_indexed, normalize_node_types
 from inflorescence.tools.path_filters import PathFilterConfig, filter_records_by_path
 from inflorescence.tools.responses import (
     MAX_GRAPH_LIMIT,
@@ -25,6 +27,35 @@ FetchRows = Callable[[int, int], Awaitable[list[dict[str, object]]]]
 # A sparse include-filter over a large project would otherwise walk the whole
 # entity set (unbounded round-trips + memory) just to fill one page; cap the scan.
 MAX_FILTER_SCAN_ROWS = 5000
+
+# Aliases accepted for get_related_entities' ``direction`` argument, normalized to the
+# canonical values the Cypher in db/queries.py matches ('both' | 'outgoing' | 'incoming').
+# Matching is case-insensitive; anything not in this map is rejected before the query
+# runs rather than silently matching zero rows (INV-7: empty and invalid must differ).
+_DIRECTION_ALIASES = {
+    "both": "both",
+    "outgoing": "outgoing",
+    "out": "outgoing",
+    "incoming": "incoming",
+    "in": "incoming",
+}
+
+
+def _normalize_direction(direction: str) -> str | dict:
+    """Normalize ``direction`` to 'both' | 'outgoing' | 'incoming', case-insensitively.
+
+    Returns the canonical string on success, or an ``error_response`` payload
+    (dict) for any value not in ``_DIRECTION_ALIASES`` — the caller must check
+    ``isinstance(result, dict)`` and return it as-is before touching the DB.
+    """
+    normalized = _DIRECTION_ALIASES.get(direction.strip().lower())
+    if normalized is None:
+        return error_response(
+            "invalid_direction",
+            f"Invalid direction {direction!r}. Valid values: 'both', 'outgoing' (alias 'out'), "
+            "'incoming' (alias 'in'). Matching is case-insensitive.",
+        )
+    return normalized
 
 
 async def _fetch_filtered_page(
@@ -76,10 +107,26 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
     ) -> dict:
         """List indexed code entities with pagination and glob path filters.
 
-        Summaries are truncated to a short preview; use ``get_entity_context``
-        for the full summary of a specific entity.
+        For inventory and orientation — "what is in this package", "how many classes are
+        under src/" — not for finding code by meaning (``search_semantic``) or by name
+        (``search_entities``); this returns entities in path order, unranked. Combine
+        ``include_paths``/``exclude_paths`` globs with ``node_types`` to scope the listing.
+        ``node_types`` values (case-insensitive): module, class, function, method,
+        directory, interface, enum, struct, trait, document. Summaries are truncated to a
+        short preview; use ``get_entity_context`` for the full summary of one entity.
+
+        ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
+        this page, and affected items carry ``"stale": true`` / ``"file_missing": true`` —
+        so an unflagged item was checked and still matches the index. This is file-level:
+        "stale" means the file changed after indexing (lines may have shifted, the summary
+        may describe older code), not that this particular entity changed.
         """
-        project = manager.get_project(directory)
+        node_types = normalize_node_types(node_types)
+        if isinstance(node_types, dict):
+            return node_types
+        project, not_indexed = await ensure_indexed(manager, directory)
+        if not_indexed is not None:
+            return not_indexed
         bounded_limit = clamp_limit(limit)
         bounded_offset = clamp_offset(offset)
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
@@ -90,13 +137,15 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             bounded_offset,
         )
         items = [ref for row in rows if (ref := entity_ref(row, summary_max_chars=NAV_SUMMARY_MAX_CHARS))]
-        return paginated_response(
+        payload = paginated_response(
             items,
             bounded_limit,
             bounded_offset,
             {"project": project, "path_filters": filters.meta(), "node_types": node_types or []},
             truncated=truncated,
         )
+        checker = await build_checker(repo, project, directory)
+        return checker.stamp(payload)
 
     @mcp.tool()
     async def get_entity_structure(
@@ -112,10 +161,26 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
     ) -> dict:
         """Return the CONTAINS hierarchy under a node, file module, or project root.
 
-        Item summaries are truncated to a short preview (the root keeps its full
-        summary); use ``get_entity_context`` for the full summary of an item.
+        The outline view: what a file or class contains, one to three levels deep. Use it
+        after locating something ("show me this module's classes and methods"); for the
+        edges *between* entities — callers, callees, imports — use ``get_related_entities``
+        or ``get_entity_context`` instead. ``node_types`` filters the items only, never the
+        root; valid values (case-insensitive): module, class, function, method, directory,
+        interface, enum, struct, trait, document. Item summaries are truncated to a short
+        preview (the root keeps its full summary).
+
+        ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
+        this page *including the root*, and affected items carry ``"stale": true`` /
+        ``"file_missing": true`` — so an unflagged item was checked and still matches the
+        index. This is file-level: "stale" means the file changed after indexing (lines may
+        have shifted, the summary may describe older code), not that this entity changed.
         """
-        project = manager.get_project(directory)
+        node_types = normalize_node_types(node_types)
+        if isinstance(node_types, dict):
+            return node_types
+        project, not_indexed = await ensure_indexed(manager, directory)
+        if not_indexed is not None:
+            return not_indexed
         root = await repo.get_structure_root(project, node_id=node_id, file_path=file_path)
         if root is None:
             return error_response("not_found", "Structure root not found")
@@ -150,8 +215,10 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             },
             truncated=truncated,
         )
-        payload["root"] = entity_ref(root)
-        return payload
+        checker = await build_checker(repo, project, directory)
+        # The root is annotated before ``stamp``, so its file counts in index_freshness.
+        payload["root"] = checker.annotate(entity_ref(root))
+        return checker.stamp(payload)
 
     @mcp.tool()
     async def get_entity_context(
@@ -163,12 +230,25 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
     ) -> dict:
         """Return parent, children, incoming, and outgoing context for an entity.
 
-        ``relation_types`` filters the ``incoming`` and ``outgoing`` sections to those
-        relationship types (e.g. ``["CALLS"]``); ``parent`` and the CONTAINS ``children``
-        are the structural skeleton and are always returned. ``offset`` paginates each
-        section, so walking ``next_offset`` terminates instead of looping.
+        The one-call deep dive on a known ``node_id``: full (untruncated) summary plus its
+        neighbourhood in every direction. Use it on a hit from any search tool; for a whole
+        subtree use ``get_entity_structure``, and for one edge kind over many hops use
+        ``get_related_entities``. ``relation_types`` filters the ``incoming`` and
+        ``outgoing`` sections to those relationship types (e.g. ``["CALLS"]``); ``parent``
+        and the CONTAINS ``children`` are the structural skeleton and are always returned.
+        ``offset`` paginates each section, so walking ``next_offset`` terminates instead of
+        looping.
+
+        ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers every file
+        named here — entity, parent and all sections — and affected refs carry
+        ``"stale": true`` / ``"file_missing": true``, so an unflagged one was checked and
+        still matches the index. This is file-level: "stale" means the file changed after
+        indexing (lines may have shifted, the summary may describe older code), not that
+        this entity changed.
         """
-        project = manager.get_project(directory)
+        project, not_indexed = await ensure_indexed(manager, directory)
+        if not_indexed is not None:
+            return not_indexed
         bounded_limit = clamp_limit(limit)
         bounded_offset = clamp_offset(offset)
         result = await repo.get_entity_context(project, node_id, relation_types, bounded_limit + 1, bounded_offset)
@@ -186,9 +266,10 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             for row in result["outgoing"]
             if (ref := entity_ref(row["entity"]))
         ]
-        return {
-            "entity": entity_ref(result["entity"]),
-            "parent": entity_ref(result["parent"]),
+        checker = await build_checker(repo, project, directory)
+        payload = {
+            "entity": checker.annotate(entity_ref(result["entity"])),
+            "parent": checker.annotate(entity_ref(result["parent"])),
             "sections": {
                 "children": paginated_response(children, bounded_limit, bounded_offset, {}),
                 "incoming": paginated_response(incoming, bounded_limit, bounded_offset, {}),
@@ -196,6 +277,12 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             },
             "meta": {"project": project, "node_id": node_id, "relation_types": relation_types or []},
         }
+        # Sections are paginated envelopes of their own; annotate the items the caller
+        # actually gets (paginated_response already trimmed the limit-plus-one row), then
+        # stamp the single meta block covering entity, parent and every section.
+        for section in payload["sections"].values():
+            checker.annotate_items(section["items"])
+        return checker.stamp(payload)
 
     @mcp.tool()
     async def get_related_entities(
@@ -210,10 +297,26 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
     ) -> dict:
         """Return entities related to a node by graph relationship.
 
+        ``direction`` selects which edges to follow relative to ``node_id``:
+        ``"both"`` (default), ``"outgoing"`` (alias ``"out"``), or ``"incoming"``
+        (alias ``"in"``). Matching is case-insensitive. Any other value returns
+        an ``invalid_direction`` error instead of an empty result.
+
         Summaries are truncated to a short preview; use ``get_entity_context``
         for the full summary of a specific entity.
+
+        ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
+        this page, and affected entities carry ``"stale": true`` / ``"file_missing": true``
+        — so an unflagged one was checked and still matches the index. This is file-level:
+        "stale" means the file changed after indexing (lines may have shifted, the summary
+        may describe older code), not that this entity changed.
         """
-        project = manager.get_project(directory)
+        normalized_direction = _normalize_direction(direction)
+        if isinstance(normalized_direction, dict):
+            return normalized_direction
+        project, not_indexed = await ensure_indexed(manager, directory)
+        if not_indexed is not None:
+            return not_indexed
         bounded_limit = clamp_limit(limit)
         bounded_offset = clamp_offset(offset)
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
@@ -221,7 +324,7 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             lambda page_limit, page_offset: repo.get_related_entities(
                 project,
                 node_id,
-                direction,
+                normalized_direction,
                 relation_types,
                 page_limit,
                 page_offset,
@@ -238,19 +341,21 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
                 "direction": row["direction"],
                 "entity": entity_ref(entity, summary_max_chars=NAV_SUMMARY_MAX_CHARS),
             })
-        return paginated_response(
+        payload = paginated_response(
             filtered_rows,
             bounded_limit,
             bounded_offset,
             {
                 "project": project,
                 "node_id": node_id,
-                "direction": direction,
+                "direction": normalized_direction,
                 "relation_types": relation_types or [],
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
         )
+        checker = await build_checker(repo, project, directory)
+        return checker.stamp(payload)
 
     @mcp.tool()
     async def search_entities(
@@ -262,8 +367,29 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         limit: int = 20,
         offset: int = 0,
     ) -> dict:
-        """Search code entities by name substring."""
-        project = manager.get_project(directory)
+        """Search code entities by case-insensitive substring of their name.
+
+        Pure name matching — ``"handl"`` finds ``handle_request`` and ``ErrorHandler`` — so
+        use it when you already know (part of) an identifier, and when a name-based answer
+        must be complete the moment a first-time index finishes parsing, before any summary
+        exists. It never looks inside bodies, signatures, or summaries: for a string
+        literal, an error message, or any text in the code use ``search_text``; to find code
+        by what it does use ``search_semantic``. ``node_types`` values (case-insensitive):
+        module, class, function, method, directory, interface, enum, struct, trait,
+        document.
+
+        ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
+        this page, and affected items carry ``"stale": true`` / ``"file_missing": true`` —
+        so an unflagged item was checked and still matches the index. This is file-level:
+        "stale" means the file changed after indexing (lines may have shifted, the summary
+        may describe older code), not that this particular entity changed.
+        """
+        node_types = normalize_node_types(node_types)
+        if isinstance(node_types, dict):
+            return node_types
+        project, not_indexed = await ensure_indexed(manager, directory)
+        if not_indexed is not None:
+            return not_indexed
         bounded_limit = clamp_limit(limit)
         bounded_offset = clamp_offset(offset)
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
@@ -274,7 +400,7 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             bounded_offset,
         )
         items = [ref for row in rows if (ref := entity_ref(row))]
-        return paginated_response(
+        payload = paginated_response(
             items,
             bounded_limit,
             bounded_offset,
@@ -286,3 +412,5 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             },
             truncated=truncated,
         )
+        checker = await build_checker(repo, project, directory)
+        return checker.stamp(payload)
