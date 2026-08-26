@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -251,7 +252,7 @@ def _serve(allow_degraded: bool = False) -> None:
         if not healthy and not allow_degraded:
             print(
                 "Error: Memgraph is not reachable and could not be started. Check that Docker "
-                "is running, or start the database yourself with `docker compose up -d`. "
+                "is installed and running (run `inflorescence init` for guided setup). "
                 "Pass `--allow-degraded` to start the server anyway.",
                 file=sys.stderr,
             )
@@ -308,7 +309,7 @@ async def _doctor_checks(settings: Settings) -> list[CheckResult]:
             reachable,
             True,
             settings.memgraph_url,
-            hint="Start Memgraph with `docker compose up -d`",
+            hint="Run `inflorescence init` to start it (or `docker start inflorescence-memgraph`)",
         )
     )
 
@@ -474,9 +475,91 @@ def _compose_file_present(cwd: Path) -> bool:
     return any((cwd / name).exists() for name in ("docker-compose.yml", "docker-compose.yaml", "compose.yml"))
 
 
+_DOCKER_INSTALL_HINT = (
+    "Install Docker Desktop (https://www.docker.com/products/docker-desktop/) or "
+    "OrbStack (https://orbstack.dev/), then re-run `inflorescence init`."
+)
+
+
+def _ensure_docker_interactive() -> bool:
+    """Get a working docker daemon for `init`, installing/launching it with consent.
+
+    `init` is the one entry point with a human at a terminal, so this is the one place
+    that may ask a question or run Homebrew. Everything it does is otherwise the user's
+    own next step typed for them: install the app, launch it, wait for the daemon.
+    """
+    from inflorescence import docker_env as de
+
+    if de.docker_available():
+        return True
+
+    if de.docker_cli_present():
+        print("Docker is installed but not running — starting it (this can take a minute)...")
+        if de.ensure_docker_daemon(wait_seconds=180.0):
+            return True
+        print("Docker did not come up. Start Docker Desktop (or OrbStack) manually, then re-run `inflorescence init`.")
+        return False
+
+    if sys.platform == "darwin" and shutil.which("brew"):
+        answer = (
+            input(
+                "Docker is not installed (needed to run the Memgraph database).\n"
+                "Install Docker Desktop now with `brew install --cask docker-desktop`? [y/N] "
+            )
+            .strip()
+            .lower()
+        )
+        if answer == "y":
+            subprocess.run(["brew", "install", "--cask", "docker-desktop"], check=False)
+            print(
+                "Launching Docker Desktop — if this is its first start, accept the service "
+                "agreement in the window that opens."
+            )
+            subprocess.run(["open", "-a", "Docker"], check=False)
+            # The app links the `docker` CLI into /usr/local/bin on first launch, so both
+            # the CLI and the daemon can appear only after a while.
+            deadline = time.monotonic() + 300.0
+            while time.monotonic() < deadline:
+                if de.docker_available():
+                    return True
+                time.sleep(3.0)
+            print("Docker was installed but its daemon never answered. " + _DOCKER_INSTALL_HINT)
+            return False
+
+    print("Docker is not installed. " + _DOCKER_INSTALL_HINT)
+    return False
+
+
+def _bootstrap_memgraph(cwd: Path) -> None:
+    """`init` step 2: make Memgraph reachable, whatever state the machine is in."""
+    from inflorescence.config import Settings
+    from inflorescence.docker_env import ensure_memgraph, local_bolt_port, memgraph_run_argv, port_open
+
+    memgraph_url = Settings().memgraph_url
+    port = local_bolt_port(memgraph_url)
+    if port is not None and port_open(port):
+        print(f"Memgraph is already up at {memgraph_url}")
+        return
+    if port is not None and not _ensure_docker_interactive():
+        return  # _ensure_docker_interactive printed what to do
+
+    # Inside a checkout of this repository compose is the friendlier tool — it brings up
+    # Memgraph Lab alongside the database. Anywhere else (an installed tool, the normal
+    # case) a standalone container is started directly.
+    if _compose_file_present(cwd) and shutil.which("docker"):
+        print("Starting Memgraph via docker compose...")
+        subprocess.run(["docker", "compose", "up", "-d", "memgraph"], check=False)
+    elif ensure_memgraph(memgraph_url):
+        print(f"Memgraph is up at {memgraph_url}")
+    else:
+        print(
+            "Could not start Memgraph automatically. Install/start Docker, or run it yourself:\n"
+            "  " + " ".join(memgraph_run_argv(port or 7687))
+        )
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     from inflorescence.config import Settings, user_env_file
-    from inflorescence.docker_env import ensure_memgraph, memgraph_run_argv
 
     cwd = Path.cwd()
     # The key goes to the per-user file, not to a .env beside whatever directory `init` ran
@@ -501,20 +584,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
     else:
         print(f"Keeping existing {env_path}")
 
-    # 2. Memgraph. Inside a checkout of this repository compose is the friendlier tool — it
-    # brings up Memgraph Lab alongside the database. Anywhere else (an installed tool, which
-    # is the normal case) a standalone container is started directly.
-    memgraph_url = Settings().memgraph_url
-    if _compose_file_present(cwd) and shutil.which("docker"):
-        print("Starting Memgraph via docker compose...")
-        subprocess.run(["docker", "compose", "up", "-d", "memgraph"], check=False)
-    elif ensure_memgraph(memgraph_url):
-        print(f"Memgraph is up at {memgraph_url}")
-    else:
-        print(
-            "Could not start Memgraph automatically. Install/start Docker, or run it yourself:\n"
-            "  " + " ".join(memgraph_run_argv(7687))
-        )
+    # 2. Memgraph — install/start Docker if needed, pull the image, start the container.
+    _bootstrap_memgraph(cwd)
 
     # 3. MCP registration — always with the ABSOLUTE path to the console script
     command = resolve_console_script()

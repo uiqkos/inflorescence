@@ -296,9 +296,9 @@ def test_build_claude_mcp_add_command_includes_absolute_path_and_serve() -> None
 
 def _stub_memgraph(monkeypatch, started: bool = True) -> None:
     """`init` must never touch a real docker daemon from a test."""
-    import inflorescence.docker_env as de
+    from inflorescence import __main__ as m
 
-    monkeypatch.setattr(de, "ensure_memgraph", lambda *a, **k: started)
+    monkeypatch.setattr(m, "_bootstrap_memgraph", lambda cwd: None)
 
 
 def test_cmd_init_writes_key_to_user_config(monkeypatch, tmp_path) -> None:
@@ -374,6 +374,122 @@ def test_settings_read_key_from_user_config_regardless_of_cwd(monkeypatch, tmp_p
     monkeypatch.chdir(elsewhere)
 
     assert Settings().llm_api_key == "sk-from-user-config"
+
+
+def _stub_docker_env(
+    monkeypatch,
+    *,
+    port_already_open: bool = False,
+    ensured: bool = True,
+) -> list[str]:
+    """Pin every docker_env probe `_bootstrap_memgraph` makes; returns the event log."""
+    import inflorescence.docker_env as de
+
+    events: list[str] = []
+    monkeypatch.setattr(de, "port_open", lambda *a, **k: port_already_open)
+    monkeypatch.setattr(de, "ensure_memgraph", lambda url, **k: events.append("ensure_memgraph") or ensured)
+    return events
+
+
+def test_bootstrap_memgraph_skips_docker_when_the_port_already_answers(monkeypatch, tmp_path, capsys) -> None:
+    from inflorescence import __main__ as m
+
+    events = _stub_docker_env(monkeypatch, port_already_open=True)
+    monkeypatch.setattr(m, "_ensure_docker_interactive", lambda: events.append("docker") or True)
+
+    m._bootstrap_memgraph(tmp_path)
+    assert events == []  # neither docker nor ensure_memgraph consulted
+    assert "already up" in capsys.readouterr().out
+
+
+def test_bootstrap_memgraph_stops_when_docker_cannot_be_had(monkeypatch, tmp_path) -> None:
+    """`_ensure_docker_interactive` prints its own guidance; the step must not pile a
+    second failure (a doomed `docker compose`/`docker run`) on top of it."""
+    from inflorescence import __main__ as m
+
+    events = _stub_docker_env(monkeypatch)
+    monkeypatch.setattr(m, "_ensure_docker_interactive", lambda: False)
+
+    m._bootstrap_memgraph(tmp_path)
+    assert events == []
+
+
+def test_bootstrap_memgraph_starts_the_container_outside_a_checkout(monkeypatch, tmp_path, capsys) -> None:
+    from inflorescence import __main__ as m
+
+    events = _stub_docker_env(monkeypatch, ensured=True)
+    monkeypatch.setattr(m, "_ensure_docker_interactive", lambda: True)
+    monkeypatch.setattr(m.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+    m._bootstrap_memgraph(tmp_path)  # tmp_path has no compose file
+    assert events == ["ensure_memgraph"]
+    assert "Memgraph is up" in capsys.readouterr().out
+
+
+def test_bootstrap_memgraph_prefers_compose_inside_a_checkout(monkeypatch, tmp_path) -> None:
+    from inflorescence import __main__ as m
+
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    events = _stub_docker_env(monkeypatch)
+    monkeypatch.setattr(m, "_ensure_docker_interactive", lambda: True)
+    monkeypatch.setattr(m.shutil, "which", lambda name: f"/usr/bin/{name}")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(m.subprocess, "run", lambda cmd, *a, **k: calls.append(cmd))
+
+    m._bootstrap_memgraph(tmp_path)
+    assert ["docker", "compose", "up", "-d", "memgraph"] in calls
+    assert events == []
+
+
+def test_ensure_docker_interactive_is_silent_when_docker_already_works(monkeypatch, capsys) -> None:
+    import inflorescence.docker_env as de
+    from inflorescence import __main__ as m
+
+    monkeypatch.setattr(de, "docker_available", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no prompt")))
+
+    assert m._ensure_docker_interactive() is True
+    assert capsys.readouterr().out == ""
+
+
+def test_ensure_docker_interactive_launches_a_stopped_daemon(monkeypatch) -> None:
+    import inflorescence.docker_env as de
+    from inflorescence import __main__ as m
+
+    monkeypatch.setattr(de, "docker_available", lambda: False)
+    monkeypatch.setattr(de, "docker_cli_present", lambda: True)
+    monkeypatch.setattr(de, "ensure_docker_daemon", lambda **k: True)
+
+    assert m._ensure_docker_interactive() is True
+
+
+def test_ensure_docker_interactive_points_at_installers_when_docker_is_absent(monkeypatch, capsys) -> None:
+    import inflorescence.docker_env as de
+    from inflorescence import __main__ as m
+
+    monkeypatch.setattr(de, "docker_available", lambda: False)
+    monkeypatch.setattr(de, "docker_cli_present", lambda: False)
+    monkeypatch.setattr(m.shutil, "which", lambda name: None)  # no brew either
+
+    assert m._ensure_docker_interactive() is False
+    out = capsys.readouterr().out
+    assert "docker.com" in out and "orbstack.dev" in out
+
+
+def test_ensure_docker_interactive_respects_a_declined_brew_install(monkeypatch) -> None:
+    import inflorescence.docker_env as de
+    from inflorescence import __main__ as m
+
+    monkeypatch.setattr(de, "docker_available", lambda: False)
+    monkeypatch.setattr(de, "docker_cli_present", lambda: False)
+    monkeypatch.setattr(m.sys, "platform", "darwin")
+    monkeypatch.setattr(m.shutil, "which", lambda name: "/opt/homebrew/bin/brew" if name == "brew" else None)
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "n")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(m.subprocess, "run", lambda cmd, *a, **k: calls.append(cmd))
+
+    assert m._ensure_docker_interactive() is False
+    assert calls == []  # declining must not install anything
 
 
 def test_project_env_outranks_user_config(monkeypatch, tmp_path) -> None:

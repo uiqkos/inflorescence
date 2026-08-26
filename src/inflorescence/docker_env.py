@@ -17,7 +17,9 @@ import logging
 import shutil
 import socket
 import subprocess
+import sys
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -27,7 +29,20 @@ MEMGRAPH_CONTAINER = "inflorescence-memgraph"
 MEMGRAPH_VOLUME = "inflorescence_mg_data"
 
 _DOCKER_CALL_TIMEOUT = 30.0
+# `docker run`/`docker start` on a daemon that just booted can take well over the
+# 30s that suffices for an inspect.
+_DOCKER_START_TIMEOUT = 120.0
+# The memgraph-mage image is >1 GB. Pulling it inside `docker run` under the 30-second
+# call timeout is what made every first run on a fresh machine "fail to start Memgraph":
+# the CLI was killed mid-pull, silently, every time. The pull is therefore its own step
+# with a budget measured in minutes, not seconds.
+_PULL_TIMEOUT = 1800.0
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+# macOS has no native dockerd — the daemon lives inside one of these apps, and "installed
+# but not launched" is the default state right after installation. Checked in order;
+# OrbStack first because it boots in seconds and needs no license click-through.
+_MACOS_DOCKER_APPS = ("OrbStack", "Docker")
 
 
 def docker_cli_present() -> bool:
@@ -43,14 +58,17 @@ def docker_available() -> bool:
     """
     if not docker_cli_present():
         return False
-    return _run(["docker", "info", "--format", "{{.ServerVersion}}"]) is not None
+    # `docker info` exits 0 even when the daemon is unreachable (the error goes to
+    # stderr); only a non-empty ServerVersion on stdout proves the daemon answered.
+    out = _run(["docker", "info", "--format", "{{.ServerVersion}}"])
+    return bool(out and out.strip())
 
 
-def _run(argv: list[str]) -> str | None:
+def _run(argv: list[str], *, timeout: float = _DOCKER_CALL_TIMEOUT) -> str | None:
     """Run *argv*, returning stdout on success and None on any failure."""
     try:
         proc = subprocess.run(  # noqa: S603 — argv is built here, never from user input
-            argv, capture_output=True, text=True, timeout=_DOCKER_CALL_TIMEOUT, check=False
+            argv, capture_output=True, text=True, timeout=timeout, check=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.debug("docker call %r failed: %s", argv[:2], exc)
@@ -59,6 +77,69 @@ def _run(argv: list[str]) -> str | None:
         logger.debug("docker call %r exited %d: %s", argv[:2], proc.returncode, proc.stderr.strip()[-300:])
         return None
     return proc.stdout
+
+
+def docker_desktop_app() -> str | None:
+    """The name of an installed macOS Docker app ("OrbStack" or "Docker"), or None."""
+    if sys.platform != "darwin":
+        return None
+    for name in _MACOS_DOCKER_APPS:
+        for base in (Path("/Applications"), Path.home() / "Applications"):
+            if (base / f"{name}.app").exists():
+                return name
+    return None
+
+
+def ensure_docker_daemon(wait_seconds: float = 90.0) -> bool:
+    """Make the docker daemon answer, launching its macOS app if that is what it takes.
+
+    "Docker Desktop is installed but not running" is the normal state of a laptop that
+    just installed it — and the state every fresh `init` used to fail in. `open -g` keeps
+    the app from stealing focus; the daemon is polled until it answers or the budget runs out.
+    """
+    if not docker_cli_present():
+        return False
+    if docker_available():
+        return True
+    app = docker_desktop_app()
+    if app is None:
+        return False
+    logger.info("Docker daemon is not running; launching %s", app)
+    if _run(["open", "-g", "-a", app]) is None:
+        return False
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if docker_available():
+            return True
+        time.sleep(2.0)
+    logger.warning("%s was launched but the docker daemon did not answer within %.0fs", app, wait_seconds)
+    return False
+
+
+def image_present(image: str) -> bool:
+    """True when *image* exists locally, so `docker run` will not touch the network."""
+    return _run(["docker", "image", "inspect", image]) is not None
+
+
+def pull_image(image: str, *, timeout: float = _PULL_TIMEOUT) -> bool:
+    """Pull *image*, streaming progress to stderr.
+
+    stderr, never stdout: under `serve` stdout carries the MCP protocol, and a progress
+    bar there corrupts the session. Under pytest capture stderr may have no real fd; the
+    progress is then simply dropped.
+    """
+    try:
+        out = sys.stderr.fileno()
+    except (AttributeError, OSError, ValueError):
+        out = subprocess.DEVNULL
+    try:
+        proc = subprocess.run(  # noqa: S603
+            ["docker", "pull", image], stdout=out, stderr=out, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("docker pull %s failed: %s", image, exc)
+        return False
+    return proc.returncode == 0
 
 
 def local_bolt_port(memgraph_url: str) -> int | None:
@@ -132,9 +213,22 @@ def ensure_memgraph(memgraph_url: str, *, wait_seconds: float = 60.0) -> bool:
         return True
     if not docker_cli_present():
         return False
+    if not ensure_docker_daemon():
+        logger.warning(
+            "Docker is installed but its daemon is not running and could not be started. "
+            "Start Docker Desktop (or OrbStack) and retry."
+        )
+        return False
 
     state = container_state(MEMGRAPH_CONTAINER)
     if state is None:
+        # Pull explicitly before `docker run`: the run call has a timeout sized for
+        # starting a container, not for downloading a multi-gigabyte image.
+        if not image_present(MEMGRAPH_IMAGE):
+            logger.info("Pulling %s — first run only, this is >1 GB and can take a few minutes", MEMGRAPH_IMAGE)
+            if not pull_image(MEMGRAPH_IMAGE):
+                logger.warning("Could not pull %s. Check the network and retry.", MEMGRAPH_IMAGE)
+                return False
         argv = memgraph_run_argv(port)
     elif state == "running":
         argv = None  # up but not yet listening — only wait
@@ -143,7 +237,7 @@ def ensure_memgraph(memgraph_url: str, *, wait_seconds: float = 60.0) -> bool:
 
     if argv is not None:
         logger.info("Starting Memgraph (%s)", MEMGRAPH_CONTAINER)
-        if _run(argv) is None:
+        if _run(argv, timeout=_DOCKER_START_TIMEOUT) is None:
             logger.warning(
                 "Could not start the Memgraph container. Is Docker running? "
                 "Start it yourself with: %s", " ".join(memgraph_run_argv(port))

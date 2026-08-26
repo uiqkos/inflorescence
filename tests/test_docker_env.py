@@ -30,6 +30,17 @@ def test_run_argv_binds_loopback_and_keeps_a_named_volume() -> None:
     assert "memgraph-mage" in de.MEMGRAPH_IMAGE, "vector indexes do not exist on plain memgraph"
 
 
+def test_docker_available_requires_a_server_version_not_just_exit_zero(monkeypatch) -> None:
+    """`docker info` exits 0 even with the daemon down (the error goes to stderr), so the
+    old exit-code check reported a dead daemon as available — and the daemon-launch path
+    this exists to trigger never ran. Only a non-empty ServerVersion proves an answer."""
+    monkeypatch.setattr(de, "docker_cli_present", lambda: True)
+    monkeypatch.setattr(de, "_run", lambda argv, **k: "\n")
+    assert de.docker_available() is False
+    monkeypatch.setattr(de, "_run", lambda argv, **k: "28.0.4\n")
+    assert de.docker_available() is True
+
+
 def test_ensure_memgraph_is_a_noop_when_the_port_already_answers(monkeypatch) -> None:
     monkeypatch.setattr(de, "port_open", lambda *a, **k: True)
     monkeypatch.setattr(de, "docker_cli_present", lambda: False)  # must not even be consulted
@@ -42,13 +53,19 @@ def test_ensure_memgraph_gives_up_quietly_without_docker(monkeypatch) -> None:
     assert de.ensure_memgraph("bolt://localhost:7687") is False
 
 
-def test_ensure_memgraph_starts_an_existing_stopped_container(monkeypatch) -> None:
+def _stub_started_daemon(monkeypatch, *, image_local: bool = True) -> None:
     monkeypatch.setattr(de, "port_open", lambda *a, **k: False)
     monkeypatch.setattr(de, "docker_cli_present", lambda: True)
-    monkeypatch.setattr(de, "container_state", lambda name: "exited")
+    monkeypatch.setattr(de, "ensure_docker_daemon", lambda *a, **k: True)
+    monkeypatch.setattr(de, "image_present", lambda image: image_local)
     monkeypatch.setattr(de, "_wait_for_port", lambda port, seconds: True)
+
+
+def test_ensure_memgraph_starts_an_existing_stopped_container(monkeypatch) -> None:
+    _stub_started_daemon(monkeypatch)
+    monkeypatch.setattr(de, "container_state", lambda name: "exited")
     ran: list[list[str]] = []
-    monkeypatch.setattr(de, "_run", lambda argv: ran.append(argv) or "")
+    monkeypatch.setattr(de, "_run", lambda argv, **k: ran.append(argv) or "")
 
     assert de.ensure_memgraph("bolt://localhost:7687") is True
     # `docker start`, not `docker run` — a second container on the same volume would fail.
@@ -56,12 +73,49 @@ def test_ensure_memgraph_starts_an_existing_stopped_container(monkeypatch) -> No
 
 
 def test_ensure_memgraph_creates_the_container_when_absent(monkeypatch) -> None:
-    monkeypatch.setattr(de, "port_open", lambda *a, **k: False)
-    monkeypatch.setattr(de, "docker_cli_present", lambda: True)
+    _stub_started_daemon(monkeypatch)
     monkeypatch.setattr(de, "container_state", lambda name: None)
-    monkeypatch.setattr(de, "_wait_for_port", lambda port, seconds: True)
     ran: list[list[str]] = []
-    monkeypatch.setattr(de, "_run", lambda argv: ran.append(argv) or "")
+    monkeypatch.setattr(de, "_run", lambda argv, **k: ran.append(argv) or "")
 
     assert de.ensure_memgraph("bolt://localhost:7687") is True
     assert ran and ran[0][:3] == ["docker", "run", "-d"]
+
+
+def test_ensure_memgraph_pulls_the_image_before_the_first_run(monkeypatch) -> None:
+    """The memgraph-mage image is >1 GB. `docker run` under the 30s call timeout was
+    killed mid-pull on every fresh machine — the pull must be its own, patient step."""
+    _stub_started_daemon(monkeypatch, image_local=False)
+    monkeypatch.setattr(de, "container_state", lambda name: None)
+    pulled: list[str] = []
+    monkeypatch.setattr(de, "pull_image", lambda image, **k: pulled.append(image) or True)
+    ran: list[list[str]] = []
+    monkeypatch.setattr(de, "_run", lambda argv, **k: ran.append(argv) or "")
+
+    assert de.ensure_memgraph("bolt://localhost:7687") is True
+    assert pulled == [de.MEMGRAPH_IMAGE]
+    assert ran and ran[0][:3] == ["docker", "run", "-d"]
+
+
+def test_ensure_memgraph_gives_up_when_the_pull_fails(monkeypatch) -> None:
+    _stub_started_daemon(monkeypatch, image_local=False)
+    monkeypatch.setattr(de, "container_state", lambda name: None)
+    monkeypatch.setattr(de, "pull_image", lambda image, **k: False)
+    ran: list[list[str]] = []
+    monkeypatch.setattr(de, "_run", lambda argv, **k: ran.append(argv) or "")
+
+    assert de.ensure_memgraph("bolt://localhost:7687") is False
+    assert ran == []  # no half-started container on a missing image
+
+
+def test_ensure_memgraph_gives_up_when_the_daemon_cannot_start(monkeypatch) -> None:
+    """Docker Desktop installed but not running is the default state of a fresh laptop;
+    when even launching it fails, the answer is False — not a docker error cascade."""
+    monkeypatch.setattr(de, "port_open", lambda *a, **k: False)
+    monkeypatch.setattr(de, "docker_cli_present", lambda: True)
+    monkeypatch.setattr(de, "ensure_docker_daemon", lambda *a, **k: False)
+    consulted: list[str] = []
+    monkeypatch.setattr(de, "container_state", lambda name: consulted.append(name) or None)
+
+    assert de.ensure_memgraph("bolt://localhost:7687") is False
+    assert consulted == []

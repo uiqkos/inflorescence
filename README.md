@@ -172,14 +172,31 @@ RETURN e.root AS dependency, count(*) AS uses ORDER BY uses DESC
 
 ## Quick start
 
-**Prerequisites**
+```bash
+uv tool install git+https://github.com/uiqkos/inflorescence
+inflorescence init
+```
 
-- [uv](https://docs.astral.sh/uv/)
-- Docker, for Memgraph. It must be the **`memgraph-mage`** image — the vector indexes that
-  make semantic search work do not exist on a plain Memgraph build.
-- An [OpenRouter](https://openrouter.ai/) API key **with credit on it**. `doctor` checks that a
+That is the whole installation. `init` walks through everything the server needs, in order:
+
+- asks for an [OpenRouter](https://openrouter.ai/) API key and stores it in
+  `~/.config/inflorescence/.env`. The key must have **credit on it** — `doctor` checks that a
   key is present, not that it has balance; an exhausted key passes the check and then fails
-  every call, leaving you with a graph and no summaries or embeddings.
+  every call, leaving you with a graph and no summaries or embeddings;
+- makes sure Docker works: launches Docker Desktop / OrbStack if it is installed but not
+  running, and on a macOS without Docker offers to install it via Homebrew;
+- pulls the **`memgraph-mage`** image (first run only, >1 GB — the vector indexes that make
+  semantic search work do not exist on a plain Memgraph build) and starts the
+  `inflorescence-memgraph` container;
+- registers the MCP server with Claude Code, or prints the JSON block for any other MCP client;
+- finishes by running `inflorescence doctor`.
+
+The only prerequisite installed by hand is [uv](https://docs.astral.sh/uv/) itself (plus
+Docker Desktop or [OrbStack](https://orbstack.dev/), if you are not on macOS with Homebrew).
+`uv tool install inflorescence` (PyPI) will follow from the first tagged release.
+
+<details>
+<summary>From a checkout instead (development)</summary>
 
 ```bash
 # 1. Get the code and its dependencies
@@ -196,6 +213,7 @@ uv run inflorescence init
 # 4. Verify everything is wired up
 uv run inflorescence doctor
 ```
+</details>
 
 On a fresh install `doctor` reports **three** passes and one failure — the schema is created
 by the first index, so it cannot exist yet:
@@ -210,9 +228,9 @@ by the first index, so it cannot exist yet:
 Index something, and the fourth check goes green:
 
 ```bash
-uv run inflorescence index /path/to/repo --dry-run   # estimate volume + cost, no writes
-uv run inflorescence index /path/to/repo             # build the graph for real
-uv run inflorescence doctor                          # now four green checks
+inflorescence index /path/to/repo --dry-run   # estimate volume + cost, no writes
+inflorescence index /path/to/repo             # build the graph for real
+inflorescence doctor                          # now four green checks
 ```
 
 From then on your assistant can call **`index_directory`** itself.
@@ -231,7 +249,10 @@ Memgraph is started for you. Inside a checkout of this repository `init` uses `d
 (which also brings up Memgraph Lab); anywhere else it starts a standalone container —
 `inflorescence-memgraph`, published on loopback only, with its data in a named volume so the
 graph survives `docker rm`. `serve` does the same on startup, since an MCP client offers no
-moment at which you could have started the database yourself.
+moment at which you could have started the database yourself. When Docker itself is installed
+but not running (the default state of a fresh laptop), the Docker Desktop or OrbStack app is
+launched and the daemon awaited; the `memgraph-mage` image is pulled as its own patient step
+on first run, so a multi-minute download never masquerades as "could not start Memgraph".
 
 To run it by hand instead:
 
@@ -242,10 +263,6 @@ docker run -d --name inflorescence-memgraph \
   memgraph/memgraph-mage:latest
 ```
 </details>
-
-> **Installing without a checkout** — `uv tool install git+https://github.com/uiqkos/inflorescence`
-> installs the CLI in one line; `uv tool install inflorescence` (PyPI) will follow from the
-> first tagged release.
 
 The server runs over stdio and is registered for you by `init`. To run it by hand:
 
