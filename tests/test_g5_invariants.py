@@ -52,6 +52,9 @@ class _FixedManager:
     async def project_is_indexed(self, directory: str) -> bool:
         return True
 
+    async def ensure_indexed_for_query(self, directory: str) -> tuple[str, str | None]:
+        return self._project, None
+
 
 async def _conn():
     from inflorescence.db.connection import MemgraphConnection

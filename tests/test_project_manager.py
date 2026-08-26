@@ -405,6 +405,593 @@ async def test_update_project_serializes_concurrent_updates(tmp_path: Path) -> N
     assert builder.updates == 2
 
 
+# ---------------------------------------------------------------------------
+# Worktree donor seeding: a linked worktree is its own project, but its content is the
+# main checkout's, so its first index must reuse that project's summaries and vectors —
+# zero LLM calls, zero embeddings — and must not be blocked by a cost cap for spend that
+# will never happen. These tests pin the plumbing: which cache went where, what was
+# written back, and what the gate priced.
+# ---------------------------------------------------------------------------
+
+
+class _SummaryNode:
+    """Minimal stand-in for a CodeNode as the seeded-summary write-back sees it."""
+
+    def __init__(self, node_id: str, summary: str = "", summary_input_hash: str = "") -> None:
+        self.id = node_id
+        self.summary = summary
+        self.summary_input_hash = summary_input_hash
+
+
+def _worktree_dirs(tmp_path: Path) -> tuple[Path, Path]:
+    main = tmp_path / "main"
+    main.mkdir()
+    worktree = tmp_path / "wt-feature"
+    worktree.mkdir()
+    return main, worktree
+
+
+def _worktree_manager(
+    repo: FakeProjectRepository,
+    builder: FakeGraphBuilder,
+    rag: FakeRAGIndexer,
+    main_root: Path | None,
+    settings: Settings | None = None,
+) -> ProjectManager:
+    """A manager whose worktree detection is stubbed — no real git layout needed here."""
+    return ProjectManager(
+        repo=repo,
+        graph_builder=builder,
+        rag_indexer=rag,
+        settings=settings or Settings(_env_file=None),
+        worktree_resolver=lambda path: main_root,
+    )
+
+
+@pytest.mark.asyncio
+async def test_first_index_of_a_worktree_seeds_caches_from_the_indexed_main_checkout(tmp_path: Path) -> None:
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder(build_result=([_SummaryNode("a.py", "s", "h1")], []))
+    rag = FakeRAGIndexer(code_count=1, summary_count=1)
+    manager = _worktree_manager(repo, builder, rag, main)
+
+    donor = manager.get_project(str(main))
+    donor_summaries = {
+        "a.py": {
+            "summary": "s", "summary_input_hash": "h1",
+            "summary_embedding": [0.1, 0.2], "summary_embedding_hash": "h1",
+        }
+    }
+    donor_chunks = {"a.py#0": [0.3, 0.4]}
+    repo.indexed_projects.add(donor)
+    repo.stored_summaries[donor] = donor_summaries
+    repo.stored_chunk_embeddings[donor] = donor_chunks
+
+    result = await manager.index_directory(str(worktree))
+
+    project = manager.get_project(str(worktree))
+    # The donor's caches — not the worktree's own (empty) ones — feed every paid phase.
+    assert repo.summary_requests == [donor]
+    assert repo.chunk_embedding_requests == [donor]
+    assert builder.build_stored_summaries == [donor_summaries]
+    assert rag.code_stored_embeddings == [donor_chunks]
+    assert rag.summary_stored_summaries == [donor_summaries]
+    assert rag.summary_dirty_ids == [set()]          # nothing regenerated -> nothing re-embedded
+    assert result["worktree_of"] == donor
+    assert repo.worktree_meta == [(project, donor, str(main.resolve()))]
+
+
+@pytest.mark.asyncio
+async def test_worktree_seeding_writes_reused_summaries_into_the_new_project(tmp_path: Path) -> None:
+    """The build callback only persists *generated* batches; summaries reused from the donor
+    live on in-memory nodes only. Without an explicit write-back the new project keeps the
+    skeleton's empty summaries and the repair pass regenerates them for real money."""
+    main, worktree = _worktree_dirs(tmp_path)
+    nodes = [
+        _SummaryNode("a.py", "reused from donor", "h1"),   # reused -> must be written back
+        _SummaryNode("b.py", "freshly generated", "h2"),   # dirty -> already persisted by build
+        _SummaryNode("c.py", "", ""),                      # failed with nothing to keep
+    ]
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder(build_result=(nodes, []))
+    builder.build_dirty_ids = {"b.py"}
+    rag = FakeRAGIndexer()
+    manager = _worktree_manager(repo, builder, rag, main)
+
+    donor = manager.get_project(str(main))
+    repo.indexed_projects.add(donor)
+    repo.stored_summaries[donor] = {"a.py": {"summary": "reused from donor", "summary_input_hash": "h1"}}
+
+    await manager.index_directory(str(worktree))
+
+    project = manager.get_project(str(worktree))
+    assert repo.summaries_written == [
+        (project, [{"node_id": "a.py", "summary": "reused from donor", "summary_input_hash": "h1"}])
+    ]
+    # The invariant the repair pass depends on: every node that ends the run with a summary
+    # is either dirty (persisted batch-by-batch by the build) or explicitly written back —
+    # so get_nodes_missing_summaries has nothing left to regenerate.
+    written_ids = {row["node_id"] for _, rows in repo.summaries_written for row in rows}
+    assert all(n.id in written_ids or n.id in builder.build_dirty_ids for n in nodes if n.summary)
+    assert "c.py" not in written_ids       # empty summaries are never written (INV-1)
+
+
+@pytest.mark.asyncio
+async def test_worktree_cost_gate_prices_nothing_when_the_donor_covers_every_file(tmp_path: Path) -> None:
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    builder.scan_checksums_result = {"a.py": "m1", "pkg/b.py": "m2"}
+    rag = FakeRAGIndexer()
+    manager = _worktree_manager(repo, builder, rag, main)
+
+    donor = manager.get_project(str(main))
+    repo.indexed_projects.add(donor)
+    repo.checksums[donor] = {"a.py": "m1", "pkg/b.py": "m2", "gone.py": "m3"}
+
+    # A cap this tight rejects even the tiny default preview — but a fully donor-covered
+    # worktree costs nothing, so it must index anyway (INV-10 gates *spend*, not work).
+    result = await manager.index_directory(str(worktree), max_cost_usd=0.0001)
+
+    assert builder.builds == 1
+    assert builder.previews == 0                # the full-scan preview is not what gates this
+    assert builder.estimated_paths == [[]]      # no file is paid for
+    assert repo.checksum_requests == [donor]
+    assert result["reused"] is False
+
+
+@pytest.mark.asyncio
+async def test_worktree_cost_gate_prices_exactly_the_files_the_donor_lacks(tmp_path: Path) -> None:
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    builder.scan_checksums_result = {"same.py": "m1", "edited.py": "NEW", "added.py": "m9"}
+    rag = FakeRAGIndexer()
+    manager = _worktree_manager(repo, builder, rag, main)
+
+    donor = manager.get_project(str(main))
+    repo.indexed_projects.add(donor)
+    repo.checksums[donor] = {"same.py": "m1", "edited.py": "OLD"}
+
+    await manager.index_directory(str(worktree))
+
+    assert builder.estimated_paths == [["added.py", "edited.py"]]
+    assert builder.scan_checksum_calls == [(None, None)]
+
+
+@pytest.mark.asyncio
+async def test_first_index_without_a_donor_is_gated_by_the_full_preview(tmp_path: Path) -> None:
+    """Control for the two gate tests above: with no donor, the tight cap still bites."""
+    from inflorescence.cost import IndexCostExceededError
+
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    rag = FakeRAGIndexer()
+    manager = _worktree_manager(repo, builder, rag, None)
+
+    with pytest.raises(IndexCostExceededError):
+        await manager.index_directory(str(tmp_path), max_cost_usd=0.0001)
+
+
+@pytest.mark.asyncio
+async def test_worktree_with_an_unindexed_main_checkout_indexes_normally_but_keeps_the_marker(tmp_path: Path) -> None:
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder(build_result=([_SummaryNode("a.py", "s", "h1")], []))
+    rag = FakeRAGIndexer()
+    manager = _worktree_manager(repo, builder, rag, main)
+    donor = manager.get_project(str(main))
+    project = manager.get_project(str(worktree))
+
+    result = await manager.index_directory(str(worktree))
+
+    assert repo.project_is_indexed_calls == [donor]   # asked, and the answer was "no"
+    assert repo.summary_requests == []                # nothing to seed from
+    assert repo.summaries_written == []               # so nothing to write back either
+    assert builder.build_stored_summaries == [None]
+    assert builder.previews == 1                      # normal first-index cost gate
+    assert "worktree_of" not in result
+    # The marker is a fact about the directory, independent of whether a donor existed:
+    # a future janitor must be able to tell this index apart from a standalone project.
+    assert repo.worktree_meta == [(project, donor, str(main.resolve()))]
+
+
+@pytest.mark.asyncio
+async def test_plain_directory_never_reaches_the_donor_path(tmp_path: Path) -> None:
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    rag = FakeRAGIndexer()
+    manager = _worktree_manager(repo, builder, rag, None)
+
+    await manager.index_directory(str(tmp_path))
+
+    assert repo.project_is_indexed_calls == []
+    assert repo.checksum_requests == []
+    assert repo.summary_requests == []
+    assert repo.worktree_meta == []
+    assert repo.summaries_written == []
+    assert builder.scan_checksum_calls == []
+    assert builder.previews == 1
+    assert rag.code_stored_embeddings == [{}]
+
+
+@pytest.mark.asyncio
+async def test_reindexing_an_already_indexed_worktree_uses_its_own_caches(tmp_path: Path) -> None:
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 12, "edges": 34, "chunks": 5, "summaries": 6})
+    builder = FakeGraphBuilder(update_result=([_SummaryNode("a.py", "s", "h1")], [object()]))
+    rag = FakeRAGIndexer()
+    manager = _worktree_manager(repo, builder, rag, main)
+    donor = manager.get_project(str(main))
+    project = manager.get_project(str(worktree))
+    repo.indexed_projects.add(donor)
+    repo.stored_summaries[donor] = {"a.py": {"summary": "donor", "summary_input_hash": "h1"}}
+
+    await manager.index_directory(str(worktree))
+
+    # Seeding is a first-index-only affair: the worktree now has its own stored state, and
+    # re-seeding from the donor would overwrite it with the other checkout's content.
+    assert builder.updates == 1 and builder.builds == 0
+    assert repo.project_is_indexed_calls == []
+    assert repo.summary_requests == []
+    assert repo.chunk_embedding_requests == [project]
+    assert repo.summaries_written == []
+    assert repo.worktree_meta == [(project, donor, str(main.resolve()))]
+
+
+@pytest.mark.asyncio
+async def test_worktree_auto_index_disabled_skips_seeding_but_still_marks_the_project(tmp_path: Path) -> None:
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    rag = FakeRAGIndexer()
+    settings = Settings(_env_file=None, worktree_auto_index=False)
+    manager = _worktree_manager(repo, builder, rag, main, settings=settings)
+    donor = manager.get_project(str(main))
+    project = manager.get_project(str(worktree))
+    repo.indexed_projects.add(donor)
+    repo.stored_summaries[donor] = {"a.py": {"summary": "donor", "summary_input_hash": "h1"}}
+
+    await manager.index_directory(str(worktree))
+
+    assert repo.project_is_indexed_calls == []       # the flag switches the branch off entirely
+    assert builder.build_stored_summaries == [None]
+    assert builder.previews == 1
+    # Detection is cheap and deletion safety outranks the flag, so the marker is still set.
+    assert repo.worktree_meta == [(project, donor, str(main.resolve()))]
+
+
+@pytest.mark.asyncio
+async def test_donor_summary_with_a_failed_embedding_is_passed_through_untouched(tmp_path: Path) -> None:
+    """A donor node whose embedding never landed (a failed embed run) reaches the reuse
+    logic as ``summary_embedding=None``; the RAG layer then simply re-embeds that one node.
+    The manager must not filter, patch, or choke on such an entry."""
+    main, worktree = _worktree_dirs(tmp_path)
+    donor_summaries = {
+        "ok.py": {"summary": "s", "summary_input_hash": "h1",
+                  "summary_embedding": [0.1], "summary_embedding_hash": "h1"},
+        "broken.py": {"summary": "s2", "summary_input_hash": "h2",
+                      "summary_embedding": None, "summary_embedding_hash": None},
+    }
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder(
+        build_result=([_SummaryNode("ok.py", "s", "h1"), _SummaryNode("broken.py", "s2", "h2")], [])
+    )
+    rag = FakeRAGIndexer(summary_count=2)
+    manager = _worktree_manager(repo, builder, rag, main)
+    donor = manager.get_project(str(main))
+    repo.indexed_projects.add(donor)
+    repo.stored_summaries[donor] = donor_summaries
+
+    result = await manager.index_directory(str(worktree))
+
+    assert rag.summary_stored_summaries == [donor_summaries]
+    assert result["summaries"] == 2
+    project = manager.get_project(str(worktree))
+    # Both are reused text, so both are written back — the missing vector is an embedding
+    # concern, not a summary one.
+    assert {row["node_id"] for _, rows in repo.summaries_written for row in rows} == {"ok.py", "broken.py"}
+    assert repo.summaries_written[0][0] == project
+
+
+@pytest.mark.asyncio
+async def test_worktree_detection_failure_degrades_to_a_standalone_index(tmp_path: Path) -> None:
+    """Detection is fail-closed by contract; a resolver that raises anyway must not be able
+    to abort an index — the worst acceptable outcome is "indexed as an ordinary project"."""
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    rag = FakeRAGIndexer()
+
+    def _boom(path: Path) -> Path | None:
+        raise OSError("git metadata unreadable")
+
+    manager = ProjectManager(
+        repo=repo, graph_builder=builder, rag_indexer=rag,
+        settings=Settings(_env_file=None), worktree_resolver=_boom,
+    )
+
+    result = await manager.index_directory(str(tmp_path))
+
+    assert result["reused"] is False and builder.builds == 1
+    assert repo.worktree_meta == []
+
+
+# ---------------------------------------------------------------------------
+# Auto-index on the first query from a worktree. A read tool that lands on an unindexed
+# worktree of an *indexed* checkout indexes it inline — donor-seeded, so parsing and writes
+# but no LLM spend — instead of refusing. Every other unindexed directory still refuses,
+# because indexing it would cost real money (INV-10), and a *failed* attempt refuses with
+# the cause attached rather than raising or returning an empty page (INV-7).
+# ---------------------------------------------------------------------------
+
+
+def _seeded_worktree(
+    tmp_path: Path,
+    settings: Settings | None = None,
+) -> tuple[ProjectManager, _SeedingRepository, FakeGraphBuilder, Path, str]:
+    """A worktree whose main checkout is indexed: the one case that may auto-index."""
+    main, worktree = _worktree_dirs(tmp_path)
+    builder = FakeGraphBuilder(build_result=([_SummaryNode("a.py", "s", "h1")], []))
+    repo = _SeedingRepository(builder)
+    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), main, settings=settings)
+    donor = manager.get_project(str(main))
+    repo.indexed_projects.add(donor)
+    repo.stored_summaries[donor] = {"a.py": {"summary": "s", "summary_input_hash": "h1"}}
+    return manager, repo, builder, worktree, donor
+
+
+@pytest.mark.asyncio
+async def test_ensure_indexed_for_query_is_a_no_op_for_an_already_indexed_project(tmp_path: Path) -> None:
+    repo = FakeProjectRepository({"nodes": 12, "edges": 34, "chunks": 5, "summaries": 6})
+    builder = FakeGraphBuilder()
+    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), None)
+    project = manager.get_project(str(tmp_path))
+    repo.indexed_projects.add(project)
+
+    assert await manager.ensure_indexed_for_query(str(tmp_path)) == (project, None)
+    # The common case costs one cheap probe: no detection, no scan, no build.
+    assert builder.builds == 0 and builder.updates == 0
+    assert builder.scan_checksum_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_indexed_for_query_refuses_a_plain_unindexed_directory(tmp_path: Path) -> None:
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), None)
+
+    project, reason = await manager.ensure_indexed_for_query(str(tmp_path))
+
+    assert project == manager.get_project(str(tmp_path))
+    # Indexing this would cost real money, so it stays an explicit, preview-approved act.
+    assert reason is not None and "index_directory" in reason
+    assert builder.builds == 0
+
+
+@pytest.mark.asyncio
+async def test_first_query_from_a_worktree_auto_indexes_it_seeded_from_the_donor(tmp_path: Path) -> None:
+    manager, repo, builder, worktree, donor = _seeded_worktree(tmp_path)
+
+    project, reason = await manager.ensure_indexed_for_query(str(worktree))
+
+    assert reason is None
+    assert project == manager.get_project(str(worktree))
+    assert builder.builds == 1
+    # Seeded, not paid for: the donor's summaries are what the build was handed.
+    assert builder.build_stored_summaries == [{"a.py": {"summary": "s", "summary_input_hash": "h1"}}]
+    assert repo.worktree_meta == [(project, donor, str((tmp_path / "main").resolve()))]
+
+
+@pytest.mark.asyncio
+async def test_auto_index_inherits_the_donor_scan_scope(tmp_path: Path) -> None:
+    """The worktree must scan the universe its donor scanned: a path excluded there —
+    vendor/**, generated code — must not be indexed here, for money, by a mere query."""
+    manager, repo, builder, worktree, donor = _seeded_worktree(tmp_path)
+    repo.stored_scope = (["backend/**"], ["vendor/**"])
+
+    await manager.ensure_indexed_for_query(str(worktree))
+
+    assert repo.scope_requests == [donor]        # inherited from the donor, not from nowhere
+    assert builder.build_filters == [(["backend/**"], ["vendor/**"])]
+    assert builder.scan_checksum_calls == [(["backend/**"], ["vendor/**"])]
+
+
+@pytest.mark.asyncio
+async def test_auto_index_of_an_unscoped_donor_passes_no_filters(tmp_path: Path) -> None:
+    """An empty stored scope means "no filters", not "include nothing"."""
+    manager, repo, builder, worktree, _ = _seeded_worktree(tmp_path)
+    repo.stored_scope = ([], [])
+
+    await manager.ensure_indexed_for_query(str(worktree))
+
+    assert builder.build_filters == [(None, None)]
+
+
+@pytest.mark.asyncio
+async def test_failed_auto_index_reports_the_cause_instead_of_raising(tmp_path: Path) -> None:
+    manager, _repo, builder, worktree, _donor = _seeded_worktree(tmp_path)
+    builder.preflight_error = RuntimeError("OPENROUTER_API_KEY is not set")
+
+    project, reason = await manager.ensure_indexed_for_query(str(worktree))
+
+    assert project == manager.get_project(str(worktree))
+    assert reason is not None and reason.startswith("auto-index attempted and failed:")
+    assert "OPENROUTER_API_KEY is not set" in reason
+    assert builder.builds == 0                    # aborted before the first write (INV-2)
+
+
+@pytest.mark.asyncio
+async def test_auto_index_blocked_by_the_cost_gate_reports_the_estimate(tmp_path: Path) -> None:
+    """The gate is the other realistic failure: a branch that rewrote half the tree is not
+    free, and the cap must still bite — reported, not raised."""
+    settings = Settings(_env_file=None, max_index_cost_usd=0.0)
+    manager, _repo, builder, worktree, _donor = _seeded_worktree(tmp_path, settings=settings)
+    builder.scan_checksums_result = {"rewritten.py": "new"}
+    builder.estimate_result = {"estimated_tokens": 50_000_000, "estimated_nodes": 100_000}
+
+    _project, reason = await manager.ensure_indexed_for_query(str(worktree))
+
+    assert reason is not None and reason.startswith("auto-index attempted and failed:")
+    assert "exceeds the limit" in reason
+    assert builder.builds == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_index_is_refused_when_the_worktree_flag_is_off(tmp_path: Path) -> None:
+    settings = Settings(_env_file=None, worktree_auto_index=False)
+    manager, _repo, builder, worktree, _donor = _seeded_worktree(tmp_path, settings=settings)
+
+    _project, reason = await manager.ensure_indexed_for_query(str(worktree))
+
+    assert reason is not None and "index_directory" in reason
+    assert builder.builds == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_index_is_refused_for_a_worktree_whose_main_checkout_is_unindexed(tmp_path: Path) -> None:
+    main, worktree = _worktree_dirs(tmp_path)
+    builder = FakeGraphBuilder()
+    repo = _SeedingRepository(builder)
+    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), main)
+
+    _project, reason = await manager.ensure_indexed_for_query(str(worktree))
+
+    # Nothing to seed from, so this index would be paid for in full — refuse it.
+    assert reason is not None and "index_directory" in reason
+    assert builder.builds == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_queries_from_one_worktree_build_once(tmp_path: Path) -> None:
+    """N parallel first queries must not start N indexes: the per-project lock serializes
+    them and the loser degrades to a checksum no-op."""
+    import asyncio
+
+    manager, _repo, builder, worktree, _donor = _seeded_worktree(tmp_path)
+    original_build = builder.build
+
+    async def slow_build(*args: object, **kwargs: object) -> BuildResult:
+        await asyncio.sleep(0.02)      # hold the lock long enough for the racer to pile up
+        return await original_build(*args, **kwargs)
+
+    builder.build = slow_build  # type: ignore[method-assign]
+
+    results = await asyncio.gather(
+        manager.ensure_indexed_for_query(str(worktree)),
+        manager.ensure_indexed_for_query(str(worktree)),
+    )
+
+    assert [reason for _project, reason in results] == [None, None]
+    assert builder.builds == 1
+    assert builder.updates == 1          # the second call found the index and re-checked it
+
+
+# ---------------------------------------------------------------------------
+# Honest preview for a worktree: quoting the whole tree advertised ~$50 for an index that
+# donor seeding makes ~$0. The estimate must price the uncovered files only, and say why.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preview_of_a_worktree_prices_only_what_the_donor_does_not_cover(tmp_path: Path) -> None:
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    builder.scan_checksums_result = {"same.py": "m1", "edited.py": "NEW", "added.py": "m9"}
+    builder.estimate_result = {"estimated_tokens": 40, "estimated_nodes": 4}
+    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), main)
+    donor = manager.get_project(str(main))
+    repo.indexed_projects.add(donor)
+    repo.checksums[donor] = {"same.py": "m1", "edited.py": "OLD", "gone.py": "m3"}
+
+    result = await manager.preview_directory(str(worktree))
+
+    assert builder.previews == 0                          # the full tree is not what is priced
+    assert builder.estimated_paths == [["added.py", "edited.py"]]
+    assert builder.scan_checksum_calls == [(None, None)]
+    assert result["preview"] is True
+    assert result["worktree_of"] == donor
+    assert result["uncovered_files"] == 2
+    assert result["donor_covered_files"] == 1             # same.py; the donor's gone.py is gone
+    assert result["files"] == 2                           # "files" = what this index would pay for
+    assert result["estimated_tokens"] == 40
+    assert "estimated_cost_usd" in result
+
+
+@pytest.mark.asyncio
+async def test_preview_of_a_plain_directory_still_prices_the_whole_tree(tmp_path: Path) -> None:
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), None)
+
+    result = await manager.preview_directory(str(tmp_path))
+
+    assert builder.previews == 1
+    assert builder.scan_checksum_calls == []
+    assert result["files"] == 3 and "worktree_of" not in result
+
+
+@pytest.mark.asyncio
+async def test_preview_of_a_worktree_without_an_indexed_donor_prices_the_whole_tree(tmp_path: Path) -> None:
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), main)
+
+    result = await manager.preview_directory(str(worktree))
+
+    # No donor means no seeding, so the whole tree really will be paid for.
+    assert builder.previews == 1
+    assert result["files"] == 3 and "worktree_of" not in result
+
+
+def test_worktree_settings_default_to_on() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.worktree_auto_index is True
+    assert settings.worktree_janitor_enabled is True
+
+
+@pytest.mark.asyncio
+async def test_repository_worktree_meta_round_trip() -> None:
+    from inflorescence.db.repository import GraphRepository
+
+    conn = _RecordingConn([{"worktree_of": "main_abc12345", "main_root_path": "/repo/main"}])
+    repo = GraphRepository(conn)  # type: ignore[arg-type]
+
+    await repo.set_project_worktree_meta("wt_deadbeef", "main_abc12345", "/repo/main")
+    assert conn.writes == [{
+        "project": "wt_deadbeef",
+        "worktree_of": "main_abc12345",
+        "main_root_path": "/repo/main",
+    }]
+    assert await repo.get_project_worktree_meta("wt_deadbeef") == {
+        "worktree_of": "main_abc12345",
+        "main_root_path": "/repo/main",
+    }
+
+    # An ordinary project's root node carries no marker: absent row, or a null property.
+    assert await GraphRepository(_RecordingConn([])).get_project_worktree_meta("p") is None  # type: ignore[arg-type]
+    blank = _RecordingConn([{"worktree_of": None, "main_root_path": None}])
+    assert await GraphRepository(blank).get_project_worktree_meta("p") is None  # type: ignore[arg-type]
+
+
+class _RecordingConn:
+    """Minimal MemgraphConnection stand-in: records write params, replays canned read rows."""
+
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+        self.writes: list[dict[str, object]] = []
+
+    async def execute_write(self, query: str, params: dict[str, object] | None = None) -> None:
+        self.writes.append(dict(params or {}))
+
+    async def execute_query(
+        self, query: str, params: dict[str, object] | None = None
+    ) -> list[dict[str, object]]:
+        return self.rows
+
+
 class FakeProjectRepository:
     def __init__(
         self,
@@ -425,19 +1012,50 @@ class FakeProjectRepository:
         self.files_requested: list[list[str]] = []
         self.scopes: list[tuple[str, list[str], list[str]]] = []
         self.stored_scope: tuple[list[str], list[str]] = ([], [])
+        # Which project's scope was read back — an auto-index must inherit the *donor's*.
+        self.scope_requests: list[str] = []
+        # Donor (worktree seeding) state, keyed by project id, plus a call log per read so a
+        # test can assert that an ordinary directory triggers no donor lookups at all.
+        self.indexed_projects: set[str] = set()
+        self.checksums: dict[str, dict[str, str]] = {}
+        self.stored_summaries: dict[str, dict[str, dict[str, object]]] = {}
+        self.stored_chunk_embeddings: dict[str, dict[str, list[float]]] = {}
+        self.project_is_indexed_calls: list[str] = []
+        self.checksum_requests: list[str] = []
+        self.summary_requests: list[str] = []
+        self.chunk_embedding_requests: list[str] = []
+        self.summaries_written: list[tuple[str, list[dict[str, object]]]] = []
+        self.worktree_meta: list[tuple[str, str, str]] = []
 
     async def get_project_stats(self, project: str) -> dict[str, int]:
         self.expected_hash = project.rsplit("_", 1)[-1]
         return self.stats
 
+    async def project_is_indexed(self, project: str) -> bool:
+        self.project_is_indexed_calls.append(project)
+        return project in self.indexed_projects
+
     async def get_checksums(self, project: str) -> dict[str, str]:
-        return {"module.py": "abc123"}
+        self.checksum_requests.append(project)
+        return dict(self.checksums.get(project, {"module.py": "abc123"}))
 
     async def get_stored_summaries(self, project: str) -> dict[str, dict[str, object]]:
-        return {}
+        self.summary_requests.append(project)
+        return self.stored_summaries.get(project, {})
 
     async def get_stored_chunk_embeddings(self, project: str) -> dict[str, list[float]]:
-        return {}
+        self.chunk_embedding_requests.append(project)
+        return self.stored_chunk_embeddings.get(project, {})
+
+    async def store_summaries(self, project: str, items: list[dict[str, object]]) -> int:
+        rows = [dict(item) for item in items]
+        self.summaries_written.append((project, rows))
+        return len(rows)
+
+    async def set_project_worktree_meta(
+        self, project: str, worktree_of: str, main_root_path: str
+    ) -> None:
+        self.worktree_meta.append((project, worktree_of, main_root_path))
 
     async def set_project_root_path(self, project: str, root_path: str) -> None:
         self.root_paths.append((project, root_path))
@@ -446,6 +1064,7 @@ class FakeProjectRepository:
         self.scopes.append((project, list(include), list(exclude)))
 
     async def get_project_scope(self, project: str) -> tuple[list[str], list[str]]:
+        self.scope_requests.append(project)
         return self.stored_scope
 
     async def get_stale_summary_embedding_nodes(self, project: str) -> list[object]:
@@ -490,6 +1109,23 @@ class FakeGraphBuilder:
         # normal "there is work to do" path runs. A no-op test flips it to False and asserts
         # neither preflight nor the vector dump happened.
         self.pending_changes = True
+        # Worktree seeding observation: which stored_summaries the build was handed, which
+        # paths the cost gate priced, and how often the full-scan preview was used at all.
+        self.build_stored_summaries: list[dict[str, dict[str, object]] | None] = []
+        self.build_dirty_ids: set[str] = set()
+        self.previews = 0
+        self.estimated_paths: list[list[str]] = []
+        self.scan_checksums_result: dict[str, str] = {}
+        self.scan_checksum_calls: list[tuple[list[str] | None, list[str] | None]] = []
+
+    def scan_checksums(
+        self,
+        root_path: Path,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+    ) -> dict[str, str]:
+        self.scan_checksum_calls.append((include_patterns, exclude_patterns))
+        return dict(self.scan_checksums_result)
 
     async def has_pending_changes(
         self,
@@ -507,6 +1143,7 @@ class FakeGraphBuilder:
             raise self.preflight_error
 
     def estimate_paths(self, root_path: Path, paths: list[str]) -> dict[str, object]:
+        self.estimated_paths.append(list(paths))
         return self.estimate_result
 
     async def build(
@@ -520,7 +1157,15 @@ class FakeGraphBuilder:
     ) -> BuildResult:
         self.builds += 1
         self.build_filters.append((include_patterns, exclude_patterns))
-        return BuildResult(nodes=list(self.build_result[0]), edges=list(self.build_result[1]))
+        self.build_stored_summaries.append(stored_summaries)
+        # Mirrors the real builder: whatever stored summaries came in are handed back on the
+        # result, which is what lets index_summaries reuse the donor's vectors.
+        return BuildResult(
+            nodes=list(self.build_result[0]),
+            edges=list(self.build_result[1]),
+            stored_summaries=stored_summaries or {},
+            dirty_summary_ids=set(self.build_dirty_ids),
+        )
 
     async def update(
         self,
@@ -548,6 +1193,7 @@ class FakeGraphBuilder:
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
     ) -> dict[str, object]:
+        self.previews += 1
         return self.preview_result or {
             "files": 3,
             "total_bytes": 120,
@@ -566,6 +1212,11 @@ class FakeRAGIndexer:
         self.summary_count = summary_count
         self.code_nodes: list[list[object]] = []
         self.summary_nodes: list[list[object]] = []
+        # Reuse plumbing: the caches each phase was handed, so a test can prove the donor's
+        # vectors (not a fresh embed) are what the run will store.
+        self.code_stored_embeddings: list[dict[str, list[float]] | None] = []
+        self.summary_stored_summaries: list[dict[str, dict[str, object]] | None] = []
+        self.summary_dirty_ids: list[set[str] | None] = []
 
     preflight_error: BaseException | None = None
 
@@ -585,6 +1236,7 @@ class FakeRAGIndexer:
     ) -> int:
         self.code_indexes += 1
         self.code_nodes.append(list(nodes))
+        self.code_stored_embeddings.append(stored_chunk_embeddings)
         return self.code_count
 
     async def index_summaries(
@@ -597,7 +1249,32 @@ class FakeRAGIndexer:
     ) -> int:
         self.summary_indexes += 1
         self.summary_nodes.append(list(nodes))
+        self.summary_stored_summaries.append(stored_summaries)
+        self.summary_dirty_ids.append(dirty_ids)
         return self.summary_count
+
+
+class _SeedingRepository(FakeProjectRepository):
+    """A repository whose answers reflect the index a build has actually written.
+
+    Two callers need that: ``ensure_indexed_for_query`` re-probes after auto-indexing (a run
+    that stored nothing must not be reported as queryable), and a second, racing ensure must
+    see the first one's nodes so it degrades to a no-op instead of building again.
+    """
+
+    def __init__(self, builder: FakeGraphBuilder) -> None:
+        super().__init__({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+        self._builder = builder
+
+    async def get_project_stats(self, project: str) -> dict[str, int]:
+        self.expected_hash = project.rsplit("_", 1)[-1]
+        if self._builder.builds:
+            return {"nodes": 7, "edges": 2, "chunks": 1, "summaries": 1}
+        return self.stats
+
+    async def project_is_indexed(self, project: str) -> bool:
+        self.project_is_indexed_calls.append(project)
+        return project in self.indexed_projects or self._builder.builds > 0
 
 
 class _FakeRecord:

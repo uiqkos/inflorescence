@@ -856,6 +856,34 @@ class GraphBuilder:
             "estimated_tokens": total_bytes // 4,
         }
 
+    def scan_checksums(
+        self,
+        root_path: Path,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+    ) -> dict[str, str]:
+        """Return ``{root-relative path: md5}`` for every file this scan would index.
+
+        The same directory walk + MD5 pass :meth:`_scan_for_changes` runs, but diffed against
+        a caller-supplied checksum map instead of the project's own stored one. That is what
+        lets a *never-indexed* project (a fresh worktree) be compared against another
+        project's checksums — the donor's — to decide which files are genuinely new content.
+        Nothing billable happens here: no parse, no LLM, no embedding.
+
+        A file unreadable at checksum time is omitted rather than raising: it is then treated
+        as content the donor does not cover, i.e. priced, which is the safe direction (INV-3).
+        """
+        root = root_path.resolve()
+        files, _ = self._scan_files(
+            root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
+        )
+        checksums: dict[str, str] = {}
+        for f in files:
+            ck = FileChecksum.try_compute(f, root)
+            if ck is not None:
+                checksums[ck.file_path] = ck.md5
+        return checksums
+
     def estimate_paths(self, root_path: Path, paths: list[str]) -> dict[str, object]:
         """Preview-style token/node stats for a specific set of changed paths.
 

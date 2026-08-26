@@ -6,6 +6,7 @@ import pytest
 
 from inflorescence import __version__
 from inflorescence.__main__ import build_parser
+from inflorescence.config import Settings
 from inflorescence.server import create_server
 
 
@@ -213,6 +214,166 @@ def _fake_server_parts(healthy: bool, ran: dict):
         return FakeMCP(), FakeConn(), FakeLLM(), FakeWatcher()
 
     return fake_create_server
+
+
+# ----------------------------------------------------------------------------------------
+# Worktree janitor wiring. The janitor deletes whole project graphs, so *where* it is started
+# is part of its safety: only the real server starts it, and shutdown always stops it.
+# ----------------------------------------------------------------------------------------
+
+
+class _JanitorFakeConn:
+    def __init__(self, healthy: bool = True) -> None:
+        self.healthy = healthy
+        self.closed = False
+
+    async def health_check(self) -> bool:
+        return self.healthy
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _JanitorFakeRepo:
+    """A repository the janitor can list, so the startup probe succeeds."""
+
+    def __init__(self) -> None:
+        self.list_calls = 0
+
+    async def list_projects(self) -> list[dict[str, object]]:
+        self.list_calls += 1
+        return []
+
+
+async def test_startup_sweeps_worktrees_and_schedules_the_periodic_task(monkeypatch) -> None:
+    from inflorescence import janitor
+    from inflorescence import server as server_mod
+
+    swept: list[object] = []
+
+    async def fake_sweep(repo, settings, *, conn=None):
+        swept.append(repo)
+        return {"scanned": 0, "candidates": 0, "deleted": [], "skipped": []}
+
+    monkeypatch.setattr(janitor, "sweep", fake_sweep)
+
+    async def fake_setup(conn) -> None:
+        return None
+
+    monkeypatch.setattr(server_mod, "setup_schema", fake_setup)
+
+    repo = _JanitorFakeRepo()
+    settings = Settings(worktree_janitor_enabled=True)
+    healthy = await server_mod.startup(_JanitorFakeConn(), repo=repo, settings=settings)
+
+    try:
+        assert healthy is True
+        assert len(swept) == 1                      # swept once at startup
+        assert len(server_mod._janitor_tasks) == 1  # and scheduled for later
+    finally:
+        await server_mod.stop_worktree_janitor()
+
+    assert server_mod._janitor_tasks == set()
+
+
+async def test_startup_does_not_schedule_a_janitor_when_the_setting_is_off(monkeypatch) -> None:
+    """The off switch is checked before anything is swept or scheduled."""
+    from inflorescence import janitor
+    from inflorescence import server as server_mod
+
+    async def fail_sweep(repo, settings, *, conn=None):
+        raise AssertionError("sweep must not run when the janitor is disabled")
+
+    monkeypatch.setattr(janitor, "sweep", fail_sweep)
+
+    async def fake_setup(conn) -> None:
+        return None
+
+    monkeypatch.setattr(server_mod, "setup_schema", fake_setup)
+
+    repo = _JanitorFakeRepo()
+    await server_mod.startup(
+        _JanitorFakeConn(), repo=repo, settings=Settings(worktree_janitor_enabled=False)
+    )
+
+    assert repo.list_calls == 0
+    assert server_mod._janitor_tasks == set()
+
+
+async def test_a_failing_sweep_does_not_stop_the_server_from_starting(monkeypatch) -> None:
+    from inflorescence import janitor
+    from inflorescence import server as server_mod
+
+    async def boom(repo, settings, *, conn=None):
+        raise RuntimeError("memgraph went away")
+
+    monkeypatch.setattr(janitor, "sweep", boom)
+
+    async def fake_setup(conn) -> None:
+        return None
+
+    monkeypatch.setattr(server_mod, "setup_schema", fake_setup)
+
+    healthy = await server_mod.startup(
+        _JanitorFakeConn(), repo=_JanitorFakeRepo(), settings=Settings()
+    )
+
+    assert healthy is True
+    assert server_mod._janitor_tasks == set()  # nothing left looping either
+
+
+async def test_shutdown_stops_the_periodic_janitor(monkeypatch) -> None:
+    from inflorescence import janitor
+    from inflorescence import server as server_mod
+
+    async def fake_sweep(repo, settings, *, conn=None):
+        return {"scanned": 0, "candidates": 0, "deleted": [], "skipped": []}
+
+    monkeypatch.setattr(janitor, "sweep", fake_sweep)
+
+    conn = _JanitorFakeConn()
+    task = await server_mod.start_worktree_janitor(
+        conn, repo=_JanitorFakeRepo(), settings=Settings(worktree_janitor_enabled=True)
+    )
+    assert task is not None
+
+    class FakeLLM:
+        async def close(self) -> None:
+            return None
+
+    class FakeWatcher:
+        def stop_all(self) -> None:
+            return None
+
+    await server_mod.shutdown(conn, FakeLLM(), FakeWatcher())
+
+    assert task.cancelled() or task.done()
+    assert server_mod._janitor_tasks == set()
+    assert conn.closed is True
+
+
+def test_dashboard_viewer_never_starts_a_janitor(monkeypatch) -> None:
+    """``create_server`` — the only thing the dashboard console builds — cannot delete.
+
+    The viewer never calls ``startup``, and ``create_server`` must not sweep or schedule
+    anything on its own; a read-only console that reaps project graphs would be a very
+    expensive surprise.
+    """
+    from inflorescence import janitor
+    from inflorescence import server as server_mod
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+
+    async def fail_sweep(repo, settings, *, conn=None):
+        raise AssertionError("create_server must never sweep")
+
+    monkeypatch.setattr(janitor, "sweep", fail_sweep)
+
+    mcp, conn, llm, watcher = create_server(enable_watcher=False)
+    try:
+        assert server_mod._janitor_tasks == set()
+    finally:
+        watcher.stop_all()
 
 
 def test_serve_exits_1_when_memgraph_unreachable(monkeypatch) -> None:

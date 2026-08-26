@@ -146,6 +146,52 @@ MATCH (n:Code:Directory {id: 'dir:.', project: $project})
 RETURN n.index_include AS include, n.index_exclude AS exclude
 """
 
+# "This project is a linked git worktree of that one." Written on the same project root node
+# as root_path/scope, and only for a directory detection proved to be a worktree — an ordinary
+# project never carries it. Two facts are stored, not one: the donor's *project id* (whose
+# cache seeded this index, and whose deletion should be considered together with this one) and
+# the main checkout's *path*, which is what a janitor re-reads git's worktree registry from.
+# The path alone would not survive the main checkout being re-indexed under a different id, and
+# the id alone cannot be turned back into a filesystem location.
+SET_PROJECT_WORKTREE_META = """
+MATCH (n:Code:Directory {id: 'dir:.', project: $project})
+SET n.worktree_of = $worktree_of, n.worktree_main_root = $main_root_path
+"""
+
+GET_PROJECT_WORKTREE_META = """
+MATCH (n:Code:Directory {id: 'dir:.', project: $project})
+RETURN n.worktree_of AS worktree_of, n.worktree_main_root AS main_root_path
+"""
+
+# Every project that has ever been indexed, with the two facts a janitor reasons about:
+# where its tree lives and whether it was indexed as a worktree. Scoped to the project root
+# node (one per project) so this is a handful of rows, not a scan of the graph. A project
+# without root_path predates path recording — it is returned by no filter here, and so can
+# never be reasoned about, let alone deleted.
+LIST_PROJECTS = """
+MATCH (n:Code:Directory {id: 'dir:.'})
+WHERE n.root_path IS NOT NULL AND n.root_path <> ''
+RETURN n.project AS project, n.root_path AS root_path,
+       n.worktree_of AS worktree_of, n.worktree_main_root AS main_root_path
+"""
+
+# The ONLY deletion of a whole project the janitor is allowed to issue. The marker is
+# re-asserted inside the same transaction as the delete (the WHERE on the root node), so a
+# marker that disappears between a caller's check and this write cannot be raced into
+# destroying an ordinary project's index: with no marked root node the MATCH yields nothing
+# and nothing is deleted. `deleted` reports how many nodes actually went, which is how the
+# caller tells "refused" from "done".
+DELETE_WORKTREE_PROJECT = """
+MATCH (root:Code:Directory {id: 'dir:.', project: $project})
+WHERE root.worktree_of IS NOT NULL AND root.worktree_of <> ''
+  AND root.worktree_main_root IS NOT NULL AND root.worktree_main_root <> ''
+WITH root
+MATCH (n {project: $project})
+WHERE n:Code OR n:CodeChunk OR n:External
+DETACH DELETE n
+RETURN count(n) AS deleted
+"""
+
 GET_STORED_SUMMARIES = """
 MATCH (n:Code {project: $project})
 WHERE n.summary IS NOT NULL AND n.summary <> ''
@@ -220,10 +266,32 @@ RETURN m.file_path AS file_path
 
 # Stamp the coverage marker: chunks for these files are fully stored for the given
 # content checksum. Set together with (i.e. equal to) the file's stored checksum.
+#
+# The file-node test is a `labels(m)` membership check, NOT the `m:Module OR m:Document`
+# label disjunction it stands for — that form is MISCOMPILED by Memgraph 3.12.0 here. With
+# the label-property indexes this schema creates (Module.project, Document.project), a
+# batched (UNWIND) write whose WHERE is a disjunction of *pure label tests* is planned as an
+# indexed union scan and the SET reaches exactly ONE node per query, however many rows
+# matched — and `RETURN count(*)` reports that same 1, so the caller cannot even see it was
+# cheated. Probed live on 3.12.0 with 5 matching rows: `m:Module OR m:Document` → 1 written;
+# `m:Module` alone → 5; `m:Module OR m.node_type = 'document'` → 5; the form below → 5. The
+# bug is specific to this shape: the same disjunction in a read, in a write without UNWIND,
+# or AND-ed with a non-label predicate executes correctly (probed live for GET_CHECKSUMS,
+# GET_FILES_WITH_STALE_CHUNKS, DELETE_PROJECT and DELETE_EDGES_BY_KEYS).
+#
+# Under-writing here is not cosmetic: an unstamped file stays "never fully chunked" for
+# GET_FILES_WITH_STALE_CHUNKS forever, so every re-index re-chunks and re-embeds unchanged
+# content — repeated paid work, which is exactly what INV-5 forbids.
+#
+# `labels(m)` is used rather than the equally-valid `m.node_type IN ['module','document']`
+# so that this stamper and the GET_FILES_WITH_STALE_CHUNKS detector above keep testing the
+# *same* fact about a node. Were one to key off labels and the other off node_type, any node
+# where the two disagreed would be detected as stale forever yet never be stampable — the
+# exact endless-re-chunk loop this marker exists to prevent.
 MARK_CHUNKS_COVERED = """
 UNWIND $rows AS row
 MATCH (m:Code {project: $project, file_path: row.file_path})
-WHERE m:Module OR m:Document
+WHERE ANY(label IN labels(m) WHERE label IN ['Module', 'Document'])
 SET m.chunks_checksum = row.checksum
 RETURN count(*) AS written
 """
@@ -576,10 +644,19 @@ DELETE r
 # Targeted stale-edge removal: each row is {source, type, target}. Matches the
 # exact endpoint pair by id (indexed) and filters the relationship by type, so a
 # reconcile deletes only edges the fresh build dropped — never the whole set.
+#
+# The target-label test is written over `labels(t)` for the same reason as
+# MARK_CHUNKS_COVERED above: a batched write whose WHERE is a disjunction of pure label
+# tests is miscompiled on Memgraph 3.12.0. This one was live-probed as correct in its
+# original `(t:Code OR t:External)` form — the disjunction was AND-ed with a non-label
+# predicate (`type(r) = row.type`), which kept the planner off the broken path — but the
+# safety depended on that incidental pairing, so the shape is gone. The `labels()` form is
+# live-validated to delete every row of a batch.
 DELETE_EDGES_BY_KEYS = """
 UNWIND $rows AS row
 MATCH (s:Code {id: row.source, project: $project})-[r]->(t {id: row.target, project: $project})
-WHERE type(r) = row.type AND (t:Code OR t:External)
+WHERE type(r) = row.type
+  AND ANY(label IN labels(t) WHERE label IN ['Code', 'External'])
 DELETE r
 """
 

@@ -281,5 +281,9 @@ def test_file_level_queries_address_documents_too(query_name: str) -> None:
 
     query = getattr(queries, query_name)
 
-    assert ":Code:Module" not in query
-    assert "Module" in query and "Document" in query
+    # Case-insensitive on purpose: a query may address the file node via the label form
+    # (:Module / :Document) or the property form (node_type IN ['module', 'document']) —
+    # both satisfy the invariant; scoping to modules alone does not.
+    lowered = query.lower()
+    assert ":code:module" not in lowered
+    assert "module" in lowered and "document" in lowered

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from time import monotonic
 
 from inflorescence.code_indexer.models import CodeNode, Edge, ExternalRef, NodeType
 from inflorescence.db import queries
@@ -25,11 +27,23 @@ DEFAULT_WRITE_BATCH_SIZE = 500
 # that lives outside the tree); a :Code-only MATCH here is what used to discard those edges
 # silently — 29% of all edges on a Go service. CALLS never points outside, so its template
 # below stays :Code-scoped.
+#
+# The "is this an allowed target" test is written over `labels(t)` rather than as the
+# `t:Code OR t:External` disjunction it replaces. Memgraph 3.12.0 miscompiles a batched
+# (UNWIND) write whose WHERE is a disjunction of *pure label tests* whenever the planner can
+# serve the MATCH from a label-property index: the write reaches only the first row, and
+# `RETURN count(*)` reports that truncated number, so the shortfall is invisible (this is the
+# MARK_CHUNKS_COVERED defect — see queries.py). This query only escaped it because its target
+# MATCH carries no label, so no label-property index applies; probed live, adding a label to
+# that MATCH drops the same query from 3 written edges to 0. That immunity is an invisible
+# accident one innocent edit would undo, and the failure would be silent edge loss, so the
+# shape is removed rather than commented around. The `labels()` form is live-validated to
+# write every row with and without an index in play.
 _UPSERT_EDGES_BATCH_TEMPLATE = (
     "UNWIND $rows AS row "
     "MATCH (s:Code {{id: row.source, project: $project}}) "
     "MATCH (t {{id: row.target, project: $project}}) "
-    "WHERE t:Code OR t:External "
+    "WHERE ANY(label IN labels(t) WHERE label IN ['Code', 'External']) "
     "MERGE (s)-[:{edge_type}]->(t) "
     "RETURN count(*) AS written"
 )
@@ -74,6 +88,87 @@ _VECTOR_MIN_FETCH = 256
 
 def _vector_fetch_k(top_k: int) -> int:
     return max(top_k * _VECTOR_OVERFETCH_FACTOR, _VECTOR_MIN_FETCH)
+
+
+# ---------------------------------------------------------------------------
+# Vector search: surviving Memgraph's post-deletion index lag
+# ---------------------------------------------------------------------------
+
+# Memgraph's vector indexes keep holding entries for nodes a DETACH DELETE removed until
+# its garbage collector catches up — about 20 seconds on 3.12. Inside that window EVERY
+# `vector_search.search` fails outright with "Trying to get a property from a deleted
+# object": not just a search for the deleted project, but every search, for every project.
+# Deleting a project is no longer only a deliberate user action — the worktree janitor
+# issues delete_worktree_project on its own schedule — so an agent's search can start
+# failing for a reason nothing in its own request explains, and the engine's bare message
+# suggests neither a cause nor that waiting fixes it.
+#
+# The retry is deliberately narrow: this one error only (matched on the engine's message,
+# since it arrives as a generic Memgraph.ClientError with no distinguishing code), a budget
+# far shorter than the GC cycle so a tool call fails fast rather than hanging, and any other
+# failure propagates untouched on the first attempt. A slow-but-correct search must not be
+# turned into an eight-second stall, and a syntax error or a dead connection must not be
+# retold as a deletion story.
+_DELETED_OBJECT_MARKER = "deleted object"
+_VECTOR_RETRY_BUDGET_S = 8.0
+_VECTOR_RETRY_BASE_DELAY_S = 0.25
+_VECTOR_RETRY_MAX_DELAY_S = 2.0
+
+# Written for a calling agent, which sees this string and nothing else: it has to name the
+# cause, say the wait is bounded, and say that re-indexing would be wasted effort.
+_STALE_VECTOR_INDEX_MESSAGE = (
+    "Vector search is temporarily unavailable: Memgraph's vector index still holds entries "
+    "for nodes removed by a recent project deletion (an explicit delete, or the worktree "
+    "janitor's sweep). Until its garbage collector clears them, every vector search fails — "
+    "for every project, not only the deleted one. Retried for {waited:.1f}s without "
+    "recovering; retry the same search in ~20 seconds. Nothing is corrupted and no "
+    "re-indexing is needed. Underlying engine error: {original}"
+)
+
+
+class StaleVectorIndexError(RuntimeError):
+    """Vector search kept failing on Memgraph's post-deletion vector-index lag.
+
+    Carries the explanation a caller can act on; the raw engine error is the ``__cause__``.
+    """
+
+
+async def _vector_search_with_retry(
+    run: Callable[[], Awaitable[list[Mapping[str, object]]]],
+) -> list[Mapping[str, object]]:
+    """Run a vector search, retrying only Memgraph's post-deletion "deleted object" error.
+
+    Returns the search result as soon as one succeeds. Re-raises anything else immediately,
+    and raises :class:`StaleVectorIndexError` if the budget runs out while the index is
+    still stale.
+    """
+    started = monotonic()
+    deadline = started + _VECTOR_RETRY_BUDGET_S
+    delay = _VECTOR_RETRY_BASE_DELAY_S
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return await run()
+        except Exception as exc:  # noqa: BLE001 — re-raised below unless it is *that* error
+            if _DELETED_OBJECT_MARKER not in str(exc):
+                raise
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                waited = monotonic() - started
+                logger.warning(
+                    "Vector search still blocked by a stale vector index after %d attempt(s)/%.1fs",
+                    attempts, waited,
+                )
+                raise StaleVectorIndexError(
+                    _STALE_VECTOR_INDEX_MESSAGE.format(waited=waited, original=exc)
+                ) from exc
+            logger.info(
+                "Vector search hit a stale vector index (attempt %d), retrying in %.2fs",
+                attempts, min(delay, remaining),
+            )
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, _VECTOR_RETRY_MAX_DELAY_S)
 
 
 def _written(rows: Sequence[Mapping[str, object]]) -> int:
@@ -432,6 +527,107 @@ class GraphRepository:
         exclude = [str(p) for p in (row.get("exclude") or [])]
         return include, exclude
 
+    async def set_project_worktree_meta(
+        self, project: str, worktree_of: str, main_root_path: str
+    ) -> None:
+        """Mark this project as the index of a linked git worktree of *worktree_of*.
+
+        Stamped on every index of a directory detection identified as a worktree, whether or
+        not the donor project turned out to be indexed: the marker records a fact about the
+        directory, and a future janitor's safety depends on that fact being complete — a
+        worktree index it cannot recognise is one it would either keep forever or, worse,
+        confuse with a standalone project. Ordinary projects never carry it.
+        """
+        await self._conn.execute_write(
+            queries.SET_PROJECT_WORKTREE_META,
+            {"project": project, "worktree_of": worktree_of, "main_root_path": main_root_path},
+        )
+
+    async def get_project_worktree_meta(self, project: str) -> dict[str, str] | None:
+        """Return ``{"worktree_of", "main_root_path"}`` for a worktree project, else ``None``.
+
+        ``None`` covers both "not a worktree" and "root node absent" (never indexed), because
+        neither gives a caller anything to act on. A half-written marker — the donor id present
+        but the path missing, or vice versa — is also reported as absent rather than handed on:
+        a partial answer here would send a janitor to look up the wrong tree.
+        """
+        records = await self._conn.execute_query(
+            queries.GET_PROJECT_WORKTREE_META, {"project": project}
+        )
+        if not records:
+            return None
+        row = records[0]
+        worktree_of = row["worktree_of"]
+        main_root_path = row["main_root_path"]
+        if not worktree_of or not main_root_path:
+            return None
+        return {"worktree_of": str(worktree_of), "main_root_path": str(main_root_path)}
+
+    async def list_projects(self) -> list[dict[str, str | None]]:
+        """Return one row per indexed project: ``project``, ``root_path``, and its worktree marker.
+
+        ``worktree_of`` / ``main_root_path`` are ``None`` for an ordinary project — the marker
+        is written only for a directory proved to be a linked worktree. Read from the project
+        root nodes, so the cost is one row per project rather than a graph scan.
+        """
+        records = await self._conn.execute_query(queries.LIST_PROJECTS, {})
+        projects: list[dict[str, str | None]] = []
+        for r in records:
+            project = r.get("project")
+            if not project:
+                continue
+            projects.append(
+                {
+                    "project": str(project),
+                    "root_path": str(r.get("root_path") or ""),
+                    "worktree_of": str(r["worktree_of"]) if r.get("worktree_of") else None,
+                    "main_root_path": str(r["main_root_path"]) if r.get("main_root_path") else None,
+                }
+            )
+        return projects
+
+    async def delete_worktree_project(self, project: str) -> bool:
+        """Delete a project's index **only** if it is marked as a worktree index. Returns whether it went.
+
+        The guarded counterpart to :meth:`delete_project`, and the only deleter the janitor is
+        allowed to call. Deleting a project throws away paid-for LLM summaries and embeddings
+        and cannot be undone, so the marker is verified twice and the second check is not
+        skippable by any caller: once here, and once *inside the delete statement itself*
+        (:data:`queries.DELETE_WORKTREE_PROJECT`), which matches nothing when the root node
+        carries no marker. A bug in the caller's candidate logic therefore ends in a refusal
+        rather than in an ordinary project losing its index.
+
+        Returns ``False`` — having written nothing — when the project has no marker, has no
+        root node at all, or lost its marker between the two checks.
+        """
+        meta = await self.get_project_worktree_meta(project)
+        if meta is None:
+            logger.error(
+                "Refusing to delete project=%s: it carries no worktree marker. Only an index "
+                "created for a linked git worktree may be reaped.",
+                project,
+            )
+            return False
+
+        result = await self._conn.execute_write_query(
+            queries.DELETE_WORKTREE_PROJECT, {"project": project}
+        )
+        if not result:
+            # The guard matched nothing: the marker was removed between the read above and
+            # this write (a re-index of the same directory as a standalone project). Nothing
+            # was deleted, which is the outcome we want.
+            logger.warning(
+                "Delete of worktree project=%s matched no marked root node — nothing deleted",
+                project,
+            )
+            return False
+        deleted = int(result[0].get("deleted") or 0)
+        logger.warning(
+            "Deleted worktree project=%s (%d node(s)) — was a worktree of project=%s at %s",
+            project, deleted, meta["worktree_of"], meta["main_root_path"],
+        )
+        return True
+
     async def update_checksums(self, project: str, items: Sequence[Mapping[str, object]]) -> int:
         """Set MD5 checksums on module nodes in UNWIND batches.
 
@@ -668,10 +864,16 @@ class GraphRepository:
         embedding: list[float],
         top_k: int = 10,
     ) -> list[dict[str, object]]:
-        """Search code chunks by vector similarity."""
-        records = await self._conn.execute_query(
-            queries.VECTOR_SEARCH_CODE,
-            {"embedding": embedding, "top_k": _vector_fetch_k(top_k), "project": project},
+        """Search code chunks by vector similarity.
+
+        Retries Memgraph's post-deletion vector-index lag (see
+        :func:`_vector_search_with_retry`); any other failure propagates untouched.
+        """
+        records = await _vector_search_with_retry(
+            lambda: self._conn.execute_query(
+                queries.VECTOR_SEARCH_CODE,
+                {"embedding": embedding, "top_k": _vector_fetch_k(top_k), "project": project},
+            )
         )
         return [
             {
@@ -691,10 +893,16 @@ class GraphRepository:
         embedding: list[float],
         top_k: int = 10,
     ) -> list[dict[str, object]]:
-        """Search nodes by summary embedding similarity."""
-        records = await self._conn.execute_query(
-            queries.VECTOR_SEARCH_SUMMARY,
-            {"embedding": embedding, "top_k": _vector_fetch_k(top_k), "project": project},
+        """Search nodes by summary embedding similarity.
+
+        Retries Memgraph's post-deletion vector-index lag (see
+        :func:`_vector_search_with_retry`); any other failure propagates untouched.
+        """
+        records = await _vector_search_with_retry(
+            lambda: self._conn.execute_query(
+                queries.VECTOR_SEARCH_SUMMARY,
+                {"embedding": embedding, "top_k": _vector_fetch_k(top_k), "project": project},
+            )
         )
         return [
             {**_serialize_entity(r), "score": r["score"]}

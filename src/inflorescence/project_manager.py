@@ -6,9 +6,10 @@ import asyncio
 import hashlib
 import logging
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 
-from inflorescence.code_indexer.graph_builder import GraphBuilder
+from inflorescence.code_indexer.graph_builder import BuildResult, GraphBuilder
 from inflorescence.config import Settings
 from inflorescence.cost import IndexCostExceededError, estimate_index_cost
 from inflorescence.db.connection import MemgraphConnection
@@ -17,8 +18,16 @@ from inflorescence.db.repository import GraphRepository
 from inflorescence.db.schema import missing_search_indexes
 from inflorescence.progress import ProgressReporter
 from inflorescence.rag.indexer import RAGIndexer
+from inflorescence.worktree import worktree_main_root
 
 logger = logging.getLogger(__name__)
+
+# Why a directory cannot be queried, in the words a read tool passes on to its caller. Two
+# shapes, because they call for two different actions: nothing was attempted, so index it —
+# or an automatic attempt was made and failed, so fix that cause (INV-7: an unqueryable
+# directory says so, and says why; it never answers with an empty page).
+_NOT_INDEXED_REASON = "index it with index_directory first"
+_AUTO_INDEX_FAILED_PREFIX = "auto-index attempted and failed: "
 
 
 class IndexPreflightError(RuntimeError):
@@ -54,11 +63,16 @@ class ProjectManager:
         rag_indexer: RAGIndexer,
         settings: Settings,
         conn: MemgraphConnection | None = None,
+        worktree_resolver: Callable[[Path], Path | None] = worktree_main_root,
     ) -> None:
         self._repo = repo
         self._builder = graph_builder
         self._rag = rag_indexer
         self._settings = settings
+        # "Is this directory a linked git worktree, and of which checkout?" Injectable so
+        # tests can exercise the seeding branch without laying out a real git repository;
+        # production always uses the filesystem-archaeology implementation in worktree.py.
+        self._worktree_resolver = worktree_resolver
         # Connection used only for the cross-process project lease. Real entry points
         # (server, CLI) always pass one; pure in-process unit tests may omit it, in which
         # case the per-project asyncio.Lock still serializes within the process.
@@ -143,13 +157,145 @@ class ProjectManager:
             )
             raise IndexCostExceededError(estimate["usd"], limit)
 
+    # ------------------------------------------------------------------
+    # Git worktrees: index as a separate project, pay only for what differs
+    # ------------------------------------------------------------------
+
+    def _worktree_main_root(self, root: Path) -> Path | None:
+        """The main checkout *root* is a linked worktree of, or ``None`` if it is not one.
+
+        :func:`~inflorescence.worktree.worktree_main_root` is total by contract — damaged or
+        unreadable git metadata answers "not a worktree" rather than raising. This wrapper
+        holds that line for an *injected* resolver too: a detection failure may cost the
+        worktree its cache reuse, but it must never be able to abort an index.
+        """
+        try:
+            return self._worktree_resolver(root)
+        except Exception:  # noqa: BLE001 — detection is advisory; indexing must survive it
+            logger.warning(
+                "Worktree detection failed for %s — indexing it as a standalone project",
+                root, exc_info=True,
+            )
+            return None
+
+    async def _stamp_worktree_meta(self, project: str, main_root: Path | None) -> None:
+        """Record "this project is a worktree of <main checkout>" on the project root node.
+
+        Written on every index of a detected worktree — including one whose main checkout was
+        never indexed, so no cache seeding happened. The marker is a fact about the directory,
+        not a receipt for the seeding, and a future janitor's ability to reap the index of a
+        deleted worktree (and to leave every other project alone) rests on it being there.
+        Ordinary projects are never marked.
+        """
+        if main_root is None:
+            return
+        await self._repo.set_project_worktree_meta(
+            project, self.get_project(str(main_root)), str(main_root)
+        )
+
+    async def _donor_project(self, project: str, main_root: Path | None) -> str | None:
+        """The indexed main-checkout project whose cache this first index may reuse.
+
+        ``None`` — no seeding — when the directory is not a worktree, when the operator turned
+        the feature off, or when the main checkout has no index to donate. The order matters:
+        the cheap local checks come first so an ordinary directory reaches the database for
+        exactly the same calls it always did.
+        """
+        if main_root is None or not self._settings.worktree_auto_index:
+            return None
+        donor = self.get_project(str(main_root))
+        if donor == project:
+            # Defensive: a resolver pointing at the worktree itself would otherwise make the
+            # project its own donor and seed it from the empty index it is about to write.
+            return None
+        if not await self._repo.project_is_indexed(donor):
+            logger.info(
+                "Worktree of %s has no indexed main checkout (project=%s) — indexing in full",
+                main_root, donor,
+            )
+            return None
+        return donor
+
+    async def _donor_uncovered_paths(
+        self,
+        root: Path,
+        donor_project: str,
+        include_patterns: list[str] | None,
+        exclude_patterns: list[str] | None,
+    ) -> list[str]:
+        """Root-relative paths whose content the donor's index does not already hold.
+
+        Summaries are reused by content hash and chunk vectors by content-derived id, so a
+        file byte-identical to the donor's copy costs nothing to "index". Only the rest — the
+        branch's own edits, plus files the donor never had — will reach the LLM and the
+        embedder, and they are the only thing the cost cap should be pricing.
+        """
+        uncovered, _scanned = await self._donor_coverage(
+            root, donor_project, include_patterns, exclude_patterns
+        )
+        return uncovered
+
+    async def _donor_coverage(
+        self,
+        root: Path,
+        donor_project: str,
+        include_patterns: list[str] | None,
+        exclude_patterns: list[str] | None,
+    ) -> tuple[list[str], int]:
+        """``(paths the donor does not cover, number of files scanned)``.
+
+        The scanned total is what makes the uncovered count explainable in a preview — "2 of
+        4300 files will be paid for" rather than a bare, suspiciously small dollar figure —
+        and it comes free with the scan the uncovered set already needs. Counting it with a
+        second scan would re-read the whole tree for one integer.
+        """
+        donor_checksums = await self._repo.get_checksums(donor_project)
+        current = self._builder.scan_checksums(
+            root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
+        )
+        uncovered = sorted(rel for rel, md5 in current.items() if donor_checksums.get(rel) != md5)
+        return uncovered, len(current)
+
+    async def _persist_seeded_summaries(self, project: str, result: BuildResult) -> int:
+        """Write the donor-reused summaries into the new project. **Not optional.**
+
+        ``build`` persists each *generated* batch through its own callback and deliberately
+        skips reused nodes — "they already match the DB". For a donor-seeded project that is
+        false: the skeleton upsert wrote empty summaries for this project, and the reused text
+        exists only on the in-memory nodes. Left unwritten, the project ends the run with an
+        empty ``summary`` on every unchanged node, which is precisely what
+        ``get_nodes_missing_summaries`` looks for — the repair pass would then regenerate,
+        with real LLM spend, the summaries this whole path exists to avoid paying for.
+
+        Only non-dirty nodes with non-empty summaries are written: dirty ones were already
+        persisted batch-by-batch, and an empty summary must never be stored over a stored one
+        (``store_summaries`` SETs unconditionally — INV-1).
+        """
+        items = [
+            {
+                "node_id": node.id,
+                "summary": node.summary,
+                "summary_input_hash": node.summary_input_hash,
+            }
+            for node in result.nodes
+            if node.summary and node.id not in result.dirty_summary_ids
+        ]
+        if items:
+            await self._repo.store_summaries(project, items)
+            logger.info(
+                "Seeded %d reused summar(ies) into worktree project=%s from its main checkout",
+                len(items), project,
+            )
+        return len(items)
+
     def get_project(self, path: str) -> str:
         """Return the project identifier for a directory path.
 
         This only *derives* an id from the path — it never checks whether that project was
         actually indexed. A typo'd or adjacent directory yields a valid-but-unindexed id, so
-        callers that answer user queries should gate on :meth:`project_is_indexed` to avoid
-        returning an empty page that looks like "no matches" (audit finding T5 / INV-7).
+        callers that answer user queries must go through :meth:`ensure_indexed_for_query`
+        (or at least :meth:`project_is_indexed`) to avoid returning an empty page that looks
+        like "no matches" (audit finding T5 / INV-7).
         """
         resolved = str(Path(path).resolve())
         if resolved not in self._projects:
@@ -159,6 +305,80 @@ class ProjectManager:
     async def project_is_indexed(self, project: str) -> bool:
         """True when *project* has any indexed data (cheap probe; see the repository)."""
         return await self._repo.project_is_indexed(project)
+
+    async def ensure_indexed_for_query(self, directory: str) -> tuple[str, str | None]:
+        """Resolve *directory* to a project a read tool may query, indexing it if that is free.
+
+        Returns ``(project, reason)``. ``reason`` is ``None`` exactly when the project holds
+        an index and the query may proceed; otherwise it is a human-readable clause the tool
+        appends to its "no index found" error. Read tools call nothing else — the decision of
+        what may be indexed on someone's behalf, and what that costs, lives here.
+
+        The one case that indexes instead of refusing is a linked worktree of an **indexed**
+        main checkout with ``worktree_auto_index`` on. That index is donor-seeded: every
+        byte-identical file reuses the donor's summary and chunk vectors, so it costs parsing
+        and writes but no LLM spend (see :meth:`index_directory`). Paying that on the first
+        query is strictly better than answering "not indexed" to someone who just switched
+        branches in a worktree they created seconds ago. It runs **synchronously** — the
+        query that triggered it must see the finished index, not race it.
+
+        Everything else refuses: an ordinary directory, a worktree whose main checkout was
+        never indexed, the feature switched off. Each of those means summarizing a whole tree
+        for real money, and INV-10 forbids spending it without an explicit, preview-approved
+        index.
+
+        Concurrency needs no extra machinery here: :meth:`index_directory` is serialized per
+        project by an asyncio lock and a cross-process lease, so N parallel first queries
+        produce one build and N-1 checksum no-ops.
+
+        A failed attempt is **reported, never raised**: the tool contract is a structured
+        error, so a dead API key or a tripped cost cap comes back as "auto-index attempted
+        and failed: <cause>" instead of an exception the MCP layer renders as a crash, and
+        never as an empty page that reads like "no matches" (INV-7).
+        """
+        project = self.get_project(directory)
+        if await self.project_is_indexed(project):
+            return project, None
+
+        root = Path(directory)
+        try:
+            if not root.is_dir():
+                # A typo'd or deleted path: nothing to index, and index_directory would only
+                # raise FileNotFoundError at the caller.
+                return project, _NOT_INDEXED_REASON
+        except OSError:
+            return project, _NOT_INDEXED_REASON
+
+        donor = await self._donor_project(project, self._worktree_main_root(root))
+        if donor is None:
+            return project, _NOT_INDEXED_REASON
+
+        # Inherit the donor's persisted scan scope. Without it the worktree would scan a
+        # *wider* universe than the checkout it is seeded from, so a vendor/** the operator
+        # excluded there gets parsed, summarized and embedded here — paid for, by a query.
+        include, exclude = await self._repo.get_project_scope(donor)
+        logger.info(
+            "First query against unindexed worktree project=%s — indexing inline, seeded from "
+            "donor project=%s", project, donor,
+        )
+        try:
+            await self.index_directory(
+                directory,
+                include_patterns=include or None,
+                exclude_patterns=exclude or None,
+            )
+        except Exception as exc:  # noqa: BLE001 — every failure becomes a structured error
+            logger.warning("Auto-index of worktree %s failed", directory, exc_info=True)
+            return project, f"{_AUTO_INDEX_FAILED_PREFIX}{exc}"
+
+        if not await self.project_is_indexed(project):
+            # The run succeeded but stored nothing (an empty tree, or one the inherited scope
+            # excludes entirely). Querying it would return the empty page this whole method
+            # exists to avoid, so it is still an error — with a different cause.
+            return project, (
+                f"{_AUTO_INDEX_FAILED_PREFIX}the index run stored no entities for this directory"
+            )
+        return project, None
 
     async def index_directory(
         self,
@@ -182,18 +402,32 @@ class ProjectManager:
         never reach an already-indexed unchanged project. Summaries are still reused by
         content hash and embeddings survive the reconcile — no LLM re-spend.
 
-        Returns statistics about the indexed project.
+        A directory that is a **linked git worktree** is indexed as its own project (it is a
+        different tree), but its first index is seeded from the main checkout's project when
+        that one is indexed: summaries and chunk vectors are reused for every byte-identical
+        file, so only what the branch actually changed is paid for — and the cost cap is
+        applied to exactly that set, not to the whole tree. A detected worktree is also
+        marked as such on its project root node whether or not seeding happened; see
+        :meth:`_stamp_worktree_meta`.
+
+        Returns statistics about the indexed project. A seeded worktree index additionally
+        reports ``worktree_of`` (the donor project) and ``seeded_summaries``.
         """
         root = Path(path).resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"Directory not found: {path}")
 
         project = self.get_project(path)
+        # Filesystem-only detection (no `git` subprocess), so it is cheap enough to run on
+        # every index and is what decides both the marker below and cache seeding.
+        main_root = self._worktree_main_root(root)
         logger.info("Indexing directory=%s as project=%s", root, project)
 
         async with self._project_locks[project], project_lease(self._conn, project):
             await self._preflight()
             existing_stats = await self._repo.get_project_stats(project)
+            seeded_from: str | None = None
+            seeded_summaries = 0
             stored_chunk_embeddings: dict[str, list[float]] = {}
             if existing_stats["nodes"] > 0:
                 stored_chunk_embeddings = await self._repo.get_stored_chunk_embeddings(project)
@@ -219,6 +453,7 @@ class ProjectManager:
                 nodes, edges = result.nodes, result.edges
                 if not nodes and not edges:
                     await self._repo.set_project_root_path(project, str(root))
+                    await self._stamp_worktree_meta(project, main_root)
                     await self._persist_scope(project, include_patterns, exclude_patterns)
                     repaired = await self._repair_incomplete_index(
                         project, root, stored_chunk_embeddings, progress
@@ -234,28 +469,63 @@ class ProjectManager:
                     return stats
             else:
                 logger.info("First-time indexing for project=%s", project)
+                # A linked worktree is a different tree, hence its own project — but its files
+                # are the main checkout's minus one branch's edits. Seeding this first index
+                # with the main project's caches makes every unchanged node a hash hit:
+                # summaries are reused by input hash, chunk vectors by content-derived id, so
+                # no LLM call and no embedding is paid for content that is already indexed.
+                donor_project = await self._donor_project(project, main_root)
+                donor_summaries: dict[str, dict[str, object]] = {}
                 limit = max_cost_usd if max_cost_usd is not None else self._settings.max_index_cost_usd
                 if limit is not None:
-                    preview = self._builder.preview(
-                        root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
-                    )
+                    if donor_project is not None:
+                        # Pricing the whole tree here would reject a free index: a large repo's
+                        # full preview clears any sane cap, while the actual spend is limited to
+                        # the files the donor does not already cover (INV-10 gates *spend*).
+                        uncovered = await self._donor_uncovered_paths(
+                            root, donor_project, include_patterns, exclude_patterns
+                        )
+                        preview = self._builder.estimate_paths(root, uncovered)
+                        logger.info(
+                            "Worktree of an indexed checkout: pricing %d file(s) not covered by "
+                            "donor project=%s", len(uncovered), donor_project,
+                        )
+                    else:
+                        preview = self._builder.preview(
+                            root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
+                        )
                     estimate = estimate_index_cost(preview, self._settings)
                     logger.info("Estimated first-time index cost: $%.4f (limit $%.2f)", estimate["usd"], limit)
                     if estimate["usd"] > limit:
                         raise IndexCostExceededError(estimate["usd"], limit)
+                if donor_project is not None:
+                    donor_summaries = await self._repo.get_stored_summaries(donor_project)
+                    stored_chunk_embeddings = await self._repo.get_stored_chunk_embeddings(donor_project)
+                    logger.info(
+                        "Seeding first index of project=%s from donor project=%s "
+                        "(%d stored summar(ies), %d chunk vector(s))",
+                        project, donor_project, len(donor_summaries), len(stored_chunk_embeddings),
+                    )
                 result = await self._builder.build(
                     project,
                     root,
                     include_patterns=include_patterns,
                     exclude_patterns=exclude_patterns,
+                    stored_summaries=donor_summaries or None,
                     progress=progress,
                 )
                 nodes, edges = result.nodes, result.edges
+                if donor_project is not None:
+                    # Must run before anything reads this project's summaries back — see
+                    # _persist_seeded_summaries for why the build's own callback isn't enough.
+                    seeded_from = donor_project
+                    seeded_summaries = await self._persist_seeded_summaries(project, result)
 
             # Record the absolute root so the dashboard can read source files from disk, and
             # persist this explicit index's scan scope so a later watcher update reproduces it
             # instead of widening the scanned universe (audit finding 5c).
             await self._repo.set_project_root_path(project, str(root))
+            await self._stamp_worktree_meta(project, main_root)
             await self._persist_scope(project, include_patterns, exclude_patterns)
 
             # RAG: chunk + embed code, embed summaries
@@ -287,6 +557,11 @@ class ProjectManager:
                 "skipped_large_files": list(result.skipped_large_files),
                 "reused": False,
             }
+            if seeded_from is not None:
+                # Only present when the worktree fast path actually ran, so an ordinary
+                # project's stats keep exactly the shape callers already parse.
+                stats["worktree_of"] = seeded_from
+                stats["seeded_summaries"] = seeded_summaries
             logger.info("Indexing complete: %s", stats)
             return stats
 
@@ -364,11 +639,43 @@ class ProjectManager:
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
     ) -> dict[str, object]:
-        """Dry-run estimate for a directory — no DB writes, no LLM calls."""
+        """Dry-run estimate for a directory — no DB writes, no LLM calls.
+
+        For a linked worktree of an indexed checkout the estimate covers **only the files the
+        donor's index does not already hold**, because those are the only ones that will ever
+        be paid for (see :meth:`index_directory`). Pricing the whole tree there quoted ~$50
+        for an index that actually costs ~$0 — a preview that scares a caller away from a
+        free operation is worse than no preview. The response then carries ``worktree_of``
+        and the covered/uncovered file counts, so the small number is explainable instead of
+        merely surprising.
+
+        A non-worktree, and a worktree whose main checkout was never indexed, are unchanged:
+        with nothing to seed from, the whole tree really will be paid for.
+        """
         root = Path(path).resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"Directory not found: {path}")
         project = self.get_project(path)
+        donor = await self._donor_project(project, self._worktree_main_root(root))
+        if donor is not None:
+            uncovered, scanned = await self._donor_coverage(
+                root, donor, include_patterns, exclude_patterns
+            )
+            paths_preview = self._builder.estimate_paths(root, uncovered)
+            paths_estimate = estimate_index_cost(paths_preview, self._settings)
+            return {
+                "project": project,
+                "directory": str(root),
+                "preview": True,
+                "estimated_cost_usd": paths_estimate["usd"],
+                # "files" keeps one meaning across both shapes: what this index would pay to
+                # process. For a seeded worktree that is the uncovered set, not the tree.
+                "files": len(uncovered),
+                **paths_preview,
+                "worktree_of": donor,
+                "donor_covered_files": scanned - len(uncovered),
+                "uncovered_files": len(uncovered),
+            }
         preview = self._builder.preview(
             root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
         )

@@ -184,6 +184,20 @@ class Settings(BaseSettings):
     # language -> image override, e.g. {"go": "ghcr.io/me/scip-go:pinned"}
     scip_images: dict[str, str] = Field(default_factory=dict)
 
+    # Git worktrees. A linked worktree is indexed as its own project (its checkout is a
+    # different tree), but nearly all of its content is byte-identical to the main checkout's,
+    # so the main project's index is a free cache donor: summaries are reused by input hash and
+    # chunk vectors by content-derived id, which makes the first index of a worktree cost ~$0
+    # for everything the branch did not change (INV-10 — money is spent on new content only).
+    # Set False to index every worktree from scratch, paying for content that is already indexed.
+    worktree_auto_index: bool = True
+    # Reap the index of a worktree git no longer knows about. A worktree is a disposable
+    # checkout: it is deleted far more often than a project is, and its index would otherwise
+    # linger forever, answering queries about a tree that no longer exists. Only projects
+    # carrying the worktree marker written at index time are ever considered — an ordinary
+    # project is never a candidate, whatever this is set to.
+    worktree_janitor_enabled: bool = True
+
     # Watcher
     watcher_debounce_seconds: float = 5.0
 
