@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -20,7 +21,7 @@ from inflorescence.tools.cypher import register_cypher_tools
 from inflorescence.tools.freshness import FreshnessChecker
 from inflorescence.tools.graph import register_graph_tools
 from inflorescence.tools.indexing import register_indexing_tools
-from inflorescence.tools.path_filters import PathFilterConfig, path_is_allowed
+from inflorescence.tools.path_filters import PathFilterConfig, is_test_path, path_is_allowed
 from inflorescence.tools.responses import (
     NAV_SUMMARY_MAX_CHARS,
     entity_ref,
@@ -29,6 +30,7 @@ from inflorescence.tools.responses import (
     truncate_summary,
 )
 from inflorescence.tools.search import _code_hits, register_search_tools
+from tests.test_worktree import git, make_repo
 
 
 def test_embedding_client_splits_batches_by_count_and_character_limits() -> None:
@@ -3095,3 +3097,417 @@ async def test_raw_graph_tools_document_that_they_do_not_check_freshness(tool_na
     description = mcp._tool_manager.get_tool(tool_name).description
 
     assert "freshness is not checked here" in description
+
+
+# ---------------------------------------------------------------------------
+# Live worktrees: an index of the main checkout says nothing about the branches
+# checked out in that checkout's worktrees, and a clean freshness block would
+# otherwise read as "you are seeing everything".
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_freshness_counts_only_worktrees_that_still_exist_on_disk(tmp_path: Path) -> None:
+    main = make_repo(tmp_path / "main")
+    live = tmp_path / "wt-live"
+    pruned = tmp_path / "wt-gone"
+    git("-C", str(main), "worktree", "add", str(live))
+    git("-C", str(main), "worktree", "add", str(pruned))
+    shutil.rmtree(pruned)  # still registered, but no branch state anyone could query
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": str(main), "limit": 10}))
+
+    assert payload["meta"]["index_freshness"]["live_worktrees"] == 1
+
+
+@pytest.mark.asyncio
+async def test_freshness_omits_live_worktrees_when_the_query_is_the_worktree_itself(tmp_path: Path) -> None:
+    """Inside a worktree the answer already *is* the branch state — no warning to give."""
+    main = make_repo(tmp_path / "main")
+    wt = tmp_path / "wt"
+    git("-C", str(main), "worktree", "add", str(wt))
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": str(wt), "limit": 10}))
+
+    assert "live_worktrees" not in payload["meta"]["index_freshness"]
+
+
+@pytest.mark.asyncio
+async def test_freshness_omits_live_worktrees_for_a_checkout_without_any(tmp_path: Path) -> None:
+    main = make_repo(tmp_path / "main")
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": str(main), "limit": 10}))
+
+    assert "live_worktrees" not in payload["meta"]["index_freshness"]
+
+
+@pytest.mark.asyncio
+async def test_search_tools_report_live_worktrees_too(tmp_path: Path, monkeypatch) -> None:
+    main = make_repo(tmp_path / "main")
+    git("-C", str(main), "worktree", "add", str(tmp_path / "wt"))
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), _FreshnessSearchRepository(), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool("search_semantic", {"directory": str(main), "query": "worker"}))
+
+    assert payload["meta"]["index_freshness"]["live_worktrees"] == 1
+
+
+@pytest.mark.asyncio
+async def test_search_text_reports_live_worktrees_on_its_empty_page(tmp_path: Path) -> None:
+    """The degenerate page carries the warning too, or it reads as a clean bill of health."""
+    main = make_repo(tmp_path / "main")
+    git("-C", str(main), "worktree", "add", str(tmp_path / "wt"))
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), FakeTextSearchRepository(), Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": str(main), "query": "***"}))
+
+    assert payload["items"] == []
+    assert payload["meta"]["index_freshness"]["live_worktrees"] == 1
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["search_code", "search_semantic", "search_hybrid", "search_text", *sorted(_GRAPH_TOOL_ARGS)],
+)
+def test_entity_tools_document_the_live_worktrees_warning(tool_name: str) -> None:
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+    register_search_tools(mcp, FakeManager(), FakeSearchRepository(), Settings(_env_file=None))
+
+    description = mcp._tool_manager.get_tool(tool_name).description
+
+    assert "live_worktrees" in description
+
+
+# ---------------------------------------------------------------------------
+# Literal path patterns. "docs/" echoed back in meta while filtering nothing is
+# exactly the silent no-op INV-7 forbids.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pattern", ["docs/", "docs"])
+def test_path_filter_literal_pattern_covers_the_path_and_its_subtree(pattern: str) -> None:
+    config = PathFilterConfig.from_paths(include_paths=None, exclude_paths=[pattern])
+
+    assert config.exclude == ["docs", "docs/**"]
+    assert path_is_allowed("docs/readme.md", config) is False
+    assert path_is_allowed("docs/a/b.md", config) is False
+    assert path_is_allowed("docs", config) is False
+    assert path_is_allowed("docsx/readme.md", config) is True  # prefix, not a path segment
+    assert path_is_allowed("src/app.py", config) is True
+
+
+def test_path_filter_literal_file_pattern_still_matches_that_one_file() -> None:
+    config = PathFilterConfig.from_paths(include_paths=["src/main.py"], exclude_paths=None)
+
+    assert config.include == ["src/main.py", "src/main.py/**"]
+    assert path_is_allowed("src/main.py", config) is True
+    assert path_is_allowed("src/other.py", config) is False
+
+
+def test_path_filter_leaves_glob_patterns_untouched() -> None:
+    config = PathFilterConfig.from_paths(include_paths=["**/*.py"], exclude_paths=["**/fixtures/**", "a?b", "x[0-9]"])
+
+    assert config.include == ["**/*.py"]
+    assert config.exclude == ["**/fixtures/**", "a?b", "x[0-9]"]
+
+
+@pytest.mark.asyncio
+async def test_list_entities_applies_and_reports_a_normalized_literal_exclude() -> None:
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+
+    payload = _payload(await mcp.call_tool(
+        "list_entities",
+        {"directory": "/tmp/project", "exclude_paths": ["tests/"], "limit": 10},
+    ))
+
+    assert [item["id"] for item in payload["items"]] == ["pkg/a.py::run"]
+    assert payload["meta"]["path_filters"]["exclude"] == ["tests", "tests/**"]
+
+
+@pytest.mark.asyncio
+async def test_search_code_applies_a_normalized_literal_exclude(monkeypatch) -> None:
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), FakeSearchRepository(), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(
+        "search_code",
+        {"directory": "/tmp/project", "query": "worker", "exclude_paths": ["tests"], "min_score": 0.2},
+    ))
+
+    assert [item["entity"]["id"] for item in payload["items"]] == ["pkg/module.py::Worker.run"]
+
+
+# ---------------------------------------------------------------------------
+# Test-file hits: flagged by path heuristic, and excludable before pagination.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tests/helpers.py",
+        "test/a.py",
+        "src/__tests__/button.tsx",
+        "pkg/testdata/fixture.json",
+        "spec/models_spec.rb",
+        "src/conftest.py",
+        "src/test_app.py",
+        "pkg/module_test.go",
+        "src/app.test.ts",
+        "src/app.spec.ts",
+    ],
+)
+def test_is_test_path_flags_test_like_paths(path: str) -> None:
+    assert is_test_path(path) is True
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["src/app.py", "pkg/latest/run.py", "src/protest.py", "docs/testing.md", "", "pkg/contest.py"],
+)
+def test_is_test_path_leaves_production_paths_alone(path: str) -> None:
+    assert is_test_path(path) is False
+
+
+class _MixedSearchRepository(StoredChecksums):
+    """Every backend answers with one test-file hit (higher score) and one production hit."""
+
+    _PROD = {**entity("pkg/inventory.py::loadInventory", "loadInventory", "function", "pkg/inventory.py", 10, 20, "Loads."), "score": 0.5}
+    _TEST = {**entity("tests/helpers.py::makeInventory", "makeInventory", "function", "tests/helpers.py", 1, 5, "Builds fixtures."), "score": 0.9}
+
+    def _rows(self) -> list[dict[str, object]]:
+        return [dict(self._TEST), dict(self._PROD)]
+
+    def _chunk_rows(self) -> list[dict[str, object]]:
+        return [
+            {**row, "chunk_id": f"chunk:{i}", "chunk_kind": "function_body", "match_start_line": 1, "match_end_line": 2}
+            for i, row in enumerate(self._rows())
+        ]
+
+    async def search_code_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+        return self._chunk_rows()
+
+    async def search_summary_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+        return self._rows()
+
+    async def search_summary_text(self, project: str, query: str, top_k: int) -> list[dict[str, object]]:
+        return self._rows()
+
+    async def search_symbol_text(self, project: str, query: str, top_k: int) -> list[dict[str, object]]:
+        return []
+
+    async def search_code_text(self, project: str, query: str, top_k: int) -> list[dict[str, object]]:
+        return []
+
+
+_SEARCH_TOOLS = ["search_code", "search_semantic", "search_hybrid", "search_text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", _SEARCH_TOOLS)
+async def test_search_tools_flag_test_like_hits_and_nothing_else(tool_name: str, monkeypatch) -> None:
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), _MixedSearchRepository(), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": "/tmp/project", "query": "inventory"}))
+
+    flags = {item["entity"]["id"]: item.get("is_test") for item in payload["items"]}
+    assert flags == {"tests/helpers.py::makeInventory": True, "pkg/inventory.py::loadInventory": None}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", _SEARCH_TOOLS)
+async def test_search_tools_drop_test_hits_when_include_tests_is_false(tool_name: str, monkeypatch) -> None:
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), _MixedSearchRepository(), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(
+        tool_name,
+        {"directory": "/tmp/project", "query": "inventory", "include_tests": False},
+    ))
+
+    assert [item["entity"]["id"] for item in payload["items"]] == ["pkg/inventory.py::loadInventory"]
+    assert "is_test" not in str(payload)
+
+
+class _PagedMixedRepository(StoredChecksums):
+    """Four code hits, one of them a test file — enough to page across the exclusion."""
+
+    _ROWS = [
+        ("pkg/a.py::a", "pkg/a.py", 0.9),
+        ("tests/test_a.py::test_a", "tests/test_a.py", 0.8),
+        ("pkg/b.py::b", "pkg/b.py", 0.7),
+        ("pkg/c.py::c", "pkg/c.py", 0.6),
+    ]
+
+    async def search_code_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+        return [
+            {
+                **entity(node_id, node_id.split("::")[1], "function", file_path, 1, 2, "S."),
+                "score": score,
+                "chunk_id": f"chunk:{node_id}",
+                "chunk_kind": "function_body",
+                "match_start_line": 1,
+                "match_end_line": 2,
+            }
+            for node_id, file_path, score in self._ROWS
+        ]
+
+
+@pytest.mark.asyncio
+async def test_include_tests_false_excludes_before_pagination(monkeypatch) -> None:
+    """Exclusion happens on the candidate rows, so pages stay full and next_offset stays true."""
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), _PagedMixedRepository(), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    first = _payload(await mcp.call_tool(
+        "search_code",
+        {"directory": "/tmp/project", "query": "q", "include_tests": False, "limit": 2, "offset": 0},
+    ))
+    second = _payload(await mcp.call_tool(
+        "search_code",
+        {"directory": "/tmp/project", "query": "q", "include_tests": False, "limit": 2, "offset": 2},
+    ))
+
+    assert [item["entity"]["id"] for item in first["items"]] == ["pkg/a.py::a", "pkg/b.py::b"]
+    assert first["page"] == page_dict(2, 0, 2, True)
+    assert [item["entity"]["id"] for item in second["items"]] == ["pkg/c.py::c"]
+    assert second["page"] == page_dict(2, 2, None, False)
+
+
+@pytest.mark.asyncio
+async def test_include_tests_defaults_to_keeping_test_hits(monkeypatch) -> None:
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), _PagedMixedRepository(), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool("search_code", {"directory": "/tmp/project", "query": "q"}))
+
+    assert [item["entity"]["id"] for item in payload["items"]] == [
+        "pkg/a.py::a",
+        "tests/test_a.py::test_a",
+        "pkg/b.py::b",
+        "pkg/c.py::c",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_include_tests_false_can_starve_a_saturated_pool_and_says_so(monkeypatch) -> None:
+    """Dropping tests is a mandatory filter, so a full candidate pool it empties is truncated."""
+    mcp = FastMCP("test")
+
+    class _AllTestsRepo(StoredChecksums):
+        async def search_code_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+            return [
+                {
+                    **entity(f"tests/test_{i}.py::t", "t", "function", f"tests/test_{i}.py", 1, 2, "S."),
+                    "score": 0.5,
+                    "chunk_id": f"c{i}",
+                    "chunk_kind": "function_body",
+                    "match_start_line": 1,
+                    "match_end_line": 2,
+                }
+                for i in range(top_k)
+            ]
+
+    register_search_tools(mcp, FakeManager(), _AllTestsRepo(), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(
+        "search_code",
+        {"directory": "/tmp/project", "query": "q", "include_tests": False},
+    ))
+
+    assert payload["items"] == []
+    assert payload["page"]["truncated"] is True
+
+
+@pytest.mark.parametrize("tool_name", _SEARCH_TOOLS)
+def test_search_tools_document_the_test_flag_and_the_include_tests_switch(tool_name: str) -> None:
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), FakeSearchRepository(), Settings(_env_file=None))
+
+    description = mcp._tool_manager.get_tool(tool_name).description
+
+    assert "include_tests" in description
+    assert "is_test" in description
+
+
+# ---------------------------------------------------------------------------
+# Match lists: a document hit with a dozen chunk matches is mostly tokens.
+# ---------------------------------------------------------------------------
+
+
+def _chunk_row(index: int, score: float) -> dict[str, object]:
+    return {
+        **entity("docs/guide.md", "guide.md", "document", "docs/guide.md", 1, 400, "Guide."),
+        "score": score,
+        "chunk_id": f"chunk:{index}",
+        "chunk_kind": "document_section",
+        "match_start_line": index,
+        "match_end_line": index + 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_search_text_caps_matches_at_three_and_reports_the_total() -> None:
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    repo.code_rows = [_chunk_row(i, float(i)) for i in range(12)]
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/project", "query": "guide"}))
+
+    item = payload["items"][0]
+    assert [match["chunk_id"] for match in item["matches"]] == ["chunk:11", "chunk:10", "chunk:9"]
+    assert item["matches_total"] == 12
+
+
+@pytest.mark.asyncio
+async def test_search_text_keeps_a_short_match_list_whole_and_unannotated() -> None:
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    repo.code_rows = [_chunk_row(0, 1.0), _chunk_row(1, 2.0)]
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/project", "query": "guide"}))
+
+    item = payload["items"][0]
+    assert [match["chunk_id"] for match in item["matches"]] == ["chunk:0", "chunk:1"]
+    assert "matches_total" not in item
+
+
+@pytest.mark.asyncio
+async def test_search_hybrid_caps_matches_at_three_and_reports_the_total(monkeypatch) -> None:
+    mcp = FastMCP("test")
+
+    class _ManyChunkRepo(StoredChecksums):
+        async def search_code_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+            return [_chunk_row(i, float(i) / 100) for i in range(12)]
+
+        async def search_summary_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+            return []
+
+    register_search_tools(mcp, FakeManager(), _ManyChunkRepo(), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool("search_hybrid", {"directory": "/tmp/project", "query": "guide"}))
+
+    item = payload["items"][0]
+    assert [match["chunk_id"] for match in item["matches"]] == ["chunk:11", "chunk:10", "chunk:9"]
+    assert item["matches_total"] == 12

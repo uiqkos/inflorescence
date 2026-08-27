@@ -69,8 +69,9 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
             "index_directory(path, preview=true) to see the estimated dollar cost, then "
             "preview=false to build. A git worktree of an already-indexed checkout is the "
             "exception — the first read query indexes it inline, reusing the main "
-            "checkout's summaries and embeddings by content hash, so it needs no explicit "
-            "index_directory call and costs almost nothing. Indexing persists "
+            "checkout's summaries and embeddings by content hash (the graph is copied "
+            "inside the database, so this is quick as well as nearly free), which means it "
+            "needs no explicit index_directory call. Indexing persists "
             "incrementally — entities are name-searchable right after parsing, summaries "
             "stream in batch by batch, and an interrupted run resumes with no repeated LLM "
             "spend. Costs real money (LLM summarization): never index a new project "
@@ -86,7 +87,12 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
             "about age: every response carrying entities re-hashes their files and reports "
             "meta.index_freshness, flagging an item whose file changed after indexing "
             "(\"stale\": true) or is gone from disk (\"file_missing\": true), so an "
-            "unflagged item was checked and still matches the index."
+            "unflagged item was checked and still matches the index. That block also "
+            "reports live_worktrees: a checkout with live git worktrees has branch state "
+            "that is not in its index at all, however fresh the index looks — ask the "
+            "worktree directly by passing its path as directory. Search hits from "
+            "test-like paths are marked \"is_test\": true (a path heuristic) and can be "
+            "dropped with include_tests=false."
         ),
     )
 

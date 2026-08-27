@@ -13,7 +13,7 @@ from inflorescence.project_manager import ProjectManager
 from inflorescence.rag.embeddings import EmbeddingClient
 from inflorescence.tools.freshness import build_checker, unchecked_empty_page
 from inflorescence.tools.gates import ensure_indexed, normalize_node_types
-from inflorescence.tools.path_filters import PathFilterConfig, filter_records_by_path
+from inflorescence.tools.path_filters import PathFilterConfig, filter_records_by_path, is_test_path
 from inflorescence.tools.responses import (
     MAX_SEARCH_LIMIT,
     clamp_limit,
@@ -30,14 +30,15 @@ def _overfetch(limit: int, offset: int) -> int:
     return max(100, min((offset + limit + 1) * 5, 500))
 
 
-def _filters_narrow(filters: PathFilterConfig, node_types: list[str] | None) -> bool:
-    """True when a mandatory filter (path include/exclude or node_type) can shrink results.
+def _filters_narrow(filters: PathFilterConfig, node_types: list[str] | None, include_tests: bool = True) -> bool:
+    """True when a mandatory filter (path, node_type, or tests) can shrink results.
 
     Memgraph's vector/text search returns a bounded, similarity-ranked candidate pool;
-    path/node_type filters run *after* that cut. When such a filter is active the pool may
-    have dropped matching entities below the ceiling, so an empty/short result is ambiguous.
+    path/node_type/test filters run *after* that cut. When such a filter is active the pool
+    may have dropped matching entities below the ceiling, so an empty/short result is
+    ambiguous — and must be reported as truncated rather than as "nothing matches".
     """
-    return bool(node_types) or not filters.include_all or bool(filters.exclude)
+    return bool(node_types) or not include_tests or not filters.include_all or bool(filters.exclude)
 
 
 # Tantivy query-syntax metacharacters. `search_text` accepts plain
@@ -52,6 +53,42 @@ def _sanitize_text_query(query: str) -> str:
     return " ".join(_TANTIVY_SPECIAL_CHARS.sub(" ", query).split())
 
 
+# A document or a long function can match on a dozen chunks; past the first few the list
+# is repetition, not evidence. Keep the best few and say how many there were.
+MAX_HIT_MATCHES = 3
+
+
+def _new_hit(row: dict[str, object], score: float, source_type: str) -> dict[str, object]:
+    """Build one hit, flagging it when its *path* says test code (heuristic, see is_test_path)."""
+    hit: dict[str, object] = {"entity": entity_ref(row), "score": score, "source_type": source_type, "matches": []}
+    if is_test_path(str(row.get("file_path") or "")):
+        hit["is_test"] = True
+    return hit
+
+
+def _drop_test_rows(rows: list[dict[str, object]], include_tests: bool) -> list[dict[str, object]]:
+    """Remove test-like rows *before* hits are built, so pagination pages the kept set."""
+    if include_tests:
+        return rows
+    return [row for row in rows if not is_test_path(str(row.get("file_path") or ""))]
+
+
+def _cap_matches(hits: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Trim every hit's match list to the best MAX_HIT_MATCHES, recording the true count.
+
+    ``matches_total`` appears only where the trim actually happened — its presence *is* the
+    statement "there were more", so an absent field means the list is complete.
+    """
+    for hit in hits:
+        matches = hit["matches"]
+        if len(matches) <= MAX_HIT_MATCHES:
+            continue
+        ordered = sorted(matches, key=lambda match: float(match.get("score") or 0), reverse=True)
+        hit["matches"] = ordered[:MAX_HIT_MATCHES]
+        hit["matches_total"] = len(matches)
+    return hits
+
+
 def _code_hits(rows: list[dict[str, object]], min_score: float) -> list[dict[str, object]]:
     grouped: dict[str, dict[str, object]] = {}
     for row in rows:
@@ -59,10 +96,7 @@ def _code_hits(rows: list[dict[str, object]], min_score: float) -> list[dict[str
         if score < min_score:
             continue
         node_id = str(row["id"])
-        hit = grouped.setdefault(
-            node_id,
-            {"entity": entity_ref(row), "score": score, "source_type": "code", "matches": []},
-        )
+        hit = grouped.setdefault(node_id, _new_hit(row, score, "code"))
         hit["score"] = max(float(hit["score"]), score)
         hit["matches"].append({
             "chunk_id": row.get("chunk_id"),
@@ -79,7 +113,7 @@ def _summary_hits(rows: list[dict[str, object]], min_score: float) -> list[dict[
     for row in rows:
         score = float(row.get("score", 0) or 0)
         if score >= min_score:
-            hits.append({"entity": entity_ref(row), "score": score, "source_type": "summary", "matches": []})
+            hits.append(_new_hit(row, score, "summary"))
     return sorted(hits, key=lambda hit: float(hit["score"]), reverse=True)
 
 
@@ -88,7 +122,7 @@ def _text_hits(rows: list[dict[str, object]], min_score: float, source_type: str
     for row in rows:
         score = float(row.get("score", 0) or 0)
         if score >= min_score:
-            hits.append({"entity": entity_ref(row), "score": score, "source_type": source_type, "matches": []})
+            hits.append(_new_hit(row, score, source_type))
     return hits
 
 
@@ -166,6 +200,7 @@ def register_search_tools(
         node_types: list[str] | None = None,
         include_paths: list[str] | None = None,
         exclude_paths: list[str] | None = None,
+        include_tests: bool = True,
         min_score: float = 0.0,
         limit: int = 10,
         offset: int = 0,
@@ -186,11 +221,23 @@ def register_search_tools(
         (parsing and graph writes only — summaries and embeddings are reused from the
         main checkout, so no LLM spend), and every later call is normal speed.
 
+        ``include_paths``/``exclude_paths`` are globs; a pattern with no glob character
+        (``"docs/"``, ``"docs"``) covers both that exact path and everything under it, and
+        ``meta.path_filters`` echoes the expanded form that was actually applied.
+
+        A hit whose *path* looks like test code (``tests/``, ``spec/``, ``test_*.py``,
+        ``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``"is_test": true``. That
+        is a heuristic over the path only — it never reads the file — so treat it as a hint,
+        not a verdict. ``include_tests=false`` drops those hits before pagination.
+
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
         file-level: "stale" means the file changed after indexing (lines may have shifted,
         the summary may describe older code), not that this entity changed.
+        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
+        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
+        query indexes it almost for free (no LLM spend).
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -209,8 +256,8 @@ def register_search_tools(
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
         candidate_k = _overfetch(bounded_limit, bounded_offset)
         raw_rows = await repo.search_code_vectors(project, embedding, candidate_k)
-        truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types)
-        rows = _filter_node_types(filter_records_by_path(raw_rows, filters), node_types)
+        truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types, include_tests)
+        rows = _drop_test_rows(_filter_node_types(filter_records_by_path(raw_rows, filters), node_types), include_tests)
         checker = await build_checker(repo, project, directory)
         return checker.stamp(_page_hits(
             _code_hits(rows, min_score),
@@ -233,6 +280,7 @@ def register_search_tools(
         node_types: list[str] | None = None,
         include_paths: list[str] | None = None,
         exclude_paths: list[str] | None = None,
+        include_tests: bool = True,
         min_score: float = 0.0,
         limit: int = 10,
         offset: int = 0,
@@ -255,11 +303,23 @@ def register_search_tools(
         (parsing and graph writes only — summaries and embeddings are reused from the
         main checkout, so no LLM spend), and every later call is normal speed.
 
+        ``include_paths``/``exclude_paths`` are globs; a pattern with no glob character
+        (``"docs/"``, ``"docs"``) covers both that exact path and everything under it, and
+        ``meta.path_filters`` echoes the expanded form that was actually applied.
+
+        A hit whose *path* looks like test code (``tests/``, ``spec/``, ``test_*.py``,
+        ``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``"is_test": true``. That
+        is a heuristic over the path only — it never reads the file — so treat it as a hint,
+        not a verdict. ``include_tests=false`` drops those hits before pagination.
+
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
         file-level: "stale" means the file changed after indexing (lines may have shifted,
         the summary may describe older code), not that this entity changed.
+        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
+        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
+        query indexes it almost for free (no LLM spend).
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -278,8 +338,8 @@ def register_search_tools(
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
         candidate_k = _overfetch(bounded_limit, bounded_offset)
         raw_rows = await repo.search_summary_vectors(project, embedding, candidate_k)
-        truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types)
-        rows = _filter_node_types(filter_records_by_path(raw_rows, filters), node_types)
+        truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types, include_tests)
+        rows = _drop_test_rows(_filter_node_types(filter_records_by_path(raw_rows, filters), node_types), include_tests)
         checker = await build_checker(repo, project, directory)
         return checker.stamp(_page_hits(
             _summary_hits(rows, min_score),
@@ -302,6 +362,7 @@ def register_search_tools(
         node_types: list[str] | None = None,
         include_paths: list[str] | None = None,
         exclude_paths: list[str] | None = None,
+        include_tests: bool = True,
         min_score: float = 0.0,
         limit: int = 10,
         offset: int = 0,
@@ -317,16 +378,31 @@ def register_search_tools(
         While an index run is in progress, coverage is partial: summary vectors exist only
         for already-summarized nodes, and code-chunk vectors land in the run's final phase.
 
+        A hit lists at most 3 chunk ``matches`` — the highest-scoring ones. ``matches_total``
+        gives the real count and is present only when the list was trimmed.
+
         A first query against a git worktree of an indexed checkout that is not indexed
         yet indexes it inline before answering: that one call is noticeably slower
         (parsing and graph writes only — summaries and embeddings are reused from the
         main checkout, so no LLM spend), and every later call is normal speed.
+
+        ``include_paths``/``exclude_paths`` are globs; a pattern with no glob character
+        (``"docs/"``, ``"docs"``) covers both that exact path and everything under it, and
+        ``meta.path_filters`` echoes the expanded form that was actually applied.
+
+        A hit whose *path* looks like test code (``tests/``, ``spec/``, ``test_*.py``,
+        ``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``"is_test": true``. That
+        is a heuristic over the path only — it never reads the file — so treat it as a hint,
+        not a verdict. ``include_tests=false`` drops those hits before pagination.
 
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
         file-level: "stale" means the file changed after indexing (lines may have shifted,
         the summary may describe older code), not that this entity changed.
+        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
+        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
+        query indexes it almost for free (no LLM spend).
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -351,10 +427,12 @@ def register_search_tools(
         raw_summary = await repo.search_summary_vectors(project, summary_embedding, top_k)
         truncated = (
             (len(raw_code) >= top_k or len(raw_summary) >= top_k)
-            and _filters_narrow(filters, node_types)
+            and _filters_narrow(filters, node_types, include_tests)
         )
-        code_rows = _filter_node_types(filter_records_by_path(raw_code, filters), node_types)
-        summary_rows = _filter_node_types(filter_records_by_path(raw_summary, filters), node_types)
+        code_rows = _drop_test_rows(_filter_node_types(filter_records_by_path(raw_code, filters), node_types), include_tests)
+        summary_rows = _drop_test_rows(
+            _filter_node_types(filter_records_by_path(raw_summary, filters), node_types), include_tests
+        )
 
         merged: dict[str, dict[str, object]] = {}
         for hit in [*_code_hits(code_rows, min_score), *_summary_hits(summary_rows, min_score)]:
@@ -375,7 +453,7 @@ def register_search_tools(
                 hit["source_type"] = "hybrid"
         checker = await build_checker(repo, project, directory)
         return checker.stamp(_page_hits(
-            hits,
+            _cap_matches(hits),
             bounded_limit,
             bounded_offset,
             {
@@ -395,6 +473,7 @@ def register_search_tools(
         node_types: list[str] | None = None,
         include_paths: list[str] | None = None,
         exclude_paths: list[str] | None = None,
+        include_tests: bool = True,
         min_score: float = 0.0,
         limit: int = 10,
         offset: int = 0,
@@ -408,7 +487,10 @@ def register_search_tools(
         (``:``, ``[]``, ``+``, ``-``, ``*``, …) are treated as separators, so terms like
         ``ValueError: invalid literal`` or ``arr[0]`` match as plain keywords. Hits on raw code
         chunks are aggregated up to their owning entity, then deduplicated across fields. Returns
-        compact entity refs with pagination — never source code or embeddings.
+        compact entity refs with pagination — never source code or embeddings. A hit lists at most
+        3 ``matches`` (the highest-scoring ones); ``matches_total`` gives the real count and is
+        present only when the list was trimmed — a long document matches on many chunks and the
+        tail of that list is repetition, not evidence.
 
         While an index run is in progress, summary and raw-code fields cover only what has
         already landed; name/signature hits are complete as soon as the skeleton is stored.
@@ -418,11 +500,23 @@ def register_search_tools(
         (parsing and graph writes only — summaries and embeddings are reused from the
         main checkout, so no LLM spend), and every later call is normal speed.
 
+        ``include_paths``/``exclude_paths`` are globs; a pattern with no glob character
+        (``"docs/"``, ``"docs"``) covers both that exact path and everything under it, and
+        ``meta.path_filters`` echoes the expanded form that was actually applied.
+
+        A hit whose *path* looks like test code (``tests/``, ``spec/``, ``test_*.py``,
+        ``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``"is_test": true``. That
+        is a heuristic over the path only — it never reads the file — so treat it as a hint,
+        not a verdict. ``include_tests=false`` drops those hits before pagination.
+
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
         file-level: "stale" means the file changed after indexing (lines may have shifted,
         the summary may describe older code), not that this entity changed.
+        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
+        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
+        query indexes it almost for free (no LLM spend).
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -447,7 +541,7 @@ def register_search_tools(
         if not text_query:
             # Nothing to search, so nothing to hash — but the block still ships, since a
             # caller may only read the item flags as "fresh" if it is always present.
-            meta["index_freshness"] = unchecked_empty_page()
+            meta["index_freshness"] = unchecked_empty_page(directory)
             return _page_hits([], bounded_limit, bounded_offset, meta)
         try:
             summary_rows = await repo.search_summary_text(project, text_query, top_k)
@@ -466,15 +560,15 @@ def register_search_tools(
 
         truncated = (
             max(len(summary_rows), len(symbol_rows), len(code_rows)) >= top_k
-            and _filters_narrow(filters, node_types)
+            and _filters_narrow(filters, node_types, include_tests)
         )
-        summary_rows = _filter_node_types(filter_records_by_path(summary_rows, filters), node_types)
-        symbol_rows = _filter_node_types(filter_records_by_path(symbol_rows, filters), node_types)
-        code_rows = _filter_node_types(filter_records_by_path(code_rows, filters), node_types)
+        summary_rows = _drop_test_rows(_filter_node_types(filter_records_by_path(summary_rows, filters), node_types), include_tests)
+        symbol_rows = _drop_test_rows(_filter_node_types(filter_records_by_path(symbol_rows, filters), node_types), include_tests)
+        code_rows = _drop_test_rows(_filter_node_types(filter_records_by_path(code_rows, filters), node_types), include_tests)
 
         checker = await build_checker(repo, project, directory)
         return checker.stamp(_page_hits(
-            _merge_text_hits(summary_rows, symbol_rows, code_rows, min_score),
+            _cap_matches(_merge_text_hits(summary_rows, symbol_rows, code_rows, min_score)),
             bounded_limit,
             bounded_offset,
             meta,

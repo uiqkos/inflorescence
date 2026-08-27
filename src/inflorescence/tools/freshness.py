@@ -25,17 +25,32 @@ This is a **file-level** check, not a node-level one. "stale" means the file cha
 line numbers may have shifted and the summary may describe older code — not that this
 particular function or class is what changed.
 
+The block carries one more honesty signal, ``live_worktrees``. Every file of the main
+checkout can hash fresh while a branch checked out in one of its git worktrees holds a
+completely different version of that code: the worktree is a *separate project*, indexed
+separately, and nothing in this index knows about it. A clean freshness block would then
+read as "you are seeing everything" to a reviewer asking the main checkout about work that
+lives on a branch. So a query against a main checkout that has live worktrees says how
+many — the answer is elsewhere, and one query with ``directory`` set to the worktree gets
+it (indexing a worktree is near-free, seeded from this very index). Present only when the
+queried directory is *not* itself a worktree and the count is non-zero.
+
 Cost: one MD5 per *distinct* path on the page (memoized here), so a 50-item page of one
-module reads one file. Nothing outside the page is scanned.
+module reads one file. Nothing outside the page is scanned. The worktree count adds one
+directory listing of ``.git/worktrees`` per tool call.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
 from inflorescence.code_indexer.models import FileChecksum
+from inflorescence.worktree import registered_worktree_paths, worktree_main_root
+
+logger = logging.getLogger(__name__)
 
 FRESH = "fresh"
 STALE = "stale"
@@ -47,6 +62,23 @@ UNKNOWN = "unknown"
 _ITEM_FLAG = {STALE: "stale", MISSING: "file_missing"}
 
 
+def count_live_worktrees(root: Path) -> int:
+    """How many linked worktrees of *root*'s checkout currently exist on disk.
+
+    Zero when *root* is itself a worktree (its own answer *is* the branch state, so there
+    is nothing to warn about) and zero outside git entirely. Registration outlives the
+    directory — git drops an entry only on ``git worktree prune`` — so deleted checkouts
+    are counted out: a path nobody can query is not a gap in the answer.
+    """
+    try:
+        if worktree_main_root(root) is not None:
+            return 0
+        return sum(1 for path in registered_worktree_paths(root) if path.exists())
+    except OSError:  # an unreadable .git layout is not worth failing a search over
+        logger.debug("Could not count worktrees under %s", root, exc_info=True)
+        return 0
+
+
 class FreshnessChecker:
     """Re-hashes the files behind one page of entity refs and annotates them.
 
@@ -54,9 +86,10 @@ class FreshnessChecker:
     the whole project — then asked about whatever paths that call happens to return.
     """
 
-    def __init__(self, root: Path, stored: Mapping[str, str]) -> None:
+    def __init__(self, root: Path, stored: Mapping[str, str], live_worktrees: int = 0) -> None:
         self._root = root
         self._stored = dict(stored)
+        self._live_worktrees = live_worktrees
         # path -> status; doubles as the "already read this file" memo and as the record
         # of which paths this page actually touched (`checked` counts its keys).
         self._statuses: dict[str, str] = {}
@@ -127,17 +160,22 @@ class FreshnessChecker:
         """Return the ``index_freshness`` block for everything checked so far.
 
         ``checked`` counts *distinct files*, not entities: the page's unique paths.
+        ``live_worktrees`` appears only when there are any — an absent field costs no
+        tokens and says the same thing a zero would.
         """
         buckets: dict[str, list[str]] = {STALE: [], MISSING: [], UNKNOWN: []}
         for file_path, status in self._statuses.items():
             if status in buckets:
                 buckets[status].append(file_path)
-        return {
+        block: dict[str, Any] = {
             "checked": len(self._statuses),
             "stale": sorted(buckets[STALE]),
             "missing": sorted(buckets[MISSING]),
             "unknown": sorted(buckets[UNKNOWN]),
         }
+        if self._live_worktrees:
+            block["live_worktrees"] = self._live_worktrees
+        return block
 
     def stamp(self, payload: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
         """Annotate ``payload["items"]`` (if any) and write ``meta.index_freshness``.
@@ -152,14 +190,19 @@ class FreshnessChecker:
         return payload
 
 
-def unchecked_empty_page() -> dict[str, Any]:
+def unchecked_empty_page(directory: str | None = None) -> dict[str, Any]:
     """The ``index_freshness`` block for a response that returns no entities at all.
 
     A degenerate page still carries the block — the "unflagged means fresh" convention
     only reads if it is unconditional — and says plainly that it checked nothing. Built
-    from an empty checker so its shape cannot drift from the real one.
+    from an empty checker so its shape cannot drift from the real one. Pass *directory*
+    to keep the ``live_worktrees`` warning on this page too: an empty answer is exactly
+    where "the branch state is elsewhere" is most worth saying.
     """
-    return FreshnessChecker(Path(), {}).meta()
+    if directory is None:
+        return FreshnessChecker(Path(), {}).meta()
+    root = Path(directory).resolve()
+    return FreshnessChecker(root, {}, live_worktrees=count_live_worktrees(root)).meta()
 
 
 async def build_checker(repo: Any, project: str, directory: str) -> FreshnessChecker:
@@ -169,4 +212,5 @@ async def build_checker(repo: Any, project: str, directory: str) -> FreshnessChe
     and reuse it for every ref they return.
     """
     stored = await repo.get_checksums(project)
-    return FreshnessChecker(Path(directory).resolve(), stored)
+    root = Path(directory).resolve()
+    return FreshnessChecker(root, stored, live_worktrees=count_live_worktrees(root))

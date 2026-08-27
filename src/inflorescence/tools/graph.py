@@ -114,12 +114,17 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         ``node_types`` values (case-insensitive): module, class, function, method,
         directory, interface, enum, struct, trait, document. Summaries are truncated to a
         short preview; use ``get_entity_context`` for the full summary of one entity.
+        A path pattern with no glob character (``"docs/"``, ``"docs"``) covers both that
+        exact path and everything under it; ``meta.path_filters`` echoes the expanded form.
 
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected items carry ``"stale": true`` / ``"file_missing": true`` —
         so an unflagged item was checked and still matches the index. This is file-level:
         "stale" means the file changed after indexing (lines may have shifted, the summary
         may describe older code), not that this particular entity changed.
+        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
+        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
+        query indexes it almost for free (no LLM spend).
         """
         node_types = normalize_node_types(node_types)
         if isinstance(node_types, dict):
@@ -174,6 +179,9 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         ``"file_missing": true`` — so an unflagged item was checked and still matches the
         index. This is file-level: "stale" means the file changed after indexing (lines may
         have shifted, the summary may describe older code), not that this entity changed.
+        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
+        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
+        query indexes it almost for free (no LLM spend).
         """
         node_types = normalize_node_types(node_types)
         if isinstance(node_types, dict):
@@ -244,7 +252,9 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         ``"stale": true`` / ``"file_missing": true``, so an unflagged one was checked and
         still matches the index. This is file-level: "stale" means the file changed after
         indexing (lines may have shifted, the summary may describe older code), not that
-        this entity changed.
+        this entity changed. ``index_freshness.live_worktrees`` > 0 means the state of those
+        worktrees' branches is NOT in this index — ask with ``directory`` set to the
+        worktree itself; that first query indexes it almost for free (no LLM spend).
         """
         project, not_indexed = await ensure_indexed(manager, directory)
         if not_indexed is not None:
@@ -303,13 +313,18 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         an ``invalid_direction`` error instead of an empty result.
 
         Summaries are truncated to a short preview; use ``get_entity_context``
-        for the full summary of a specific entity.
+        for the full summary of a specific entity. A path pattern with no glob character
+        (``"docs/"``, ``"docs"``) covers both that exact path and everything under it;
+        ``meta.path_filters`` echoes the expanded form.
 
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected entities carry ``"stale": true`` / ``"file_missing": true``
         — so an unflagged one was checked and still matches the index. This is file-level:
         "stale" means the file changed after indexing (lines may have shifted, the summary
         may describe older code), not that this entity changed.
+        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
+        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
+        query indexes it almost for free (no LLM spend).
         """
         normalized_direction = _normalize_direction(direction)
         if isinstance(normalized_direction, dict):
@@ -376,13 +391,18 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         literal, an error message, or any text in the code use ``search_text``; to find code
         by what it does use ``search_semantic``. ``node_types`` values (case-insensitive):
         module, class, function, method, directory, interface, enum, struct, trait,
-        document.
+        document. A path pattern with no glob character (``"docs/"``, ``"docs"``) covers
+        both that exact path and everything under it; ``meta.path_filters`` echoes the
+        expanded form.
 
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected items carry ``"stale": true`` / ``"file_missing": true`` —
         so an unflagged item was checked and still matches the index. This is file-level:
         "stale" means the file changed after indexing (lines may have shifted, the summary
         may describe older code), not that this particular entity changed.
+        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
+        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
+        query indexes it almost for free (no LLM spend).
         """
         node_types = normalize_node_types(node_types)
         if isinstance(node_types, dict):
