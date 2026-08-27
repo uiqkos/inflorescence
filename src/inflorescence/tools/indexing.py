@@ -36,10 +36,13 @@ def register_indexing_tools(mcp: FastMCP, manager: ProjectManager, watcher: File
         hash at zero additional LLM cost. While a run is in progress, summary-based and
         chunk-based search cover only what has already landed (see the search tools' notes).
 
-        GIT WORKTREES ARE NEARLY FREE, AND USUALLY NEED NO CALL AT ALL. The first index of a
-        worktree whose main checkout is already indexed reuses that checkout's summaries and
-        embeddings by content hash, so LLM spend is ~$0 — only files that differ from the
-        donor are paid for. You normally never call this for a worktree: the read tools
+        GIT WORKTREES ARE NEARLY FREE AND FAST, AND USUALLY NEED NO CALL AT ALL. The first
+        index of a worktree whose main checkout is already indexed reuses that checkout's
+        summaries and embeddings by content hash, so LLM spend is ~$0 — only files that differ
+        from the donor are paid for. The reuse happens as a copy *inside the database*, so it
+        also finishes in a fraction of the time a normal first index takes; the response
+        reports ``worktree_of`` and ``cloned`` (the copied node/chunk/edge counts). You
+        normally never call this for a worktree: the read tools
         (search_*, list/get_*, cypher_query) index it themselves on the first query.
         preview=true on such a worktree reports ``worktree_of`` (the donor project) plus
         ``donor_covered_files`` / ``uncovered_files``, and prices only the uncovered files,

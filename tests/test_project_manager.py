@@ -411,16 +411,35 @@ async def test_update_project_serializes_concurrent_updates(tmp_path: Path) -> N
 # zero LLM calls, zero embeddings — and must not be blocked by a cost cap for spend that
 # will never happen. These tests pin the plumbing: which cache went where, what was
 # written back, and what the gate priced.
+#
+# The reuse itself is normally done by copying the donor's graph inside Memgraph (see the
+# clone tests further down). The tests here pin the **client-side** path it falls back to,
+# so they switch the clone off explicitly — it is the path a clone failure lands on, and it
+# has to keep working exactly as it did.
 # ---------------------------------------------------------------------------
+
+
+def _client_seeding() -> Settings:
+    """Settings that force the pre-clone, client-side donor seeding path."""
+    return Settings(_env_file=None, worktree_clone=False)
 
 
 class _SummaryNode:
     """Minimal stand-in for a CodeNode as the seeded-summary write-back sees it."""
 
-    def __init__(self, node_id: str, summary: str = "", summary_input_hash: str = "") -> None:
+    def __init__(
+        self,
+        node_id: str,
+        summary: str = "",
+        summary_input_hash: str = "",
+        file_path: str | None = None,
+    ) -> None:
         self.id = node_id
         self.summary = summary
         self.summary_input_hash = summary_input_hash
+        # The clone path scopes its paid phases by file, so these stand-ins carry one.
+        # Defaults to the id, which is what a module node's id already is.
+        self.file_path = node_id if file_path is None else file_path
 
 
 def _worktree_dirs(tmp_path: Path) -> tuple[Path, Path]:
@@ -454,7 +473,7 @@ async def test_first_index_of_a_worktree_seeds_caches_from_the_indexed_main_chec
     repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
     builder = FakeGraphBuilder(build_result=([_SummaryNode("a.py", "s", "h1")], []))
     rag = FakeRAGIndexer(code_count=1, summary_count=1)
-    manager = _worktree_manager(repo, builder, rag, main)
+    manager = _worktree_manager(repo, builder, rag, main, settings=_client_seeding())
 
     donor = manager.get_project(str(main))
     donor_summaries = {
@@ -497,7 +516,7 @@ async def test_worktree_seeding_writes_reused_summaries_into_the_new_project(tmp
     builder = FakeGraphBuilder(build_result=(nodes, []))
     builder.build_dirty_ids = {"b.py"}
     rag = FakeRAGIndexer()
-    manager = _worktree_manager(repo, builder, rag, main)
+    manager = _worktree_manager(repo, builder, rag, main, settings=_client_seeding())
 
     donor = manager.get_project(str(main))
     repo.indexed_projects.add(donor)
@@ -524,7 +543,7 @@ async def test_worktree_cost_gate_prices_nothing_when_the_donor_covers_every_fil
     builder = FakeGraphBuilder()
     builder.scan_checksums_result = {"a.py": "m1", "pkg/b.py": "m2"}
     rag = FakeRAGIndexer()
-    manager = _worktree_manager(repo, builder, rag, main)
+    manager = _worktree_manager(repo, builder, rag, main, settings=_client_seeding())
 
     donor = manager.get_project(str(main))
     repo.indexed_projects.add(donor)
@@ -548,7 +567,7 @@ async def test_worktree_cost_gate_prices_exactly_the_files_the_donor_lacks(tmp_p
     builder = FakeGraphBuilder()
     builder.scan_checksums_result = {"same.py": "m1", "edited.py": "NEW", "added.py": "m9"}
     rag = FakeRAGIndexer()
-    manager = _worktree_manager(repo, builder, rag, main)
+    manager = _worktree_manager(repo, builder, rag, main, settings=_client_seeding())
 
     donor = manager.get_project(str(main))
     repo.indexed_projects.add(donor)
@@ -679,7 +698,7 @@ async def test_donor_summary_with_a_failed_embedding_is_passed_through_untouched
         build_result=([_SummaryNode("ok.py", "s", "h1"), _SummaryNode("broken.py", "s2", "h2")], [])
     )
     rag = FakeRAGIndexer(summary_count=2)
-    manager = _worktree_manager(repo, builder, rag, main)
+    manager = _worktree_manager(repo, builder, rag, main, settings=_client_seeding())
     donor = manager.get_project(str(main))
     repo.indexed_projects.add(donor)
     repo.stored_summaries[donor] = donor_summaries
@@ -693,6 +712,281 @@ async def test_donor_summary_with_a_failed_embedding_is_passed_through_untouched
     # concern, not a summary one.
     assert {row["node_id"] for _, rows in repo.summaries_written for row in rows} == {"ok.py", "broken.py"}
     assert repo.summaries_written[0][0] == project
+
+
+# ---------------------------------------------------------------------------
+# Server-side clone: the same free first index, done inside the database. These pin the
+# decision (when it runs at all), the order (copy -> identity -> incremental update), the
+# scoping of the paid phases, and the two ways it must degrade — a clone that fails, and a
+# clone that never finished because the process died mid-copy.
+# ---------------------------------------------------------------------------
+
+
+def _cloning_world(
+    tmp_path: Path,
+    *,
+    nodes: list[_SummaryNode] | None = None,
+    worktree_files: dict[str, str] | None = None,
+    donor_files: dict[str, str] | None = None,
+    settings: Settings | None = None,
+) -> tuple[ProjectManager, FakeProjectRepository, FakeGraphBuilder, FakeRAGIndexer, Path, Path]:
+    """A first index of a worktree whose donor is indexed, with the clone path available."""
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder(update_result=(list(nodes or []), []))
+    builder.call_log = repo.call_log
+    builder.scan_checksums_result = dict(worktree_files or {"same.py": "m1"})
+    rag = FakeRAGIndexer(code_count=2, summary_count=3)
+    manager = _worktree_manager(repo, builder, rag, main, settings=settings)
+
+    donor = manager.get_project(str(main))
+    repo.indexed_projects.add(donor)
+    # The donor's stored checksums are the whole diff mechanism: whatever this tree hashes
+    # to that the donor does not already hold is what the branch changed.
+    repo.checksums[donor] = dict(donor_files or {"same.py": "m1"})
+    return manager, repo, builder, rag, main, worktree
+
+
+@pytest.mark.asyncio
+async def test_first_index_of_a_worktree_clones_the_donor_graph_inside_the_database(
+    tmp_path: Path,
+) -> None:
+    """The default first index of a worktree is a server-side copy, not a client-side rebuild."""
+    manager, repo, builder, rag, main, worktree = _cloning_world(tmp_path)
+    donor = manager.get_project(str(main))
+    project = manager.get_project(str(worktree))
+
+    result = await manager.index_directory(str(worktree))
+
+    assert repo.clone_calls == [(donor, project)]
+    assert builder.builds == 0, "the tree was re-parsed from scratch despite the clone"
+    # Nothing was pulled through the client: no whole-project summary dump, no whole-project
+    # vector dump, and no summary write-back — the values never left the database.
+    assert repo.summary_requests == []
+    assert repo.chunk_embedding_requests == []
+    assert repo.summaries_written == []
+    assert result["worktree_of"] == donor
+    assert result["cloned"] == repo.clone_counts
+    assert "seeded_summaries" not in result, (
+        "the clone path must not claim summaries were seeded through the client"
+    )
+    assert repo.worktree_meta == [(project, donor, str(main.resolve()))]
+    assert repo.root_paths == [(project, str(worktree.resolve()))]
+
+
+@pytest.mark.asyncio
+async def test_cloned_worktree_copies_first_then_stamps_identity_then_updates(
+    tmp_path: Path,
+) -> None:
+    """Order is the atomicity contract: the copy carries the donor's identity, so this
+    project's own root path and worktree marker may only be stamped once the copy is
+    verified — and the incremental update must run against a project that already has them."""
+    manager, repo, builder, _rag, _main, worktree = _cloning_world(
+        tmp_path,
+        nodes=[_SummaryNode("edited.py", "s", "h")],
+        worktree_files={"same.py": "m1", "edited.py": "NEW"},
+        donor_files={"same.py": "m1", "edited.py": "OLD"},
+    )
+
+    await manager.index_directory(str(worktree))
+
+    assert repo.call_log == [
+        "clone_project",
+        "set_project_root_path",
+        "set_project_worktree_meta",
+        "set_project_scope",
+        "update",
+    ]
+    assert builder.updates == 1
+
+
+@pytest.mark.asyncio
+async def test_cloned_worktree_identical_to_the_donor_does_not_even_update(tmp_path: Path) -> None:
+    """A worktree whose files all match the donor's checksums has nothing left to do: the
+    copy *is* the index. Running the incremental path anyway would re-scan the tree and
+    re-dump the project's summaries for a guaranteed no-op."""
+    manager, repo, builder, rag, main, worktree = _cloning_world(
+        tmp_path,
+        worktree_files={"same.py": "m1", "also.py": "m2"},
+        donor_files={"same.py": "m1", "also.py": "m2"},
+    )
+
+    result = await manager.index_directory(str(worktree))
+
+    assert builder.updates == 0 and builder.builds == 0
+    assert rag.code_indexes == 0 and rag.summary_indexes == 0
+    assert result["changed_files"] == 0
+    assert result["worktree_of"] == manager.get_project(str(main))
+    assert result["reused"] is False, "the index was created by this run, not reused"
+
+
+@pytest.mark.asyncio
+async def test_cloned_worktree_pays_only_for_the_files_that_differ(tmp_path: Path) -> None:
+    """The clone left every other file's chunks and summary vectors already correct in the
+    database. Re-writing them would mean a vector-index update per chunk — the exact cost
+    the clone exists to avoid — so both paid phases are scoped to the differing files."""
+    nodes = [
+        _SummaryNode("edited.py", "new summary", "h-new"),
+        _SummaryNode("same.py", "old summary", "h-old"),
+        _SummaryNode("dir:.", "container", "h-dir", file_path=""),
+    ]
+    manager, repo, builder, rag, _main, worktree = _cloning_world(
+        tmp_path,
+        nodes=nodes,
+        worktree_files={"same.py": "m1", "edited.py": "NEW", "added.py": "m9"},
+        donor_files={"same.py": "m1", "edited.py": "OLD", "gone.py": "m3"},
+    )
+    builder.update_reconcilable = {"same.py", "edited.py", "added.py", "gone.py"}
+    builder.update_dirty_ids = {"edited.py", "dir:."}
+    project = manager.get_project(str(worktree))
+
+    result = await manager.index_directory(str(worktree))
+
+    # Changed content, a file the branch added, and a file it deleted — nothing else.
+    assert result["changed_files"] == 3
+    assert repo.scoped_chunk_embedding_requests == [(project, ["added.py", "edited.py", "gone.py"])]
+    assert repo.chunk_embedding_requests == [], "the whole project's vectors were unloaded"
+    # Chunks: only nodes of the differing files. Pruning is scoped the same way, and only
+    # to files the build actually reconciled.
+    assert [n.id for n in rag.code_nodes[0]] == ["edited.py"]
+    assert rag.code_reconcilable == [{"edited.py", "added.py", "gone.py"}]
+    # Summaries: the differing files plus whatever this run regenerated (a container's
+    # summary moves when a child's does, so its vector has to follow).
+    assert {n.id for n in rag.summary_nodes[0]} == {"edited.py", "dir:."}
+    assert rag.summary_dirty_ids == [{"edited.py", "dir:."}]
+
+
+@pytest.mark.asyncio
+async def test_clone_failure_deletes_the_partial_copy_and_falls_back_to_client_seeding(
+    tmp_path: Path,
+) -> None:
+    """A clone that fails must cost the worktree its speed, not its index: the partial copy
+    is deleted and the original, proven client-side seeding runs — still at zero LLM cost."""
+    main, worktree = _worktree_dirs(tmp_path)
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    repo.clone_error = RuntimeError("clone verification failed: chunks source=8100 target=8099")
+    builder = FakeGraphBuilder(build_result=([_SummaryNode("a.py", "s", "h1")], []))
+    rag = FakeRAGIndexer()
+    manager = _worktree_manager(repo, builder, rag, main)
+    donor = manager.get_project(str(main))
+    project = manager.get_project(str(worktree))
+    donor_summaries = {"a.py": {"summary": "s", "summary_input_hash": "h1"}}
+    repo.indexed_projects.add(donor)
+    repo.stored_summaries[donor] = donor_summaries
+    repo.stored_chunk_embeddings[donor] = {"a.py#0": [0.1]}
+
+    result = await manager.index_directory(str(worktree))
+
+    assert repo.deleted_projects == [project], "the partial copy was left behind"
+    # ...and the old path really ran: the donor's caches fed the build and the reused
+    # summaries were written back into the new project.
+    assert builder.builds == 1
+    assert builder.build_stored_summaries == [donor_summaries]
+    assert repo.chunk_embedding_requests == [donor]
+    assert repo.summaries_written == [
+        (project, [{"node_id": "a.py", "summary": "s", "summary_input_hash": "h1"}])
+    ]
+    assert result["worktree_of"] == donor
+    assert result["seeded_summaries"] == 1
+    assert "cloned" not in result
+
+
+@pytest.mark.asyncio
+async def test_worktree_clone_switched_off_uses_the_client_side_path(tmp_path: Path) -> None:
+    manager, repo, builder, _rag, main, worktree = _cloning_world(
+        tmp_path, settings=Settings(_env_file=None, worktree_clone=False)
+    )
+    donor = manager.get_project(str(main))
+    repo.stored_summaries[donor] = {"a.py": {"summary": "s", "summary_input_hash": "h1"}}
+
+    result = await manager.index_directory(str(worktree))
+
+    assert repo.clone_calls == []
+    assert repo.deleted_projects == []
+    assert builder.builds == 1                       # the client-side seeding path
+    assert repo.summary_requests == [donor]
+    assert "cloned" not in result
+
+
+@pytest.mark.asyncio
+async def test_plain_directory_is_never_cloned(tmp_path: Path) -> None:
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    rag = FakeRAGIndexer()
+    manager = _worktree_manager(repo, builder, rag, None)
+
+    await manager.index_directory(str(tmp_path))
+
+    assert repo.clone_calls == []
+    assert repo.deleted_projects == []
+    assert builder.builds == 1
+
+
+@pytest.mark.asyncio
+async def test_the_cost_cap_is_checked_before_anything_is_cloned(tmp_path: Path) -> None:
+    """INV-10 outranks the fast path: a worktree whose *uncovered* files would cost more than
+    the cap must be refused before a single node is copied, not after."""
+    from inflorescence.cost import IndexCostExceededError
+
+    manager, repo, builder, _rag, _main, worktree = _cloning_world(
+        tmp_path,
+        worktree_files={"same.py": "m1", "huge.py": "NEW"},
+        donor_files={"same.py": "m1"},
+    )
+    builder.estimate_result = {"estimated_tokens": 10_000_000, "estimated_nodes": 5_000}
+
+    with pytest.raises(IndexCostExceededError):
+        await manager.index_directory(str(worktree), max_cost_usd=0.0001)
+
+    assert builder.estimated_paths == [["huge.py"]]
+    assert repo.clone_calls == []
+
+
+@pytest.mark.asyncio
+async def test_first_query_against_a_worktree_clones_it_within_the_donor_scope(
+    tmp_path: Path,
+) -> None:
+    """The read tools' entry point reaches the clone path too, and must not widen the scan:
+    a tree the donor excluded is not to be parsed — let alone paid for — by a mere query."""
+    manager, repo, builder, _rag, main, worktree = _cloning_world(
+        tmp_path,
+        nodes=[_SummaryNode("edited.py", "s", "h")],
+        worktree_files={"same.py": "m1", "edited.py": "NEW"},
+        donor_files={"same.py": "m1", "edited.py": "OLD"},
+    )
+    donor = manager.get_project(str(main))
+    repo.stored_scope = (["backend/**"], ["vendor/**"])
+
+    project, reason = await manager.ensure_indexed_for_query(str(worktree))
+
+    assert reason is None
+    assert repo.clone_calls == [(donor, project)]
+    assert repo.scope_requests == [donor]          # inherited, not invented
+    assert builder.scan_checksum_calls == [(["backend/**"], ["vendor/**"])]
+    assert builder.update_filters == [(["backend/**"], ["vendor/**"])]
+    assert repo.scopes == [(project, ["backend/**"], ["vendor/**"])]
+
+
+@pytest.mark.asyncio
+async def test_an_unfinished_clone_is_deleted_and_the_directory_indexed_from_scratch(
+    tmp_path: Path,
+) -> None:
+    """A process killed mid-copy leaves nodes that belong to *another* project. Updating
+    them in place would reconcile a fresh parse against a graph that was never whole, so the
+    next index throws them away and starts over — and nothing paid-for is lost, because the
+    donor still holds every summary and vector."""
+    manager, repo, builder, _rag, main, worktree = _cloning_world(tmp_path)
+    donor = manager.get_project(str(main))
+    project = manager.get_project(str(worktree))
+    repo.clone_markers[project] = donor
+    # A half-copy really does have nodes: the stats probe must not be what decides.
+    repo.stats = {"nodes": 812, "edges": 400, "chunks": 0, "summaries": 0}
+
+    await manager.index_directory(str(worktree))
+
+    assert repo.deleted_projects == [project]
+    assert repo.call_log[:2] == ["delete_project", "clone_project"]
+    assert builder.updates == 0, "a half-copied graph was reconciled instead of discarded"
 
 
 @pytest.mark.asyncio
@@ -730,11 +1024,18 @@ def _seeded_worktree(
     tmp_path: Path,
     settings: Settings | None = None,
 ) -> tuple[ProjectManager, _SeedingRepository, FakeGraphBuilder, Path, str]:
-    """A worktree whose main checkout is indexed: the one case that may auto-index."""
+    """A worktree whose main checkout is indexed: the one case that may auto-index.
+
+    Pinned to the client-side seeding path unless a test says otherwise, so these assertions
+    stay about *what a query is allowed to index* rather than about which mechanism copies
+    the donor's cache; the clone path's own auto-index case is covered separately below.
+    """
     main, worktree = _worktree_dirs(tmp_path)
     builder = FakeGraphBuilder(build_result=([_SummaryNode("a.py", "s", "h1")], []))
     repo = _SeedingRepository(builder)
-    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), main, settings=settings)
+    manager = _worktree_manager(
+        repo, builder, FakeRAGIndexer(), main, settings=settings or _client_seeding()
+    )
     donor = manager.get_project(str(main))
     repo.indexed_projects.add(donor)
     repo.stored_summaries[donor] = {"a.py": {"summary": "s", "summary_input_hash": "h1"}}
@@ -1026,6 +1327,16 @@ class FakeProjectRepository:
         self.chunk_embedding_requests: list[str] = []
         self.summaries_written: list[tuple[str, list[dict[str, object]]]] = []
         self.worktree_meta: list[tuple[str, str, str]] = []
+        # Server-side clone state. `call_log` records the ordered sequence of calls that the
+        # clone path's contract is about (copy, then identity, then the incremental update) —
+        # the builder appends to the same list when a test hands it over.
+        self.call_log: list[str] = []
+        self.clone_calls: list[tuple[str, str]] = []
+        self.clone_error: BaseException | None = None
+        self.clone_counts = {"nodes": 5, "chunks": 3, "externals": 1, "edges": 7}
+        self.clone_markers: dict[str, str] = {}
+        self.deleted_projects: list[str] = []
+        self.scoped_chunk_embedding_requests: list[tuple[str, list[str]]] = []
 
     async def get_project_stats(self, project: str) -> dict[str, int]:
         self.expected_hash = project.rsplit("_", 1)[-1]
@@ -1055,13 +1366,42 @@ class FakeProjectRepository:
     async def set_project_worktree_meta(
         self, project: str, worktree_of: str, main_root_path: str
     ) -> None:
+        self.call_log.append("set_project_worktree_meta")
         self.worktree_meta.append((project, worktree_of, main_root_path))
 
     async def set_project_root_path(self, project: str, root_path: str) -> None:
+        self.call_log.append("set_project_root_path")
         self.root_paths.append((project, root_path))
 
     async def set_project_scope(self, project: str, include: list[str], exclude: list[str]) -> None:
+        self.call_log.append("set_project_scope")
         self.scopes.append((project, list(include), list(exclude)))
+
+    async def get_clone_marker(self, project: str) -> str | None:
+        return self.clone_markers.get(project)
+
+    async def clone_project(self, source: str, target: str) -> dict[str, int]:
+        self.call_log.append("clone_project")
+        self.clone_calls.append((source, target))
+        if self.clone_error is not None:
+            raise self.clone_error
+        self.indexed_projects.add(target)
+        return dict(self.clone_counts)
+
+    async def delete_project(self, project: str) -> None:
+        self.call_log.append("delete_project")
+        self.deleted_projects.append(project)
+        self.clone_markers.pop(project, None)
+        # A deleted project really is empty afterwards: the caller decides "first index or
+        # incremental" from these counts, and a fake that kept reporting the old ones would
+        # hide exactly the bug this models (a half-copy reconciled instead of rebuilt).
+        self.stats = {"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0}
+
+    async def get_stored_chunk_embeddings_for_files(
+        self, project: str, file_paths: list[str]
+    ) -> dict[str, list[float]]:
+        self.scoped_chunk_embedding_requests.append((project, list(file_paths)))
+        return dict(self.stored_chunk_embeddings.get(project, {}))
 
     async def get_project_scope(self, project: str) -> tuple[list[str], list[str]]:
         self.scope_requests.append(project)
@@ -1117,6 +1457,14 @@ class FakeGraphBuilder:
         self.estimated_paths: list[list[str]] = []
         self.scan_checksums_result: dict[str, str] = {}
         self.scan_checksum_calls: list[tuple[list[str] | None, list[str] | None]] = []
+        # Set to a FakeProjectRepository's list so a test can assert the *order* of the
+        # clone path's steps across both fakes (copy -> identity -> update).
+        self.call_log: list[str] | None = None
+        # What an update reports back about itself; the clone path scopes the paid RAG
+        # phases with these, so a test can prove only the changed files were re-processed.
+        self.update_reconcilable: set[str] = set()
+        self.update_dirty_ids: set[str] = set()
+        self.update_stored_summaries: dict[str, dict[str, object]] = {}
 
     def scan_checksums(
         self,
@@ -1177,9 +1525,17 @@ class FakeGraphBuilder:
         progress: object | None = None,
     ) -> BuildResult:
         self.updates += 1
+        if self.call_log is not None:
+            self.call_log.append("update")
         self.update_filters.append((include_patterns, exclude_patterns))
         nodes, edges = self.update_result
-        return BuildResult(nodes=list(nodes), edges=list(edges))
+        return BuildResult(
+            nodes=list(nodes),
+            edges=list(edges),
+            stored_summaries=dict(self.update_stored_summaries),
+            dirty_summary_ids=set(self.update_dirty_ids),
+            reconcilable_files=set(self.update_reconcilable),
+        )
 
     async def repair_missing_summaries(self, project: str, root_path: Path) -> list[object]:
         self.repairs += 1
@@ -1215,6 +1571,7 @@ class FakeRAGIndexer:
         # Reuse plumbing: the caches each phase was handed, so a test can prove the donor's
         # vectors (not a fresh embed) are what the run will store.
         self.code_stored_embeddings: list[dict[str, list[float]] | None] = []
+        self.code_reconcilable: list[set[str] | None] = []
         self.summary_stored_summaries: list[dict[str, dict[str, object]] | None] = []
         self.summary_dirty_ids: list[set[str] | None] = []
 
@@ -1237,6 +1594,7 @@ class FakeRAGIndexer:
         self.code_indexes += 1
         self.code_nodes.append(list(nodes))
         self.code_stored_embeddings.append(stored_chunk_embeddings)
+        self.code_reconcilable.append(reconcilable_files)
         return self.code_count
 
     async def index_summaries(

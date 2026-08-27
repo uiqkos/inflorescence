@@ -33,6 +33,12 @@ indexed projects and is never touched. Git is real (``subprocess``, as in
 ``tests/test_worktree.py``): the whole feature is filesystem archaeology over git's on-disk
 layout, and hand-crafted metadata would prove nothing about it.
 
+What this file deliberately does not pin is *how* the donor's cache reaches the new project.
+Since the server-side clone landed that is a copy made inside Memgraph, with the client-side
+seeding kept as its fallback; both are free, and the oracles here hold for either. The clone
+itself — exactness, atomicity, and what happens when it is interrupted or cannot be trusted —
+is proven in ``tests/test_worktree_clone_live.py`` (S10-S12).
+
 Two defects found while writing this file are *not* worktree defects, and are deliberately
 not asserted here — they would fail this suite for something it does not own, and pinning
 the current behavior would bless it. Both are documented at the assertion that had to work
@@ -464,7 +470,14 @@ async def test_s1_s2_s9_identical_worktree_is_indexed_for_free_and_completely(tm
         # The strict zeros.
         world.assert_free("S2 (worktree identical to its donor)")
         assert wt_stats["worktree_of"] == main_project
-        assert int(wt_stats["seeded_summaries"]) > 0
+        # How the donor's cache was carried over depends on which path ran: a server-side
+        # clone reports the copied counts, the client-side seeding the summaries it wrote
+        # back. The claim here is the same either way — nothing was regenerated. Which
+        # mechanism produced it, and whether the copy is exact, is S10's business
+        # (tests/test_worktree_clone_live.py).
+        assert wt_stats.get("cloned") or int(wt_stats.get("seeded_summaries", 0)) > 0, (
+            f"the worktree index reused nothing from its donor: {wt_stats}"
+        )
 
         # ...and the index is nonetheless complete: same nodes, same summary text, real vectors.
         wt_summaries = await repo.get_stored_summaries(wt_project)
@@ -515,7 +528,8 @@ async def test_s1_s2_s9_identical_worktree_is_indexed_for_free_and_completely(tm
         print(
             f"\nS1: llm={s1_llm} code_embeds={s1_code} summary_embeds={s1_summary} "
             f"nodes={donor_stats['nodes']}\nS2: llm=0 code_embeds=0 summary_embeds=0 "
-            f"seeded_summaries={wt_stats['seeded_summaries']}"
+            f"cloned={wt_stats.get('cloned')} "
+            f"seeded_summaries={wt_stats.get('seeded_summaries')}"
         )
     finally:
         await world.close()

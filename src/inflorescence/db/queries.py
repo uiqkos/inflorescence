@@ -93,8 +93,20 @@ RETURN n.file_path AS file_path, n.checksum AS checksum
 # and resolved through the project index, so it does not scan the graph. Search/query tools
 # use it to tell "this project was never indexed" (a typo'd or adjacent directory synthesises
 # a valid-but-empty project id) apart from "indexed, but no matches" (audit finding T5 / INV-7).
+#
+# A project whose :CloneMarker is still present is reported as NOT indexed even though it
+# already holds nodes: those nodes are a server-side clone in flight (see CLONE_* below), so
+# they are a partial copy of another project, with none of this project's own identity
+# stamped yet. Answering "indexed" there would let a read tool serve a half-copied graph —
+# the empty/partial page INV-7 exists to prevent. The marker is written before the first
+# cloned node and removed only after the clone is verified complete, so this probe flips to
+# True exactly when the graph is whole. The OPTIONAL MATCH runs first (a handful of marker
+# nodes exist at most), so the common case costs one extra label scan of a nearly empty label.
 PROJECT_IS_INDEXED = """
+OPTIONAL MATCH (m:CloneMarker {project: $project})
+WITH m LIMIT 1
 MATCH (n:Code {project: $project})
+WHERE m IS NULL
 RETURN 1 AS ok
 LIMIT 1
 """
@@ -187,7 +199,7 @@ WHERE root.worktree_of IS NOT NULL AND root.worktree_of <> ''
   AND root.worktree_main_root IS NOT NULL AND root.worktree_main_root <> ''
 WITH root
 MATCH (n {project: $project})
-WHERE n:Code OR n:CodeChunk OR n:External
+WHERE n:Code OR n:CodeChunk OR n:External OR n:CloneMarker
 DETACH DELETE n
 RETURN count(n) AS deleted
 """
@@ -556,7 +568,7 @@ RETURN count(*) AS written
 
 DELETE_PROJECT = """
 MATCH (n {project: $project})
-WHERE n:Code OR n:CodeChunk OR n:External
+WHERE n:Code OR n:CodeChunk OR n:External OR n:CloneMarker
 DETACH DELETE n
 """
 
@@ -578,6 +590,186 @@ MATCH (n:External {project: $project})
 WHERE NOT (n)<-[]-()
 DELETE n
 RETURN count(n) AS deleted
+"""
+
+# ---------------------------------------------------------------------------
+# Server-side project clone (the worktree fast path)
+# ---------------------------------------------------------------------------
+#
+# Copying one project's graph into another used to be done through the client: parse the
+# whole tree again, upsert every node and edge, then re-write every chunk with its 1536-float
+# vector over Bolt. Measured on a 5.5k-node / 8.1k-chunk repository that is minutes, and
+# nearly all of it is the vectors making a pointless round trip out of the database and back.
+# These queries do the copy inside Memgraph: no property value ever crosses the wire.
+#
+# Two shapes are forced by the engine and are the reason this is a family of templates
+# rather than one statement:
+#   * labels cannot be parameterized, so nodes are cloned one label at a time and edges one
+#     (relationship type, target label) pair at a time — exactly as upsert_nodes/upsert_edges
+#     already do for writes;
+#   * `MATCH (x {project: ...})` without a label cannot use the label-property indexes this
+#     schema creates, so every MATCH here names a label. That is a performance requirement,
+#     not a style one: an unlabelled endpoint match inside the edge clone degrades to a full
+#     node scan per row.
+#
+# Every clone statement returns `count(...)` for logging, but the count is NOT what decides
+# success: Memgraph 3.12 has been observed writing fewer rows than its own count reports
+# (see MARK_CHUNKS_COVERED above). The repository verifies the clone with the independent
+# COUNT queries below and refuses the result on any mismatch.
+
+# The in-flight flag. Written before the first cloned node and removed only after the copy
+# has been counted and verified, so its presence means "these nodes are a partial copy of
+# another project". PROJECT_IS_INDEXED consults it (a half-clone must never answer a query),
+# DELETE_PROJECT removes it with the nodes, and ProjectManager.index_directory treats it as
+# "delete this project and clone it again".
+SET_CLONE_MARKER = """
+MERGE (m:CloneMarker {project: $project})
+SET m.source = $source, m.started_at = timestamp()
+"""
+
+GET_CLONE_MARKER = """
+MATCH (m:CloneMarker {project: $project})
+RETURN m.source AS source
+LIMIT 1
+"""
+
+CLEAR_CLONE_MARKER = """
+MATCH (m:CloneMarker {project: $project})
+DELETE m
+"""
+
+# One label group of Code nodes, keyset-paginated by id so a huge project is copied in
+# bounded transactions instead of one that has to hold every vector in the project at once.
+# `SET m = properties(n)` copies *everything* — summary, summary_embedding, checksum,
+# chunks_checksum, the call-provenance lists — and then the project stamp is overwritten;
+# the order matters, since properties(n) carries the source's own project value.
+# `max(n.id)` is the cursor: ORDER BY + LIMIT yields a contiguous prefix, so the largest id
+# in the batch is where the next one resumes.
+CLONE_NODES_TEMPLATE = """
+MATCH (n:Code:{node_label} {{project: $source}})
+WHERE n.id > $after
+WITH n ORDER BY n.id LIMIT $limit
+CREATE (m:Code:{node_label})
+SET m = properties(n)
+SET m.project = $target
+RETURN count(m) AS written, max(n.id) AS last
+"""
+
+# Chunks carry the code embeddings — the expensive half of the copy, and the whole reason
+# this path exists. Same keyset pagination, and the vector index picks the created nodes up
+# exactly as it does for a client-side write (verified live: vector search over the clone
+# returns the cloned chunks).
+CLONE_CHUNKS = """
+MATCH (n:CodeChunk {project: $source})
+WHERE n.id > $after
+WITH n ORDER BY n.id LIMIT $limit
+CREATE (m:CodeChunk)
+SET m = properties(n)
+SET m.project = $target
+RETURN count(m) AS written, max(n.id) AS last
+"""
+
+# Dependencies the project names but does not contain. Project-scoped like everything else
+# (:External nodes carry `project`), so they are cloned rather than shared.
+CLONE_EXTERNALS = """
+MATCH (n:External {project: $source})
+WHERE n.id > $after
+WITH n ORDER BY n.id LIMIT $limit
+CREATE (m:External)
+SET m = properties(n)
+SET m.project = $target
+RETURN count(m) AS written, max(n.id) AS last
+"""
+
+# Which (relationship type, target label) pairs actually exist in the source. Discovered
+# rather than hard-coded from EdgeType: a clone that silently dropped a relationship type
+# someone added later would be a graph that looks complete and answers "calls nothing".
+# Whatever this misses still fails the count verification and falls back to the slow path.
+CLONE_EDGE_SHAPES = """
+MATCH (s:Code {project: $source})-[r]->(t {project: $source})
+RETURN DISTINCT type(r) AS type, labels(t) AS target_labels
+"""
+
+# The cursor windows for edge cloning: edges are copied for a bounded slice of source nodes
+# at a time. Read separately from the clone itself because a slice may legitimately contain
+# no edge of the type being copied, and an aggregate over zero rows returns no row at all —
+# so the cursor could not advance if it came back from the write.
+CLONE_SOURCE_ID_WINDOW = """
+MATCH (a:Code {project: $source})
+WHERE a.id > $after
+RETURN a.id AS id
+ORDER BY a.id
+LIMIT $limit
+"""
+
+# One relationship type between one pair of label classes, for one cursor window. Both
+# endpoints are re-found in the target by id — the ids were copied verbatim, so this is an
+# indexed lookup, and it is what makes the copy structurally identical rather than merely
+# similarly shaped. `SET r2 = properties(r)` carries CALLS provenance (resolution,
+# callee_text) across.
+CLONE_EDGES_TEMPLATE = """
+MATCH (a:Code {{project: $source}})-[r:{edge_type}]->(b:{target_label} {{project: $source}})
+WHERE a.id > $after AND a.id <= $upper
+MATCH (a2:Code {{project: $target, id: a.id}})
+MATCH (b2:{target_label} {{project: $target, id: b.id}})
+CREATE (a2)-[r2:{edge_type}]->(b2)
+SET r2 = properties(r)
+RETURN count(r2) AS written
+"""
+
+# A cloned root node arrives carrying the *donor's* identity: its absolute root_path, its
+# persisted include/exclude scope, and (if the donor were itself marked) its worktree fields.
+# Those are stripped immediately, before the caller stamps this project's own, so that a
+# clone interrupted halfway is invisible to everything that reasons about projects by path:
+# LIST_PROJECTS filters on a non-empty root_path, so the janitor never sees a half-clone, and
+# nothing can mistake it for a second project rooted at the donor's directory.
+CLEAR_CLONED_ROOT_IDENTITY = """
+MATCH (n:Code:Directory {id: 'dir:.', project: $project})
+SET n.root_path = null,
+    n.index_include = null,
+    n.index_exclude = null,
+    n.worktree_of = null,
+    n.worktree_main_root = null
+"""
+
+# Verification. Counted independently of the writes, per label and per relationship type, on
+# both projects — "the clone reported N rows" is not evidence that N rows exist (INV-7, and
+# the 3.12 under-write quirk documented at MARK_CHUNKS_COVERED).
+#
+# The edge count deliberately matches on unlabelled endpoints: it is the one query here that
+# must see relationships the clone never thought about, including any that start somewhere
+# other than a :Code node. It costs a scan, which is affordable once per clone and is the
+# difference between "verified" and "verified against my own assumptions".
+COUNT_CODE_NODES = """
+MATCH (n:Code {project: $project})
+RETURN count(n) AS count
+"""
+
+COUNT_CHUNKS = """
+MATCH (n:CodeChunk {project: $project})
+RETURN count(n) AS count
+"""
+
+COUNT_EXTERNALS = """
+MATCH (n:External {project: $project})
+RETURN count(n) AS count
+"""
+
+COUNT_EDGES_BY_TYPE = """
+MATCH (s {project: $project})-[r]->(t {project: $project})
+RETURN type(r) AS type, count(r) AS count
+"""
+
+# Stored chunk vectors for a named set of files. The whole-project variant above unloads
+# every vector in the project over Bolt (7.5s for 8.1k chunks, measured) — affordable once,
+# ruinous on a path whose entire point is not moving vectors through the client. After a
+# server-side clone only the files that actually differ from the donor are re-chunked, and
+# those are the only files whose stored vectors can still be reused (a chunk id hashes the
+# file path, so a chunk can never be reused across files).
+GET_STORED_CHUNK_EMBEDDINGS_FOR_FILES = """
+MATCH (c:CodeChunk {project: $project})
+WHERE c.file_path IN $file_paths
+RETURN c.id AS chunk_id, c.embedding AS embedding
 """
 
 # Reconcile queries: an update replaces stale state piecewise instead of wiping

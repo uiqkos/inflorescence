@@ -78,6 +78,29 @@ _NODE_TYPE_LABEL_BY_VALUE = {
 # this map by value, so a type added without a label raises KeyError on its first node.
 _NODE_TYPE_VALUE_BY_LABEL = {label: value for value, label in _NODE_TYPE_LABEL_BY_VALUE.items()}
 
+# Rows per clone transaction. Far larger than DEFAULT_WRITE_BATCH_SIZE because nothing
+# crosses the wire here: the batch exists only to bound how much a single Memgraph
+# transaction has to hold (a chunk batch materialises ~batch_size × 1536 floats server-side).
+# Measured on 5.5k nodes / 8.1k chunks, one query per label was the *fastest* variant — the
+# per-batch re-scan costs more than the transaction size saves — so the batch is set high
+# enough that ordinary projects finish in one or two round trips and only genuinely huge
+# ones ever paginate.
+CLONE_BATCH_SIZE = 5000
+
+# Which label a cloned edge endpoint should be matched by. A Code node also carries its
+# node-type label, and the clone needs the *class* label that has a project index on it.
+_EDGE_ENDPOINT_LABELS = ("Code", "CodeChunk", "External")
+
+
+class ProjectCloneError(RuntimeError):
+    """A server-side project clone could not be completed or could not be trusted.
+
+    Raised for both halves of the same failure: the copy itself blew up, or it finished and
+    the independent recount disagreed with the source. Callers treat the two identically —
+    delete the partial copy and fall back to the client-side path — so they are one class.
+    """
+
+
 # Memgraph's vector_search.search has no filtered variant: it returns the GLOBAL
 # top-k across every project sharing the index, and the project filter runs after.
 # With several indexed projects a small top_k can be fully consumed by another
@@ -363,9 +386,228 @@ class GraphRepository:
         return deleted
 
     async def delete_project(self, project: str) -> None:
-        """Delete all graph and vector data for a project."""
+        """Delete all graph and vector data for a project (including any clone marker)."""
         await self._conn.execute_write(queries.DELETE_PROJECT, {"project": project})
         logger.debug("Deleted all nodes for project=%s", project)
+
+    # ------------------------------------------------------------------
+    # Server-side project clone
+    # ------------------------------------------------------------------
+
+    async def get_clone_marker(self, project: str) -> str | None:
+        """The source project of a clone that never finished, or ``None``.
+
+        A non-``None`` answer means this project holds a partial copy of the named project
+        and must be deleted before being (re-)indexed — see :meth:`clone_project` for the
+        contract. Cheap: the marker label holds one node per clone in flight.
+        """
+        records = await self._conn.execute_query(queries.GET_CLONE_MARKER, {"project": project})
+        if not records:
+            return None
+        source = records[0].get("source")
+        return str(source) if source else None
+
+    async def clone_project(self, source: str, target: str) -> dict[str, int]:
+        """Copy every node, chunk, dependency and edge of *source* into *target*, inside the DB.
+
+        Returns ``{"nodes", "chunks", "externals", "edges"}`` — the counts a *re-read* of the
+        target found, not the counts the writes claimed.
+
+        Why this exists: the client-side alternative pulls every summary and every 1536-float
+        vector out of Memgraph and writes them all back under a new project id. The values are
+        identical on both ends of that trip, so the trip is pure cost — minutes on a repository
+        of a few thousand nodes, nearly all of it spent moving vectors the database already
+        has. Here nothing but ids and counts crosses the wire.
+
+        **Atomicity contract.** There is no transaction spanning the whole copy, so the
+        interruption story is explicit instead of hoped for:
+
+        1. The target must be empty. A non-empty target raises rather than duplicating nodes.
+        2. A ``:CloneMarker`` is written *before* the first node. While it is present
+           :meth:`project_is_indexed` reports the project as **not indexed**, so no read tool
+           can serve a half-copied graph, and ``ProjectManager.index_directory`` deletes the
+           project and clones it again instead of updating it.
+        3. The cloned root node's borrowed identity (the donor's ``root_path`` and scope) is
+           erased immediately, so a half-clone is invisible to ``list_projects`` — the janitor
+           and the dashboard never see a phantom project rooted at the donor's directory.
+        4. The copy is verified by independent recounts of both projects (per label, per
+           relationship type). Memgraph 3.12 is known to write fewer rows than its own
+           ``count(*)`` reports for some shapes, so the writes' own numbers are not evidence.
+        5. Only then is the marker removed. The caller stamps this project's real
+           ``root_path``/scope/worktree marker afterwards.
+
+        Anything that goes wrong — a failed statement or a recount that disagrees — raises
+        :class:`ProjectCloneError` with the target left marked and therefore un-queryable.
+        The caller is expected to delete the partial copy (``delete_project``) and fall back;
+        if the process dies before that, step 2 makes the next index run do it.
+        """
+        existing = await self._count_one(queries.COUNT_CODE_NODES, target)
+        existing += await self._count_one(queries.COUNT_CHUNKS, target)
+        existing += await self._count_one(queries.COUNT_EXTERNALS, target)
+        if existing:
+            raise ProjectCloneError(
+                f"Refusing to clone project={source} into project={target}: the target already "
+                f"holds {existing} node(s). Cloning into a non-empty project would duplicate "
+                "every node, since the copy CREATEs rather than MERGEs. Delete it first."
+            )
+
+        started = monotonic()
+        await self._conn.execute_write(
+            queries.SET_CLONE_MARKER, {"project": target, "source": source}
+        )
+        try:
+            nodes = 0
+            for label in _NODE_TYPE_LABEL_BY_VALUE.values():
+                nodes += await self._clone_keyset(
+                    queries.CLONE_NODES_TEMPLATE.format(node_label=label), source, target
+                )
+            chunks = await self._clone_keyset(queries.CLONE_CHUNKS, source, target)
+            externals = await self._clone_keyset(queries.CLONE_EXTERNALS, source, target)
+            # Before any verification, so an interrupted clone cannot masquerade as a project
+            # rooted at the donor's directory (contract step 3).
+            await self._conn.execute_write(
+                queries.CLEAR_CLONED_ROOT_IDENTITY, {"project": target}
+            )
+            edges = await self._clone_edges(source, target)
+            counts = await self._verify_clone(source, target)
+        except ProjectCloneError:
+            raise
+        except Exception as exc:
+            raise ProjectCloneError(
+                f"Server-side clone of project={source} into project={target} failed: {exc}"
+            ) from exc
+
+        await self._conn.execute_write(queries.CLEAR_CLONE_MARKER, {"project": target})
+        logger.info(
+            "Cloned project=%s into project=%s in %.1fs (%d nodes, %d chunks, %d externals, "
+            "%d edges; write counts: %d/%d/%d/%d)",
+            source, target, monotonic() - started,
+            counts["nodes"], counts["chunks"], counts["externals"], counts["edges"],
+            nodes, chunks, externals, edges,
+        )
+        return counts
+
+    async def _count_one(self, query: str, project: str) -> int:
+        records = await self._conn.execute_query(query, {"project": project})
+        return int(records[0]["count"]) if records else 0
+
+    async def _edge_counts(self, project: str) -> dict[str, int]:
+        records = await self._conn.execute_query(queries.COUNT_EDGES_BY_TYPE, {"project": project})
+        return {str(r["type"]): int(r["count"]) for r in records}
+
+    async def _clone_keyset(self, query: str, source: str, target: str) -> int:
+        """Run one keyset-paginated clone statement to exhaustion. Returns rows written."""
+        after = ""
+        written = 0
+        while True:
+            records = await self._conn.execute_write_query(
+                query,
+                {"source": source, "target": target, "after": after, "limit": CLONE_BATCH_SIZE},
+            )
+            batch = _written(records)
+            if not batch:
+                return written
+            written += batch
+            last = records[0].get("last")
+            if last is None:
+                # Rows were written but no cursor came back — continuing would re-clone the
+                # same window forever. Better to fail the clone than to duplicate nodes.
+                raise ProjectCloneError(
+                    f"Clone of project={source} lost its pagination cursor after {written} row(s)"
+                )
+            after = str(last)
+
+    async def _clone_edges(self, source: str, target: str) -> int:
+        """Clone every relationship of the source, one (type, target label) pair at a time."""
+        shapes = await self._conn.execute_query(queries.CLONE_EDGE_SHAPES, {"source": source})
+        pairs: set[tuple[str, str]] = set()
+        for row in shapes:
+            labels = {str(label) for label in (row.get("target_labels") or [])}
+            target_label = next((label for label in _EDGE_ENDPOINT_LABELS if label in labels), None)
+            if target_label is None:
+                # An endpoint the clone has no way to address by label. Not fatal here — the
+                # recount below turns it into a refusal, which is the honest outcome.
+                logger.error(
+                    "Clone of project=%s found a %s edge into a node with labels %s it cannot "
+                    "address; the clone will fail verification",
+                    source, row.get("type"), sorted(labels),
+                )
+                continue
+            pairs.add((str(row["type"]), target_label))
+
+        written = 0
+        after = ""
+        while True:
+            window = await self._conn.execute_query(
+                queries.CLONE_SOURCE_ID_WINDOW,
+                {"source": source, "after": after, "limit": CLONE_BATCH_SIZE},
+            )
+            if not window:
+                return written
+            upper = str(window[-1]["id"])
+            for edge_type, target_label in sorted(pairs):
+                query = queries.CLONE_EDGES_TEMPLATE.format(
+                    edge_type=edge_type, target_label=target_label
+                )
+                records = await self._conn.execute_write_query(
+                    query,
+                    {
+                        "source": source, "target": target,
+                        "after": after, "upper": upper,
+                    },
+                )
+                written += _written(records)
+            after = upper
+
+    async def _verify_clone(self, source: str, target: str) -> dict[str, int]:
+        """Recount both projects independently; raise unless every count matches."""
+        counts: dict[str, int] = {}
+        mismatches: list[str] = []
+        for key, query in (
+            ("nodes", queries.COUNT_CODE_NODES),
+            ("chunks", queries.COUNT_CHUNKS),
+            ("externals", queries.COUNT_EXTERNALS),
+        ):
+            src = await self._count_one(query, source)
+            dst = await self._count_one(query, target)
+            counts[key] = dst
+            if src != dst:
+                mismatches.append(f"{key}: source={src} target={dst}")
+
+        src_edges = await self._edge_counts(source)
+        dst_edges = await self._edge_counts(target)
+        counts["edges"] = sum(dst_edges.values())
+        for edge_type in sorted(set(src_edges) | set(dst_edges)):
+            src_n = src_edges.get(edge_type, 0)
+            dst_n = dst_edges.get(edge_type, 0)
+            if src_n != dst_n:
+                mismatches.append(f"{edge_type} edges: source={src_n} target={dst_n}")
+
+        if mismatches:
+            raise ProjectCloneError(
+                f"Clone of project={source} into project={target} is incomplete — "
+                + "; ".join(mismatches)
+            )
+        return counts
+
+    async def get_stored_chunk_embeddings_for_files(
+        self, project: str, file_paths: Sequence[str]
+    ) -> dict[str, list[float]]:
+        """``{chunk_id: embedding}`` for the given files only (null embeddings dropped).
+
+        The scoped counterpart to :meth:`get_stored_chunk_embeddings`, for callers that know
+        which files they are about to re-chunk. Reuse is never lost by scoping: a chunk id
+        hashes the owning node and file path, so a chunk of one file can never be reused for
+        another.
+        """
+        file_paths = list(file_paths)
+        if not file_paths:
+            return {}
+        records = await self._conn.execute_query(
+            queries.GET_STORED_CHUNK_EMBEDDINGS_FOR_FILES,
+            {"project": project, "file_paths": file_paths},
+        )
+        return {r["chunk_id"]: r["embedding"] for r in records if r["embedding"] is not None}
 
     async def get_node_ids(self, project: str) -> set[str]:
         """Return the ids of all stored Code nodes for a project."""
@@ -472,6 +714,11 @@ class GraphRepository:
         Distinguishes a never-indexed project (typo'd/adjacent directory → valid-but-empty
         project id) from an indexed one with no matches, so tools stop "politely lying" with
         an empty page (audit finding T5 / INV-7).
+
+        A project holding an unfinished server-side clone is reported as **not** indexed even
+        though it has nodes: they are a partial copy of another project (see
+        :meth:`clone_project`). Read tools therefore refuse it rather than serving half a
+        graph, and the auto-index path they fall into is what repairs it.
         """
         records = await self._conn.execute_query(queries.PROJECT_IS_INDEXED, {"project": project})
         return bool(records)

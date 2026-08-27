@@ -191,6 +191,16 @@ class Settings(BaseSettings):
     # for everything the branch did not change (INV-10 — money is spent on new content only).
     # Set False to index every worktree from scratch, paying for content that is already indexed.
     worktree_auto_index: bool = True
+    # How that first index is produced. True (default): the donor's graph is copied inside
+    # Memgraph — summaries and vectors never leave the database — and only the files the
+    # branch actually differs on are re-parsed and re-embedded, which turns minutes of
+    # client-side re-writing into a copy plus a checksum scan. False falls back to the
+    # original path: parse the whole tree in the client and write every node, chunk and
+    # vector back over Bolt, reusing the donor's caches by content hash. Both cost the same
+    # (nothing) in LLM and embedding calls; only wall time differs. The fallback is also
+    # automatic — a clone that fails or fails verification is deleted and the client-side
+    # path runs instead, so this switch exists for diagnosis, not for correctness.
+    worktree_clone: bool = True
     # Reap the index of a worktree git no longer knows about. A worktree is a disposable
     # checkout: it is deleted far more often than a project is, and its index would otherwise
     # linger forever, answering queries about a tree that no longer exists. Only projects

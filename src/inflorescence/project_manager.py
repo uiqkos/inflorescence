@@ -7,6 +7,7 @@ import hashlib
 import logging
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from inflorescence.code_indexer.graph_builder import BuildResult, GraphBuilder
@@ -28,6 +29,21 @@ logger = logging.getLogger(__name__)
 # directory says so, and says why; it never answers with an empty page).
 _NOT_INDEXED_REASON = "index it with index_directory first"
 _AUTO_INDEX_FAILED_PREFIX = "auto-index attempted and failed: "
+
+
+@dataclass(frozen=True)
+class _DonorCoverage:
+    """How a worktree's files differ from the donor project's index.
+
+    ``uncovered`` — root-relative paths whose content the donor does not hold (edited by the
+    branch, or new); ``deleted`` — paths the donor indexed that this checkout no longer has;
+    ``scanned`` — how many files the walk saw, which is what makes a near-zero cost estimate
+    explainable rather than merely surprising.
+    """
+
+    uncovered: list[str]
+    deleted: list[str]
+    scanned: int
 
 
 class IndexPreflightError(RuntimeError):
@@ -216,45 +232,195 @@ class ProjectManager:
             return None
         return donor
 
-    async def _donor_uncovered_paths(
-        self,
-        root: Path,
-        donor_project: str,
-        include_patterns: list[str] | None,
-        exclude_patterns: list[str] | None,
-    ) -> list[str]:
-        """Root-relative paths whose content the donor's index does not already hold.
-
-        Summaries are reused by content hash and chunk vectors by content-derived id, so a
-        file byte-identical to the donor's copy costs nothing to "index". Only the rest — the
-        branch's own edits, plus files the donor never had — will reach the LLM and the
-        embedder, and they are the only thing the cost cap should be pricing.
-        """
-        uncovered, _scanned = await self._donor_coverage(
-            root, donor_project, include_patterns, exclude_patterns
-        )
-        return uncovered
-
     async def _donor_coverage(
         self,
         root: Path,
         donor_project: str,
         include_patterns: list[str] | None,
         exclude_patterns: list[str] | None,
-    ) -> tuple[list[str], int]:
-        """``(paths the donor does not cover, number of files scanned)``.
+    ) -> _DonorCoverage:
+        """How this tree differs from the donor's index: uncovered, deleted, and how many scanned.
 
-        The scanned total is what makes the uncovered count explainable in a preview — "2 of
-        4300 files will be paid for" rather than a bare, suspiciously small dollar figure —
-        and it comes free with the scan the uncovered set already needs. Counting it with a
-        second scan would re-read the whole tree for one integer.
+        One walk of the tree answers everything the worktree path needs. The scanned total is
+        what makes the uncovered count explainable in a preview — "2 of 4300 files will be
+        paid for" rather than a bare, suspiciously small dollar figure. ``deleted`` (indexed
+        by the donor, absent here) costs nothing to index but has to be reconciled after a
+        clone, or the branch's removed files keep answering queries.
+
+        Deliberately a single call: the cost gate and the post-clone reconcile both need this
+        diff, and a second call would re-read and re-hash every file in the repository for
+        the same answer.
         """
         donor_checksums = await self._repo.get_checksums(donor_project)
         current = self._builder.scan_checksums(
             root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
         )
-        uncovered = sorted(rel for rel, md5 in current.items() if donor_checksums.get(rel) != md5)
-        return uncovered, len(current)
+        return _DonorCoverage(
+            uncovered=sorted(rel for rel, md5 in current.items() if donor_checksums.get(rel) != md5),
+            deleted=sorted(set(donor_checksums) - set(current)),
+            scanned=len(current),
+        )
+
+    async def _discard_unfinished_clone(self, project: str) -> bool:
+        """Delete a project whose server-side clone never finished. Returns whether it went.
+
+        The nodes such a project holds are a partial copy of *another* project: complete for
+        some labels, missing for others, with no identity of its own (see
+        :meth:`GraphRepository.clone_project`). They are not an index of this directory, so
+        they are thrown away and the directory is indexed from scratch — never updated in
+        place, which would reconcile a fresh parse against a graph that was never whole.
+        Nothing paid-for is lost: the donor still holds every summary and vector.
+        """
+        source = await self._repo.get_clone_marker(project)
+        if source is None:
+            return False
+        logger.warning(
+            "Project=%s holds an unfinished clone of project=%s (a previous run was killed "
+            "mid-copy) — deleting it and indexing from scratch",
+            project, source,
+        )
+        await self._repo.delete_project(project)
+        return True
+
+    async def _clone_donor_graph(self, project: str, donor_project: str) -> dict[str, int] | None:
+        """Copy the donor's graph into *project* inside Memgraph. ``None`` means "fall back".
+
+        The fast half of the worktree fast path: the donor's summaries and vectors are
+        already the right values under the wrong project id, and moving them out to the
+        client and back is the single most expensive thing the old path did.
+
+        A failure here is never fatal. The clone is deleted and ``None`` is returned, and the
+        caller then runs the original client-side seeding path — slower, but proven, and
+        equally free of LLM and embedding spend. That is why this catches everything: a new
+        Memgraph quirk must cost a worktree its speed, not its index.
+        """
+        if not self._settings.worktree_clone:
+            return None
+        try:
+            return await self._repo.clone_project(donor_project, project)
+        except Exception as exc:  # noqa: BLE001 — any clone failure degrades to the slow path
+            logger.warning(
+                "Server-side clone of donor project=%s into project=%s failed (%s) — falling "
+                "back to client-side seeding for this index",
+                donor_project, project, exc, exc_info=True,
+            )
+            try:
+                await self._repo.delete_project(project)
+            except Exception:  # noqa: BLE001 — the marker keeps the leftovers repairable
+                logger.error(
+                    "Could not delete the partial clone in project=%s; it stays marked as an "
+                    "unfinished clone and the next index run will remove it",
+                    project, exc_info=True,
+                )
+            return None
+
+    async def _index_cloned_worktree(
+        self,
+        project: str,
+        root: Path,
+        donor_project: str,
+        main_root: Path | None,
+        clone_counts: dict[str, int],
+        coverage: _DonorCoverage,
+        include_patterns: list[str] | None,
+        exclude_patterns: list[str] | None,
+        progress: ProgressReporter | None,
+    ) -> dict[str, object]:
+        """Finish a first index that started as a server-side clone of the donor's graph.
+
+        The clone left this project holding the donor's graph and none of its own identity.
+        Two things remain: stamp the identity, and pay for the difference between the two
+        checkouts — nothing more, because everything else is already correct in the database.
+
+        Finding that difference needs no git: the donor's per-file checksums (which the clone
+        copied along with everything else) versus a plain scan of this tree names exactly the
+        files whose content differs, plus the ones the branch deleted — *coverage*, already
+        computed for the cost gate. The existing incremental path then does the real work,
+        and the RAG phases are scoped to those files: the unscoped versions would re-write
+        every chunk and every summary vector in the project — one vector-index update each —
+        which is precisely the cost the clone avoided.
+        """
+        # Identity first: the update below reconciles against a project that must already
+        # know where it lives and what scope it was indexed under.
+        await self._repo.set_project_root_path(project, str(root))
+        await self._stamp_worktree_meta(project, main_root)
+        await self._persist_scope(project, include_patterns, exclude_patterns)
+
+        touched = set(coverage.uncovered) | set(coverage.deleted)
+
+        result = BuildResult(nodes=[], edges=[])
+        chunks_stored = 0
+        summaries_stored = 0
+        if touched:
+            logger.info(
+                "Cloned worktree project=%s differs from donor project=%s in %d file(s) — "
+                "reconciling just those", project, donor_project, len(touched),
+            )
+            result = await self._builder.update(
+                project,
+                root,
+                include_patterns=include_patterns,
+                exclude_patterns=exclude_patterns,
+                progress=progress,
+            )
+            # Scope both paid phases to the files that actually differ. `reconcilable_files`
+            # is intersected rather than replaced so a file the build failed to re-parse
+            # keeps its cloned chunks instead of being emptied (INV-1/INV-3, finding 4).
+            reconcilable = touched & result.reconcilable_files
+            chunk_nodes = [n for n in result.nodes if n.file_path in touched]
+            # Summaries additionally cover every node this run regenerated: a container's
+            # summary moves when a child's does, and its vector must follow.
+            summary_nodes = [
+                n for n in result.nodes
+                if n.file_path in touched or n.id in result.dirty_summary_ids
+            ]
+            if chunk_nodes or reconcilable:
+                stored_chunk_embeddings = (
+                    await self._repo.get_stored_chunk_embeddings_for_files(project, sorted(touched))
+                )
+                chunks_stored = await self._rag.index_code(
+                    project, root, chunk_nodes,
+                    stored_chunk_embeddings=stored_chunk_embeddings,
+                    prune_stale=True,
+                    reconcilable_files=reconcilable,
+                    progress=progress,
+                )
+            if summary_nodes:
+                summaries_stored = await self._rag.index_summaries(
+                    project, summary_nodes,
+                    stored_summaries=result.stored_summaries,
+                    dirty_ids=result.dirty_summary_ids,
+                    progress=progress,
+                )
+        else:
+            logger.info(
+                "Cloned worktree project=%s is byte-identical to donor project=%s — nothing "
+                "left to index", project, donor_project,
+            )
+
+        db_stats = await self._repo.get_project_stats(project)
+        stats: dict[str, object] = {
+            "project": project,
+            "directory": str(root),
+            # What this project holds now, which for a clone is the whole graph — reporting
+            # only what the tail-end update touched would read as "indexed almost nothing".
+            "nodes": db_stats["nodes"],
+            "edges": db_stats["edges"],
+            "chunks": db_stats["chunks"],
+            "summaries": db_stats["summaries"],
+            "db": db_stats,
+            "skipped_large_files": list(result.skipped_large_files),
+            "reused": False,
+            "worktree_of": donor_project,
+            # Present only on this path, so a caller can tell a server-side clone from the
+            # client-side seeding that reports `seeded_summaries` instead.
+            "cloned": dict(clone_counts),
+            "changed_files": len(touched),
+            "chunks_reindexed": chunks_stored,
+            "summaries_reembedded": summaries_stored,
+        }
+        logger.info("Indexing complete (cloned worktree): %s", stats)
+        return stats
 
     async def _persist_seeded_summaries(self, project: str, result: BuildResult) -> int:
         """Write the donor-reused summaries into the new project. **Not optional.**
@@ -410,8 +576,18 @@ class ProjectManager:
         marked as such on its project root node whether or not seeding happened; see
         :meth:`_stamp_worktree_meta`.
 
+        That first index normally runs as a **server-side clone** (``worktree_clone``): the
+        donor's graph is copied inside Memgraph, so no summary and no vector travels to the
+        client and back, and only the files this checkout differs on are re-parsed and
+        re-embedded. On a repository of a few thousand nodes that is tens of seconds rather
+        than minutes — the residual cost is Memgraph's own vector-index insert, which no path
+        avoids. If the clone fails or fails its verification it is deleted and the original
+        client-side seeding runs instead; both cost nothing in LLM or embedding calls.
+
         Returns statistics about the indexed project. A seeded worktree index additionally
-        reports ``worktree_of`` (the donor project) and ``seeded_summaries``.
+        reports ``worktree_of`` (the donor project), plus either ``cloned`` (the copied
+        node/chunk/external/edge counts, server-side path) or ``seeded_summaries`` (the
+        client-side path).
         """
         root = Path(path).resolve()
         if not root.is_dir():
@@ -425,6 +601,10 @@ class ProjectManager:
 
         async with self._project_locks[project], project_lease(self._conn, project):
             await self._preflight()
+            # Before anything reads this project's state: a killed server-side clone left
+            # nodes that belong to another project. They must not be mistaken for an index
+            # of this directory and updated in place.
+            await self._discard_unfinished_clone(project)
             existing_stats = await self._repo.get_project_stats(project)
             seeded_from: str | None = None
             seeded_summaries = 0
@@ -476,19 +656,23 @@ class ProjectManager:
                 # no LLM call and no embedding is paid for content that is already indexed.
                 donor_project = await self._donor_project(project, main_root)
                 donor_summaries: dict[str, dict[str, object]] = {}
+                # One scan of the tree answers both "what would this cost?" and, after a
+                # clone, "what still has to be indexed?" — see _donor_coverage.
+                coverage: _DonorCoverage | None = None
                 limit = max_cost_usd if max_cost_usd is not None else self._settings.max_index_cost_usd
+                if donor_project is not None and (limit is not None or self._settings.worktree_clone):
+                    coverage = await self._donor_coverage(
+                        root, donor_project, include_patterns, exclude_patterns
+                    )
                 if limit is not None:
-                    if donor_project is not None:
+                    if coverage is not None:
                         # Pricing the whole tree here would reject a free index: a large repo's
                         # full preview clears any sane cap, while the actual spend is limited to
                         # the files the donor does not already cover (INV-10 gates *spend*).
-                        uncovered = await self._donor_uncovered_paths(
-                            root, donor_project, include_patterns, exclude_patterns
-                        )
-                        preview = self._builder.estimate_paths(root, uncovered)
+                        preview = self._builder.estimate_paths(root, coverage.uncovered)
                         logger.info(
                             "Worktree of an indexed checkout: pricing %d file(s) not covered by "
-                            "donor project=%s", len(uncovered), donor_project,
+                            "donor project=%s", len(coverage.uncovered), donor_project,
                         )
                     else:
                         preview = self._builder.preview(
@@ -498,6 +682,17 @@ class ProjectManager:
                     logger.info("Estimated first-time index cost: $%.4f (limit $%.2f)", estimate["usd"], limit)
                     if estimate["usd"] > limit:
                         raise IndexCostExceededError(estimate["usd"], limit)
+                if donor_project is not None and coverage is not None:
+                    # The fast path: copy the donor's graph inside Memgraph, then pay only
+                    # for the files this checkout differs on. `None` means the copy could not
+                    # be made or could not be trusted — the client-side seeding below then
+                    # runs exactly as it did before, at the same (zero) LLM cost.
+                    clone_counts = await self._clone_donor_graph(project, donor_project)
+                    if clone_counts is not None:
+                        return await self._index_cloned_worktree(
+                            project, root, donor_project, main_root, clone_counts, coverage,
+                            include_patterns, exclude_patterns, progress,
+                        )
                 if donor_project is not None:
                     donor_summaries = await self._repo.get_stored_summaries(donor_project)
                     stored_chunk_embeddings = await self._repo.get_stored_chunk_embeddings(donor_project)
@@ -658,9 +853,8 @@ class ProjectManager:
         project = self.get_project(path)
         donor = await self._donor_project(project, self._worktree_main_root(root))
         if donor is not None:
-            uncovered, scanned = await self._donor_coverage(
-                root, donor, include_patterns, exclude_patterns
-            )
+            coverage = await self._donor_coverage(root, donor, include_patterns, exclude_patterns)
+            uncovered, scanned = coverage.uncovered, coverage.scanned
             paths_preview = self._builder.estimate_paths(root, uncovered)
             paths_estimate = estimate_index_cost(paths_preview, self._settings)
             return {
