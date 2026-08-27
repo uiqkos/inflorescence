@@ -2217,6 +2217,7 @@ async def test_get_entity_context_tool_paginates_and_trims_sections() -> None:
         "project": "project-id",
         "node_id": "pkg/a.py::Worker",
         "relation_types": ["CALLS"],
+        "answered_from": str(Path("/tmp/project").resolve()),
         # /tmp/project holds no such files, and the fake stored no checksums: every path
         # on the page is 'unknown', which is meta-only and flags no item.
         "index_freshness": {"checked": 2, "stale": [], "missing": [], "unknown": ["pkg/a.py", "pkg/b.py"]},
@@ -3953,3 +3954,92 @@ async def test_get_related_entities_marks_the_surplus_as_approximate_past_the_sc
 
     assert payload["error"]["code"] == "ambiguous_name"
     assert "and 41+ more" in payload["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# meta.answered_from: which tree, which commit. Two agents disagreed in the field
+# about whether their branch work was in the graph, and no field of the response
+# could settle it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_answered_from_names_the_checkout_branch_and_commit(tmp_path: Path) -> None:
+    main = make_repo(tmp_path / "main")
+    head = git("-C", str(main), "rev-parse", "HEAD").strip()
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": str(main), "limit": 10}))
+
+    assert payload["meta"]["answered_from"] == f"{main.resolve()} (main @ {head[:7]})"
+
+
+@pytest.mark.asyncio
+async def test_answered_from_names_the_worktree_and_the_checkout_it_came_from(tmp_path: Path) -> None:
+    main = make_repo(tmp_path / "main")
+    wt = tmp_path / "wt"
+    git("-C", str(main), "worktree", "add", "-b", "feature/x", str(wt))
+    head = git("-C", str(wt), "rev-parse", "HEAD").strip()
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": str(wt), "limit": 10}))
+
+    assert payload["meta"]["answered_from"] == (
+        f"{wt.resolve()} (feature/x @ {head[:7]}), a git worktree of {main.resolve()}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_answered_from_degrades_to_the_path_outside_git(tmp_path: Path) -> None:
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": str(tmp_path), "limit": 10}))
+
+    assert payload["meta"]["answered_from"] == str(tmp_path.resolve())
+
+
+@pytest.mark.asyncio
+async def test_search_text_reports_answered_from_on_its_empty_page(tmp_path: Path) -> None:
+    main = make_repo(tmp_path / "main")
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), FakeTextSearchRepository(), Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": str(main), "query": "***"}))
+
+    assert payload["items"] == []
+    assert payload["meta"]["answered_from"].startswith(str(main.resolve()))
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["search_code", "search_semantic", "search_hybrid", "search_text", *sorted(_GRAPH_TOOL_ARGS)],
+)
+@pytest.mark.asyncio
+async def test_entity_tools_always_report_answered_from(tool_name: str, tmp_path: Path, monkeypatch) -> None:
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), _CountingGraphRepository())
+    register_search_tools(mcp, FakeManager(), _FreshnessSearchRepository(), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+    args = {"directory": str(tmp_path), **_GRAPH_TOOL_ARGS.get(tool_name, {"query": "worker"})}
+
+    payload = _payload(await mcp.call_tool(tool_name, args))
+
+    assert payload["meta"]["answered_from"] == str(tmp_path.resolve())
+
+
+def test_freshness_does_not_judge_directory_nodes(tmp_path: Path) -> None:
+    """A directory has no content to hash; calling it "unknown" read as doubt about the index."""
+    digest = _write_file(tmp_path, "pkg/a.py", "def run(): ...\n")
+    checker = FreshnessChecker(tmp_path, {"pkg/a.py": digest})
+
+    items: list[dict[str, object]] = [
+        {"id": "dir:pkg", "node_type": "directory", "file_path": "pkg"},
+        {"id": "pkg/a.py::run", "node_type": "function", "file_path": "pkg/a.py"},
+    ]
+    checker.annotate_items(items)
+
+    assert items[0] == {"id": "dir:pkg", "node_type": "directory", "file_path": "pkg"}
+    assert checker.meta() == {"checked": 1, "stale": [], "missing": [], "unknown": []}

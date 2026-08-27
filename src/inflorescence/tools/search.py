@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
@@ -11,7 +12,7 @@ from inflorescence.config import Settings
 from inflorescence.db.repository import GraphRepository
 from inflorescence.project_manager import ProjectManager
 from inflorescence.rag.embeddings import EmbeddingClient
-from inflorescence.tools.freshness import build_checker, unchecked_empty_page
+from inflorescence.tools.freshness import build_checker, describe_origin, unchecked_empty_page
 from inflorescence.tools.gates import ensure_indexed, normalize_node_types
 from inflorescence.tools.path_filters import PathFilterConfig, filter_records_by_path, is_test_path
 from inflorescence.tools.responses import (
@@ -261,6 +262,8 @@ def register_search_tools(
         closely, so the code probably is not there; confirm absence with ``search_text`` on
         exact terms. (This only labels; ``min_score`` is the separate hard cut-off.)
 
+        ``meta.answered_from`` names the tree this answer came from: path, branch @ short
+        commit, and — for a git worktree — the checkout it belongs to.
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
@@ -350,6 +353,8 @@ def register_search_tools(
         closely, so the code probably is not there; confirm absence with ``search_text`` on
         exact terms. (This only labels; ``min_score`` is the separate hard cut-off.)
 
+        ``meta.answered_from`` names the tree this answer came from: path, branch @ short
+        commit, and — for a git worktree — the checkout it belongs to.
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
@@ -440,6 +445,8 @@ def register_search_tools(
         closely, so the code probably is not there; confirm absence with ``search_text`` on
         exact terms. (This only labels; ``min_score`` is the separate hard cut-off.)
 
+        ``meta.answered_from`` names the tree this answer came from: path, branch @ short
+        commit, and — for a git worktree — the checkout it belongs to.
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
@@ -560,6 +567,8 @@ def register_search_tools(
         is a heuristic over the path only — it never reads the file — so treat it as a hint,
         not a verdict. ``include_tests=false`` drops those hits before pagination.
 
+        ``meta.answered_from`` names the tree this answer came from: path, branch @ short
+        commit, and — for a git worktree — the checkout it belongs to.
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
@@ -591,8 +600,9 @@ def register_search_tools(
         }
         text_query = _sanitize_text_query(query)
         if not text_query:
-            # Nothing to search, so nothing to hash — but the block still ships, since a
-            # caller may only read the item flags as "fresh" if it is always present.
+            # Nothing to search, so nothing to hash — but the blocks still ship, since a
+            # caller may only read the item flags as "fresh" if they are always present.
+            meta["answered_from"] = describe_origin(Path(directory).resolve())
             meta["index_freshness"] = unchecked_empty_page(directory)
             return _page_hits([], bounded_limit, bounded_offset, meta)
         try:

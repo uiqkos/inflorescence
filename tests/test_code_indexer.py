@@ -132,6 +132,81 @@ def test_resolve_edges_resolves_js_relative_import() -> None:
     assert resolved == [Edge(source="src/app.js", target="src/utils.js", edge_type=EdgeType.IMPORTS)]
 
 
+def test_resolve_edges_resolves_js_parent_relative_import() -> None:
+    """The field report's worst failure: `../` gave no IMPORTS edge at all.
+
+    ``PurePosixPath`` keeps ``..`` as a component, so the joined specifier never matched
+    the module index and "who imports MathBlock" answered a confident "nobody" while a
+    screen one directory up imported it.
+    """
+    nodes = [
+        CodeNode(id="src/screens/TheoryScreen.tsx", name="TheoryScreen", node_type=NodeType.MODULE, file_path="src/screens/TheoryScreen.tsx", line_start=1, line_end=1),
+        CodeNode(id="src/components/Math/MathBlock.tsx", name="MathBlock", node_type=NodeType.MODULE, file_path="src/components/Math/MathBlock.tsx", line_start=1, line_end=1),
+    ]
+    edges = [Edge(source="src/screens/TheoryScreen.tsx", target="../components/Math/MathBlock", edge_type=EdgeType.IMPORTS)]
+
+    resolved = resolve_edges(nodes, edges).edges
+
+    assert resolved == [Edge(source="src/screens/TheoryScreen.tsx", target="src/components/Math/MathBlock.tsx", edge_type=EdgeType.IMPORTS)]
+
+
+def test_resolve_edges_resolves_js_grandparent_relative_import_to_index_file() -> None:
+    nodes = [
+        CodeNode(id="src/a/b/deep.ts", name="deep", node_type=NodeType.MODULE, file_path="src/a/b/deep.ts", line_start=1, line_end=1),
+        CodeNode(id="src/shared/index.ts", name="index", node_type=NodeType.MODULE, file_path="src/shared/index.ts", line_start=1, line_end=1),
+    ]
+    edges = [Edge(source="src/a/b/deep.ts", target="../../shared", edge_type=EdgeType.IMPORTS)]
+
+    resolved = resolve_edges(nodes, edges).edges
+
+    assert resolved == [Edge(source="src/a/b/deep.ts", target="src/shared/index.ts", edge_type=EdgeType.IMPORTS)]
+
+
+def test_resolve_edges_leaves_import_climbing_above_the_root_unresolved() -> None:
+    """Normalization must not invent a match for a specifier that leaves the project."""
+    nodes = [
+        CodeNode(id="app.ts", name="app", node_type=NodeType.MODULE, file_path="app.ts", line_start=1, line_end=1),
+    ]
+    edges = [Edge(source="app.ts", target="../outside/thing", edge_type=EdgeType.IMPORTS)]
+
+    resolved = resolve_edges(nodes, edges).edges
+
+    assert resolved == [Edge(source="app.ts", target="../outside/thing", edge_type=EdgeType.IMPORTS)]
+
+
+def test_resolve_edges_resolves_side_effect_stylesheet_import_to_the_document_node() -> None:
+    """`import './index.css'` is an edge to an indexed file, not an external dependency."""
+    nodes = [
+        CodeNode(id="src/main.tsx", name="main", node_type=NodeType.MODULE, file_path="src/main.tsx", line_start=1, line_end=1),
+        CodeNode(id="src/index.css", name="index.css", node_type=NodeType.DOCUMENT, file_path="src/index.css", line_start=1, line_end=40),
+        CodeNode(id="src/theme/tokens.css", name="tokens.css", node_type=NodeType.DOCUMENT, file_path="src/theme/tokens.css", line_start=1, line_end=9),
+    ]
+    edges = [
+        Edge(source="src/main.tsx", target="./index.css", edge_type=EdgeType.IMPORTS),
+        Edge(source="src/main.tsx", target="./theme/tokens.css", edge_type=EdgeType.IMPORTS),
+    ]
+
+    resolved = resolve_edges(nodes, edges).edges
+
+    assert resolved == [
+        Edge(source="src/main.tsx", target="src/index.css", edge_type=EdgeType.IMPORTS),
+        Edge(source="src/main.tsx", target="src/theme/tokens.css", edge_type=EdgeType.IMPORTS),
+    ]
+
+
+def test_resolve_edges_does_not_let_an_extensionless_specifier_hit_a_document() -> None:
+    """`./config` resolving to config.json would be a bundler guess this resolver cannot make."""
+    nodes = [
+        CodeNode(id="src/app.ts", name="app", node_type=NodeType.MODULE, file_path="src/app.ts", line_start=1, line_end=1),
+        CodeNode(id="src/config.json", name="config.json", node_type=NodeType.DOCUMENT, file_path="src/config.json", line_start=1, line_end=3),
+    ]
+    edges = [Edge(source="src/app.ts", target="./config", edge_type=EdgeType.IMPORTS)]
+
+    resolved = resolve_edges(nodes, edges).edges
+
+    assert resolved == [Edge(source="src/app.ts", target="./config", edge_type=EdgeType.IMPORTS)]
+
+
 def test_resolve_edges_resolves_go_package_import() -> None:
     nodes = [
         CodeNode(id="cmd/main.go", name="main", node_type=NodeType.MODULE, file_path="cmd/main.go", line_start=1, line_end=1),

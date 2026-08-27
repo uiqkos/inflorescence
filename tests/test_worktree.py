@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from inflorescence.worktree import registered_worktree_paths, worktree_main_root
+from inflorescence.worktree import head_description, registered_worktree_paths, worktree_main_root
 
 # A clean-room git: no ~/.gitconfig, no /etc/gitconfig, and an identity supplied per call,
 # so `commit` works on a machine where the developer has never configured git.
@@ -201,3 +201,62 @@ def test_registered_worktree_paths_skips_broken_entries(main_repo: Path, tmp_pat
 
 def test_registered_worktree_paths_on_non_repository(tmp_path: Path) -> None:
     assert registered_worktree_paths(tmp_path) == set()
+
+
+# ---------------------------------------------------------------------------
+# head_description: which commit an answer was read from. Same rule as the rest of
+# this module — every failure mode returns None, because a wrong provenance line is
+# worse than an absent one.
+# ---------------------------------------------------------------------------
+
+
+def test_head_description_names_branch_and_short_commit(main_repo: Path) -> None:
+    head = git("-C", str(main_repo), "rev-parse", "HEAD").strip()
+
+    assert head_description(main_repo) == f"main @ {head[:7]}"
+
+
+def test_head_description_reads_a_worktrees_own_head_not_the_main_checkouts(
+    main_repo: Path, tmp_path: Path
+) -> None:
+    wt = tmp_path / "wt"
+    git("-C", str(main_repo), "worktree", "add", "-b", "feature/x", str(wt))
+    head = git("-C", str(wt), "rev-parse", "HEAD").strip()
+
+    assert head_description(wt) == f"feature/x @ {head[:7]}"
+    assert head_description(main_repo).startswith("main @ ")
+
+
+def test_head_description_resolves_a_packed_ref(main_repo: Path) -> None:
+    """`git gc` moves loose refs into packed-refs; the branch must still resolve."""
+    head = git("-C", str(main_repo), "rev-parse", "HEAD").strip()
+    git("-C", str(main_repo), "pack-refs", "--all")
+    assert not (main_repo / ".git" / "refs" / "heads" / "main").exists()
+
+    assert head_description(main_repo) == f"main @ {head[:7]}"
+
+
+def test_head_description_marks_a_detached_head(main_repo: Path) -> None:
+    head = git("-C", str(main_repo), "rev-parse", "HEAD").strip()
+    git("-C", str(main_repo), "checkout", "--detach")
+
+    assert head_description(main_repo) == f"detached @ {head[:7]}"
+
+
+def test_head_description_is_none_outside_git(tmp_path: Path) -> None:
+    assert head_description(tmp_path) is None
+
+
+def test_head_description_is_none_on_damaged_metadata(main_repo: Path) -> None:
+    (main_repo / ".git" / "HEAD").write_text("\n", encoding="utf-8")
+
+    assert head_description(main_repo) is None
+
+
+def test_head_description_falls_back_to_the_branch_when_the_ref_cannot_be_read(
+    main_repo: Path,
+) -> None:
+    """An unborn branch (or a ref layout this parser does not know) still names the branch."""
+    git("-C", str(main_repo), "checkout", "--orphan", "orphan")
+
+    assert head_description(main_repo) == "orphan"

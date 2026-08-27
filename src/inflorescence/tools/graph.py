@@ -162,6 +162,8 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         A path pattern with no glob character (``"docs/"``, ``"docs"``) covers both that
         exact path and everything under it; ``meta.path_filters`` echoes the expanded form.
 
+        ``meta.answered_from`` names the tree this answer came from: path, branch @ short
+        commit, and — for a git worktree — the checkout it belongs to.
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected items carry ``"stale": true`` / ``"file_missing": true`` —
         so an unflagged item was checked and still matches the index. This is file-level:
@@ -220,6 +222,8 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         interface, enum, struct, trait, document. Item summaries are truncated to a short
         preview (the root keeps its full summary).
 
+        ``meta.answered_from`` names the tree this answer came from: path, branch @ short
+        commit, and — for a git worktree — the checkout it belongs to.
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page *including the root*, and affected items carry ``"stale": true`` /
         ``"file_missing": true`` — so an unflagged item was checked and still matches the
@@ -294,6 +298,8 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         ``offset`` paginates each section, so walking ``next_offset`` terminates instead of
         looping.
 
+        ``meta.answered_from`` names the tree this answer came from: path, branch @ short
+        commit, and — for a git worktree — the checkout it belongs to.
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers every file
         named here — entity, parent and all sections — and affected refs carry
         ``"stale": true`` / ``"file_missing": true``, so an unflagged one was checked and
@@ -377,6 +383,8 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         (``"docs/"``, ``"docs"``) covers both that exact path and everything under it;
         ``meta.path_filters`` echoes the expanded form.
 
+        ``meta.answered_from`` names the tree this answer came from: path, branch @ short
+        commit, and — for a git worktree — the checkout it belongs to.
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected entities carry ``"stale": true`` / ``"file_missing": true``
         — so an unflagged one was checked and still matches the index. This is file-level:
@@ -475,6 +483,8 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         both that exact path and everything under it; ``meta.path_filters`` echoes the
         expanded form.
 
+        ``meta.answered_from`` names the tree this answer came from: path, branch @ short
+        commit, and — for a git worktree — the checkout it belongs to.
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected items carry ``"stale": true`` / ``"file_missing": true`` —
         so an unflagged item was checked and still matches the index. This is file-level:

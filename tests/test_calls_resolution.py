@@ -350,6 +350,35 @@ def test_js_top_level_calls_attribute_to_module_node(tmp_path: Path) -> None:
     assert "setupTests" in result.unresolved_calls["src/app.ts"]
 
 
+def test_js_parent_relative_import_carries_calls_and_imports(tmp_path: Path) -> None:
+    """A `../` import used to resolve to nothing, which cost more than the missing edge.
+
+    ``_try_resolve_js_relative_import`` left ``..`` uncollapsed, so the import edge was
+    dropped *and* every call through that binding was filed as an external dependency —
+    the graph asserted that a function of this very project lived in node_modules.
+    """
+    (tmp_path / "src/screens").mkdir(parents=True)
+    (tmp_path / "src/api").mkdir(parents=True)
+    screen = tmp_path / "src/screens/SessionScreen.tsx"
+    screen.write_text(
+        "import { fetchUnits } from '../api/units'\n"
+        "export function load() { return fetchUnits() }\n"
+    )
+    api = tmp_path / "src/api/units.ts"
+    api.write_text("export function fetchUnits() { return 1 }\n")
+
+    nodes, edges, facts = _parse_project(JavaScriptParser(), tmp_path, [screen, api])
+    result = resolve_edges(nodes, edges, facts)
+
+    assert _calls(result)[("src/screens/SessionScreen.tsx::load", "src/api/units.ts::fetchUnits")] == "import"
+    assert Edge(
+        source="src/screens/SessionScreen.tsx",
+        target="src/api/units.ts",
+        edge_type=EdgeType.IMPORTS,
+    ) in result.edges
+    assert "src/screens/SessionScreen.tsx::load" not in result.external_calls
+
+
 def test_js_cjs_require_bindings(tmp_path: Path) -> None:
     lib = tmp_path / "lib"
     lib.mkdir()

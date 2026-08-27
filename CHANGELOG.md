@@ -21,8 +21,15 @@ First public release.
   markup (`.html`, `.htm`) and configuration (`.json`, `.jsonc`, `.yaml`, `.yml`, `.toml`,
   `.ini`, `.cfg`, `.conf`). One node per file, no structure parsing, body split into
   overlapping chunks and summarized by a prose-specific prompt — so a CSS media query or a
-  build-config key is findable by its own text. Dependency lock files are never indexed;
-  oversized files are reported as `skipped_large_files`. Turn off with `INDEX_DOCUMENTS=false`.
+  build-config key is findable by its own text. Code that imports one by path
+  (`import './index.css'`) gives it an incoming `IMPORTS` edge. Dependency lock files are
+  never indexed; oversized files are reported as `skipped_large_files`. Turn off with
+  `INDEX_DOCUMENTS=false`.
+- **Answers that say where they came from** — every response carrying entities reports
+  `meta.answered_from` (tree path, `branch @ commit`, and the checkout a git worktree belongs
+  to) and `meta.index_freshness`, which re-hashes that page's files and flags any that changed
+  or vanished since indexing. Vector hits below `SEMANTIC_WEAK_THRESHOLD` are marked
+  `"weak": true`, since a top-k search cannot prove absence.
 - **Dual RAG plus BM25** — code chunks and LLM summaries embedded into separate HNSW indexes
   and fused per entity; full-text indexes over names, signatures, summaries and raw code.
 - **12 MCP tools** — search by meaning, by text, by name and by code similarity; entity

@@ -1,4 +1,4 @@
-"""Detect a linked git worktree and locate the main repository it belongs to.
+"""Read git's on-disk layout: which worktree a checkout is, and what it is checked out at.
 
 A worktree is indexed as its own project (its checkout is a different tree), but almost all
 of its content is shared with the main checkout, so the main project's index is the natural
@@ -14,9 +14,14 @@ The layout being read (git ≥ 2.5)::
     main/.git/worktrees/<id>/commondir  # path back to main/.git, usually "../.."
     wt/.git                          # a *file*: "gitdir: /abs/main/.git/worktrees/<id>"
 
+The same archaeology answers a second question — ``head_description``: which branch and
+commit a directory is on. Tools stamp it onto every answer as ``meta.answered_from``, so a
+page of entities says which of a repository's several checkouts it describes.
+
 Every function here is total: unreadable, truncated, or hand-edited metadata yields "not a
-worktree" rather than an exception. A wrong answer here would attach one project's cache to
-an unrelated tree, so ambiguity always resolves to "no donor".
+worktree" (or no provenance line) rather than an exception. A wrong answer here would
+attach one project's cache to an unrelated tree, so ambiguity always resolves to "no
+donor".
 """
 
 from __future__ import annotations
@@ -186,3 +191,90 @@ def registered_worktree_paths(main_root: Path) -> set[Path]:
             continue
         roots.add(gitdir_file.parent)
     return roots
+
+
+def _git_dir(root: Path) -> Path | None:
+    """The git directory governing *root*: the ``.git`` folder, or what its ``.git`` file names.
+
+    For a linked worktree this is ``main/.git/worktrees/<id>`` — the per-worktree directory,
+    which holds that worktree's own ``HEAD``. That is the point: a worktree's HEAD is the
+    only thing that says which branch the answer came from.
+    """
+    dotgit = _nearest_dotgit(root)
+    if dotgit is None:
+        return None
+    try:
+        if dotgit.is_dir():
+            return dotgit
+    except OSError:
+        return None
+    pointer = _first_line(dotgit)
+    if pointer is None or not pointer.startswith(_GITDIR_PREFIX):
+        return None
+    raw_target = pointer[len(_GITDIR_PREFIX):].strip()
+    if not raw_target:
+        return None
+    target = _resolve_relative_to(dotgit.parent, raw_target)
+    try:
+        return target if target is not None and target.is_dir() else None
+    except OSError:
+        return None
+
+
+def _ref_sha(git_dir: Path, ref: str) -> str | None:
+    """Resolve ``refs/heads/x`` to its object id: loose ref first, then ``packed-refs``.
+
+    Refs live in the *common* directory, which for a linked worktree is not its own git
+    directory, so both are searched. Only the two on-disk forms git guarantees are read —
+    a ref reachable through neither (a reftable repository, say) yields ``None``, and the
+    caller then reports the branch without a commit rather than nothing at all.
+    """
+    raw_common = _first_line(git_dir / "commondir")
+    common = _resolve_relative_to(git_dir, raw_common) if raw_common else None
+    for directory in (git_dir, common):
+        if directory is None:
+            continue
+        sha = _first_line(directory / ref)
+        if sha:
+            return sha
+        packed = directory / "packed-refs"
+        try:
+            text = packed.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped[0] in "#^":
+                continue
+            candidate_sha, _, candidate_ref = stripped.partition(" ")
+            if candidate_ref.strip() == ref:
+                return candidate_sha
+    return None
+
+
+def head_description(root: Path) -> str | None:
+    """Name the commit *root* is checked out at: ``"main @ a1b2c3d"``, or ``None``.
+
+    Detached HEAD reads ``"detached @ a1b2c3d"``; a branch whose object id cannot be read
+    reads as the branch alone. Every failure — no git, unreadable metadata, a layout this
+    module does not know — returns ``None``, because a wrong provenance line is worse than
+    an absent one.
+    """
+    try:
+        start = Path(root).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    git_dir = _git_dir(start)
+    if git_dir is None:
+        return None
+    head = _first_line(git_dir / "HEAD")
+    if head is None:
+        return None
+    if not head.startswith("ref:"):
+        return f"detached @ {head[:7]}" if len(head) >= 7 else None
+    ref = head[len("ref:"):].strip()
+    if not ref:
+        return None
+    branch = ref.removeprefix("refs/heads/")
+    sha = _ref_sha(git_dir, ref)
+    return f"{branch} @ {sha[:7]}" if sha else branch

@@ -15,6 +15,10 @@ reports what it found:
 * ``unknown`` — it is unreadable, or nothing was stored for it (never a module/document
   node, so no checksum exists).
 
+Directory nodes are exempt: their ``file_path`` names a folder, which has no content to
+hash, and judging one only ever produced a meta-level ``unknown`` that read as doubt about
+the index.
+
 The report is deliberately two-part. ``meta.index_freshness`` is present on *every* such
 response, empty lists and all, and only that constancy makes the per-item flags readable
 as "everything unflagged is fresh" rather than "this tool may or may not have checked".
@@ -37,9 +41,16 @@ queried directory is *not* itself a worktree and the count is non-zero, and phra
 sentence rather than a number: a bare count beside ``checked``/``stale`` reads as a defect
 count for *this* answer, which is the opposite of what it means.
 
+Alongside the freshness block, every such response carries ``meta.answered_from`` — the
+tree the query was answered from, named by path, branch and short commit (see
+:func:`describe_origin`). Freshness says whether the answer is current; that line says
+*current with what*, which is the question a repository with several worktrees on disk
+actually raises.
+
 Cost: one MD5 per *distinct* path on the page (memoized here), so a 50-item page of one
 module reads one file. Nothing outside the page is scanned. The worktree count adds one
-directory listing of ``.git/worktrees`` per tool call.
+directory listing of ``.git/worktrees`` per tool call, and the origin line a handful of
+small reads under ``.git``.
 """
 
 from __future__ import annotations
@@ -49,8 +60,8 @@ from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
-from inflorescence.code_indexer.models import FileChecksum
-from inflorescence.worktree import registered_worktree_paths, worktree_main_root
+from inflorescence.code_indexer.models import FileChecksum, NodeType
+from inflorescence.worktree import head_description, registered_worktree_paths, worktree_main_root
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +73,9 @@ UNKNOWN = "unknown"
 # The per-item flag each status raises, if any. ``unknown`` is absent on purpose (see
 # the module docstring): it is a meta-only signal.
 _ITEM_FLAG = {STALE: "stale", MISSING: "file_missing"}
+
+# Directory nodes carry a folder as their ``file_path``; nothing about them is hashable.
+_DIRECTORY_NODE_TYPE = NodeType.DIRECTORY.value
 
 
 def _live_worktrees_notice(count: int) -> str:
@@ -75,6 +89,35 @@ def _live_worktrees_notice(count: int) -> str:
     """
     noun = "worktree is" if count == 1 else "worktrees are"
     return f"{count} {noun} not in this index; pass a worktree directory to query its branch state"
+
+
+def describe_origin(root: Path) -> str:
+    """Name the tree this answer came from: path, branch, commit, and worktree lineage.
+
+    Reported as ``meta.answered_from`` on every response that carries entities, because
+    "which tree am I even looking at" turned out to be a live question in the field: with
+    several worktrees of one repository on disk, two agents an hour apart disagreed about
+    whether their branch work was in the graph, and nothing in the response could settle
+    it. The path alone answers most of it; the branch and short commit say *when*, so a
+    freshness block that reads clean can be read against a specific state of the code
+    rather than against "the repository".
+
+    This is the tree the query was answered *from*, not the commit the index was built at
+    — those differ exactly when files changed since indexing, which is what
+    ``index_freshness`` is for. Outside git, or with metadata this process cannot read,
+    the line degrades to the path.
+    """
+    line = str(root)
+    head = head_description(root)
+    if head:
+        line = f"{line} ({head})"
+    try:
+        main_root = worktree_main_root(root)
+    except OSError:
+        main_root = None
+    if main_root is not None:
+        line = f"{line}, a git worktree of {main_root}"
+    return line
 
 
 def count_live_worktrees(root: Path) -> int:
@@ -101,10 +144,17 @@ class FreshnessChecker:
     the whole project — then asked about whatever paths that call happens to return.
     """
 
-    def __init__(self, root: Path, stored: Mapping[str, str], live_worktrees: int = 0) -> None:
+    def __init__(
+        self,
+        root: Path,
+        stored: Mapping[str, str],
+        live_worktrees: int = 0,
+        origin: str | None = None,
+    ) -> None:
         self._root = root
         self._stored = dict(stored)
         self._live_worktrees = live_worktrees
+        self._origin = origin
         # path -> status; doubles as the "already read this file" memo and as the record
         # of which paths this page actually touched (`checked` counts its keys).
         self._statuses: dict[str, str] = {}
@@ -151,6 +201,12 @@ class FreshnessChecker:
         file_path = ref.get("file_path")
         if not file_path:
             return ref
+        if ref.get("node_type") == _DIRECTORY_NODE_TYPE:
+            # A directory node's file_path names a folder, and a folder has no content to
+            # hash. Judging it produced a page-wide `unknown: ["src/components"]` that read
+            # as "this index is unsure about your code" when it only meant "that is not a
+            # file" (field report, 27.08.2026).
+            return ref
         flag = _ITEM_FLAG.get(self.status(str(file_path)))
         if flag:
             ref[flag] = True
@@ -194,7 +250,10 @@ class FreshnessChecker:
         return block
 
     def stamp(self, payload: MutableMapping[str, Any]) -> MutableMapping[str, Any]:
-        """Annotate ``payload["items"]`` (if any) and write ``meta.index_freshness``.
+        """Annotate ``payload["items"]`` (if any) and write the meta honesty block.
+
+        Writes ``meta.answered_from`` (which tree, which commit) and
+        ``meta.index_freshness`` (whether that tree still matches the index).
 
         Always call this *last*: the meta block reports only the paths already checked,
         so anything annotated outside ``items`` (a structure root, a context's parent)
@@ -202,6 +261,8 @@ class FreshnessChecker:
         """
         self.annotate_items(payload.get("items") or [])
         meta = payload.setdefault("meta", {})
+        if self._origin:
+            meta["answered_from"] = self._origin
         meta["index_freshness"] = self.meta()
         return payload
 
@@ -229,4 +290,9 @@ async def build_checker(repo: Any, project: str, directory: str) -> FreshnessChe
     """
     stored = await repo.get_checksums(project)
     root = Path(directory).resolve()
-    return FreshnessChecker(root, stored, live_worktrees=count_live_worktrees(root))
+    return FreshnessChecker(
+        root,
+        stored,
+        live_worktrees=count_live_worktrees(root),
+        origin=describe_origin(root),
+    )

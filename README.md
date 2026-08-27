@@ -159,6 +159,9 @@ nothing calls a paragraph, and a CSS rule is not a function — so no structure 
 above them. Their content reaches search as overlapping chunks of the file body, which is what
 makes `@media (prefers-reduced-motion)` in the middle of a stylesheet findable at all, and
 their summary is written by a prompt that asks what the file answers rather than what it calls.
+They own no outgoing edges, but code that imports one by path — `import './index.css'`,
+`import cfg from './config.json'` — points an `IMPORTS` edge at it, so "who pulls in this
+stylesheet" is a normal `get_related_entities(direction="incoming")` question.
 Filter them in or out like any other type — `search_semantic(..., node_types=["document"])`, or
 `node_types=["function", "method"]` to exclude them.
 
@@ -299,6 +302,13 @@ The three vector searches label how close they actually got: a hit below
 `SEMANTIC_WEAK_THRESHOLD` carries `"weak": true`, and a page where every hit is weak also sets
 `meta.weak_results` — the honest form of "nothing here looks like what you asked for", since a
 top-k search cannot prove absence. Confirm with `search_text` on exact terms.
+
+Every response that carries entities also says where it came from and how old it is:
+`meta.answered_from` names the tree — path, `branch @ short commit`, and, for a git worktree,
+the checkout it belongs to — and `meta.index_freshness` re-hashes that page's files, flagging
+an item whose file changed since indexing (`"stale": true`) or vanished (`"file_missing":
+true`). With several worktrees of one repository on disk, those two lines are what tell you
+whether the answer describes the branch you are working on.
 
 **Direct query**
 - **`cypher_query`** — run paginated, read-only Cypher against Memgraph (each `MATCH` is project-scoped)

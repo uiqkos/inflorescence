@@ -21,6 +21,7 @@ IMPORTS/INHERITS/IMPLEMENTS resolution is unchanged from the legacy behavior.
 from __future__ import annotations
 
 import builtins
+import posixpath
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -85,9 +86,22 @@ def _detect_language(file_path: str) -> str:
 
 
 def _build_module_index(nodes: Sequence[CodeNode]) -> dict[str, str]:
-    """Build a mapping from module-style names to node IDs for import resolution."""
+    """Build a mapping from module-style names to node IDs for import resolution.
+
+    Documents (``.css``, ``.json``, ``.html`` …) are in here too, but under their exact
+    path only. They have no module name to speak of — nothing dots into a stylesheet —
+    yet a bundler-era JS file imports them by path all the time, most often for the side
+    effect alone (``import './index.css'``). Registering them makes that a real edge to
+    the indexed file instead of an ``:External`` node named after a path inside this very
+    project. A document is never given the extensionless key a JS module gets: ``./config``
+    must not silently resolve to ``config.json``, which is a bundler-configuration
+    question this resolver has no way to answer.
+    """
     module_to_id: dict[str, str] = {}
     for n in nodes:
+        if n.node_type.value == "document":
+            module_to_id[n.file_path] = n.id
+            continue
         if n.node_type.value != "module":
             continue
         lang = _detect_language(n.file_path)
@@ -176,11 +190,26 @@ def _try_resolve_js_relative_import(
     target: str,
     module_to_id: dict[str, str],
 ) -> str | None:
-    """Attempt to resolve a JS/TS relative import to a module ID."""
+    """Attempt to resolve a JS/TS relative import to a module ID.
+
+    The join must be normalized **lexically**: ``PurePosixPath`` deliberately keeps ``..``
+    as a path component (it cannot collapse one without knowing about symlinks), so
+    ``components/Math`` + ``../../screens/TheoryScreen`` used to stay
+    ``components/Math/../../screens/TheoryScreen`` and matched nothing. Every ``../``
+    import in the project therefore produced no ``IMPORTS`` edge at all, and
+    "who imports X" answered a confident, wrong "nobody" for anything imported from
+    another directory (field report, 27.08.2026). ``posixpath.normpath`` collapses the
+    components the way a bundler resolves a specifier; a target that climbs above the
+    project root simply keeps its leading ``..`` and matches nothing, which is correct —
+    it is outside the index.
+
+    A specifier that already carries an extension (``./styles.css``, ``./data.json``) is
+    resolved by the first lookup, because documents are registered in the module index
+    under their exact path: a side-effect ``import './index.css'`` is a real edge to a
+    real indexed file, not an external dependency.
+    """
     source_dir = str(PurePosixPath(source_file).parent)
-    resolved_path = str(PurePosixPath(source_dir) / target)
-    # Normalize (remove ./ and resolve ..)
-    resolved_path = str(PurePosixPath(resolved_path))
+    resolved_path = posixpath.normpath(posixpath.join(source_dir, target))
     if resolved_path in module_to_id:
         return module_to_id[resolved_path]
     # Try with extensions
