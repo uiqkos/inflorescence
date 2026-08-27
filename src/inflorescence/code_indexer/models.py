@@ -26,10 +26,11 @@ class NodeType(StrEnum):
     ENUM = "enum"
     STRUCT = "struct"
     TRAIT = "trait"
-    # A prose file (README, docs/*.md, notes.txt) indexed whole: it has no symbols to
-    # contain and no calls to resolve, so it is a leaf of the containment tree and its
-    # body is chunked with overlap instead of being parsed. Kept apart from MODULE so a
-    # search for modules doesn't return documentation and vice versa.
+    # A non-code file indexed whole: prose (README, docs/*.md, notes.txt) as well as a
+    # stylesheet, an HTML page or a JSON/YAML/TOML config. It has no symbols to contain
+    # and no calls to resolve, so it is a leaf of the containment tree and its body is
+    # chunked with overlap instead of being parsed. Kept apart from MODULE so a search
+    # for modules doesn't return documentation and vice versa.
     DOCUMENT = "document"
 
 
@@ -247,7 +248,8 @@ class IndexerConfig(BaseModel):
     generated_patterns: list[str] = Field(default_factory=lambda: list(GENERATED_FILE_PATTERNS))
     use_llm_summaries: bool = True
     use_llm_fallback_parser: bool = True
-    # Prose documents (.md/.txt/...) are scanned, stored as one node per file, and chunked
+    # Documents — prose (.md/.txt/...), styles (.css/.scss/...), markup (.html) and config
+    # (.json/.yaml/.toml/.ini/...) — are scanned, stored as one node per file, and chunked
     # with overlap. Turning this off removes their extensions from the scan entirely, so
     # nothing about them is read, summarized, or embedded.
     index_documents: bool = True

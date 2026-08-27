@@ -152,13 +152,15 @@ Solid edges are containment — the spine you traverse to browse the tree. Dashe
 real relationships between entities. Every node also carries its signature, docstring, source
 range and an embedded summary.
 
-**`Document`** nodes are prose files — `README.md`, `docs/**.md`, `notes.txt`. They sit in the
-containment tree beside modules, but they are leaves: a heading is not a symbol and nothing
-calls a paragraph, so no structure is invented above them. Their content reaches search as
-overlapping chunks of the file body, and their summary is written by a prompt that asks what
-the document answers rather than what it calls. Filter them in or out like any other type —
-`search_semantic(..., node_types=["document"])`, or `node_types=["function", "method"]` to
-exclude them.
+**`Document`** nodes are whole non-code files — `README.md`, `docs/**.md`, `notes.txt`, but
+also `index.css`, `index.html`, `tsconfig.json`, `docker-compose.yml`, `pyproject.toml`. They
+sit in the containment tree beside modules, but they are leaves: a heading is not a symbol,
+nothing calls a paragraph, and a CSS rule is not a function — so no structure is invented
+above them. Their content reaches search as overlapping chunks of the file body, which is what
+makes `@media (prefers-reduced-motion)` in the middle of a stylesheet findable at all, and
+their summary is written by a prompt that asks what the file answers rather than what it calls.
+Filter them in or out like any other type — `search_semantic(..., node_types=["document"])`, or
+`node_types=["function", "method"]` to exclude them.
 
 **`External`** nodes are the exception: a package the project imports or a base class it
 inherits from, which lives outside the indexed tree. They are deliberately *not* labelled
@@ -282,7 +284,9 @@ inflorescence --debug serve        # verbose logs (handler events, update lifecy
 - **`list_entities`** — list indexed entities, with pagination and glob path filters
 - **`get_entity_structure`** — browse the containment hierarchy under a node, file, or the project root
 - **`get_entity_context`** — an entity's parent, children, and incoming/outgoing relations
-- **`get_related_entities`** — entities related to a node by a given relationship
+- **`get_related_entities`** — entities related to a node by a given relationship, addressed
+  either by `node_id` or by a `name` substring the tool resolves itself (so "who calls X" is
+  one call; an ambiguous name fails with the candidate list instead of guessing)
 - **`search_entities`** — find entities by name substring
 
 **Search**
@@ -290,6 +294,11 @@ inflorescence --debug serve        # verbose logs (handler events, update lifecy
 - **`search_semantic`** — vector search by *meaning* over summaries (find code by what it does)
 - **`search_hybrid`** — combined code + summary vector search, deduplicated per entity
 - **`search_text`** — exact keyword (BM25) search over names, signatures, summaries, and raw code
+
+The three vector searches label how close they actually got: a hit below
+`SEMANTIC_WEAK_THRESHOLD` carries `"weak": true`, and a page where every hit is weak also sets
+`meta.weak_results` — the honest form of "nothing here looks like what you asked for", since a
+top-k search cannot prove absence. Confirm with `search_text` on exact terms.
 
 **Direct query**
 - **`cypher_query`** — run paginated, read-only Cypher against Memgraph (each `MATCH` is project-scoped)
@@ -303,6 +312,13 @@ the change, then reconciles the graph — new functions appear, deleted ones are
 signatures update, and cross-file edges are re-resolved. Summaries and embeddings for **unchanged**
 nodes are reused, so a one-file edit re-summarizes only that file's path to the root, not the whole
 project.
+
+Unchanged content is not re-*written* either. The whole project is re-parsed and re-resolved
+(a one-line edit can change what another file is recorded as calling), but a chunk or a
+summary vector the database already holds is left exactly where it is instead of being
+re-stored with an identical value — each of those writes costs a round trip and a
+vector-index update. The `chunks` and `summaries` an update reports are therefore what it
+**wrote**, not how much the project contains; `db` in the same result carries the totals.
 
 ```mermaid
 sequenceDiagram
@@ -396,8 +412,10 @@ All settings are environment variables (or a `.env` file). The ones you are like
 | `LLM_MODEL` | `google/gemini-2.5-flash-lite` | Model for summaries and LLM parsing |
 | `CODE_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Code-chunk embeddings |
 | `SUMMARY_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Summary embeddings |
+| `SEMANTIC_WEAK_THRESHOLD` | `0.5` | Cosine similarity below which a vector hit is labelled `"weak"`. Model-dependent; a label, not a filter (that is the per-query `min_score`) |
 | `USE_LLM_SUMMARIES` | `true` | Set `false` for a graph-only index that sends nothing to an LLM |
-| `INDEX_DOCUMENTS` | `true` | Index prose files (`.md`, `.txt`, …) as whole documents. `false` leaves them out of the scan entirely |
+| `INDEX_DOCUMENTS` | `true` | Index non-code files (prose, styles, markup, config — see [Supported languages](#supported-languages)) as whole documents. `false` leaves them out of the scan entirely |
+| `DOCUMENT_EXTENSIONS` | see [below](#supported-languages) | Which extensions count as a document. Narrow it to index only some of them |
 | `MAX_FILE_SIZE_BYTES` | `262144` | Skip files larger than this |
 | `MAX_INDEX_COST_USD` | `10.0` | Cost cap on a first index **and** on every watcher update. Set empty to remove the cap |
 | `REQUIRE_SEARCH_INDEXES` | `true` | Refuse to index against a Memgraph that cannot host vector indexes, instead of paying for unsearchable embeddings |
@@ -605,7 +623,10 @@ The design, the per-rung precision measurements and the known limits are written
 | JavaScript / TypeScript | tree-sitter |
 | Go | tree-sitter |
 | Rust | tree-sitter |
-| Prose documents | `.md`, `.markdown`, `.mdx`, `.rst`, `.txt`, `.text`, `.adoc`, `.asciidoc`, `.org` — indexed whole, not parsed |
+| Prose | `.md`, `.markdown`, `.mdx`, `.rst`, `.txt`, `.text`, `.adoc`, `.asciidoc`, `.org` — indexed whole, not parsed |
+| Styles | `.css`, `.scss`, `.sass`, `.less`, `.styl` — indexed whole, not parsed |
+| Markup | `.html`, `.htm` — indexed whole, not parsed |
+| Configuration | `.json`, `.jsonc`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf` — indexed whole, not parsed |
 
 Only these extensions are scanned; files in other languages are skipped today. The
 parser layer is pluggable (`ParserRegistry` maps an extension to a parser), so broad
@@ -613,9 +634,23 @@ tree-sitter coverage is a natural next step — see the note below.
 
 Documents are deliberately *not* parsed for structure: each file becomes one `Document`
 node and its body is split into overlapping windows (`DOCUMENT_CHUNK_SIZE` /
-`DOCUMENT_CHUNK_OVERLAP`), which is what keeps a passage in the middle of a long guide
-retrievable. They are summarized and embedded like code, so they cost money like code —
-set `INDEX_DOCUMENTS=false` to leave them out entirely, or narrow `DOCUMENT_EXTENSIONS`.
+`DOCUMENT_CHUNK_OVERLAP`), which is what keeps a passage in the middle of a long guide —
+or a `@media (prefers-reduced-motion)` block in the middle of a stylesheet — retrievable.
+They are summarized and embedded like code, so they cost money like code: `preview=true`
+prices them along with everything else, and adding them to an already-indexed project makes
+the next re-index quote more than the last one did. Set `INDEX_DOCUMENTS=false` to leave
+them out entirely, or narrow `DOCUMENT_EXTENSIONS`.
+
+Three guards keep generated bulk out. Dependency lock files are dropped **by name**,
+whatever the extension list says — `package-lock.json`, `npm-shrinkwrap.json`,
+`pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `deno.lock`, `poetry.lock`, `pdm.lock`,
+`uv.lock`, `Pipfile.lock`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, `go.sum`,
+`mix.lock`, `flake.lock`, `packages.lock.json`. Anything over `MAX_FILE_SIZE_BYTES` is
+reported in `skipped_large_files` rather than summarized. And `.gitignore` plus the default
+excludes already keep `node_modules/`, `dist/`, `build/` and friends out of the scan.
+`.xml` is deliberately absent: in practice it is dominated by machine-written trees (IDE
+settings, JUnit/coverage reports, generated resources) whose tag soup chunks and embeds
+badly, and its hand-written uses belong to toolchains this indexer has no parser for.
 
 ## Development
 

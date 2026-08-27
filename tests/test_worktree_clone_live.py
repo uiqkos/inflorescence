@@ -32,6 +32,7 @@ rather than copied so both files keep testing against the same fakes.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 
@@ -387,3 +388,190 @@ async def test_s12_a_lossy_clone_is_refused_and_the_index_falls_back(
         print(f"\nS12: lossy clone refused; fallback produced {final['nodes']} nodes, llm=0")
     finally:
         await world.close()
+
+
+# ---------------------------------------------------------------------------
+# S13 · the copy runs on several connections, and the edges wait for the nodes
+#
+# The only tests in this file that do not need Memgraph. What they assert is a property of
+# the *client's* orchestration, not of the database — how many statements it keeps in flight,
+# in what order it releases the phases, and what it does with a worker that fails — and a
+# fake connection can observe all three exactly, while a live run can only observe them by
+# timing. The live oracles above still decide whether the resulting graph is correct.
+# ---------------------------------------------------------------------------
+
+
+class _FakeCloneConn:
+    """An in-memory stand-in for Memgraph that records clone-statement overlap.
+
+    Holds one flat ``{label: [ids]}`` store per project, answers the clone's boundary,
+    copy, count and edge-shape queries from it, and records for every copy statement when
+    it started and finished — which is what lets the tests below distinguish "four
+    statements ran" from "four statements ran *at the same time*".
+    """
+
+    def __init__(self, source: dict[str, list[str]], *, delay: float = 0.01) -> None:
+        self.projects: dict[str, dict[str, list[str]]] = {
+            "src": {label: sorted(ids) for label, ids in source.items()},
+            "dst": {},
+        }
+        self._delay = delay
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.copy_calls = 0
+        self.finished_copies = 0
+        self.edge_phase_started_after: int | None = None
+        self.fail_label: str | None = None
+        self.cancelled = 0
+
+    # -- helpers ----------------------------------------------------------
+    _LABEL_RE = re.compile(r"MATCH \(n:([A-Za-z:]+) \{project: \$source\}\)")
+
+    def _label(self, query: str) -> str:
+        match = self._LABEL_RE.search(query)
+        assert match, f"fake conn cannot route this query:\n{query}"
+        return match.group(1)
+
+    def _store(self, project: str) -> dict[str, list[str]]:
+        return self.projects.setdefault(project, {})
+
+    def _code_count(self, project: str) -> int:
+        return sum(
+            len(ids) for label, ids in self._store(project).items() if label.startswith("Code:")
+        )
+
+    # -- connection API ---------------------------------------------------
+    async def execute_query(self, query: str, params=None, max_records=None):
+        params = params or {}
+        if "collect(id) AS ids" in query:
+            ids = self._store(params["source"]).get(self._label(query), [])
+            shards = int(params["shards"])
+            if len(ids) < shards:
+                return [{"total": len(ids), "boundaries": []}]
+            return [{
+                "total": len(ids),
+                "boundaries": [ids[len(ids) * i // shards] for i in range(1, shards)],
+            }]
+        if "CodeChunk {project: $project}" in query and "count" in query:
+            return [{"count": len(self._store(params["project"]).get("CodeChunk", []))}]
+        if "External {project: $project}" in query and "count" in query:
+            return [{"count": len(self._store(params["project"]).get("External", []))}]
+        if "(n:Code {project: $project})" in query and "count" in query:
+            return [{"count": self._code_count(params["project"])}]
+        if "DISTINCT type(r)" in query:  # CLONE_EDGE_SHAPES
+            return []
+        if "RETURN type(r) AS type" in query:  # COUNT_EDGES_BY_TYPE
+            return []
+        if "RETURN a.id AS id" in query:  # CLONE_SOURCE_ID_WINDOW — the edge phase begins here
+            if self.edge_phase_started_after is None:
+                self.edge_phase_started_after = self.finished_copies
+            return []
+        raise AssertionError(f"fake conn cannot route this query:\n{query}")
+
+    async def execute_write_query(self, query: str, params=None):
+        params = params or {}
+        label = self._label(query)
+        self.copy_calls += 1
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            await asyncio.sleep(self._delay)
+            if label == self.fail_label:
+                raise RuntimeError(f"induced failure copying {label}")
+            after, upper = params["after"], params["upper"]
+            window = [
+                node_id for node_id in self._store(params["source"]).get(label, [])
+                if node_id > after and (upper == "" or node_id <= upper)
+            ][: params["limit"]]
+            self._store(params["target"]).setdefault(label, []).extend(window)
+            return [{"written": len(window), "last": window[-1] if window else None}]
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        finally:
+            self.in_flight -= 1
+            self.finished_copies += 1
+
+    async def execute_write(self, query: str, params=None):
+        return None
+
+
+def _fake_source(labels: dict[str, int]) -> dict[str, list[str]]:
+    return {
+        label: [f"{label.lower().replace(':', '-')}:{i:05d}" for i in range(count)]
+        for label, count in labels.items()
+    }
+
+
+@pytest.mark.asyncio
+async def test_clone_copies_node_groups_concurrently_and_starts_edges_only_after() -> None:
+    """S13a: the node half runs several statements at once; the edge half runs after all of it.
+
+    Both halves of the claim matter. Concurrency is the whole point of the change — the
+    serial loop left Memgraph idle between round trips. The ordering is what keeps it
+    correct: a cloned edge is created by re-finding *both* endpoints by id in the target, so
+    an edge copied while its endpoint was still being written would simply not be created,
+    and the recount would refuse the clone.
+    """
+    conn = _FakeCloneConn(_fake_source({
+        "Code:Module": 40, "Code:Function": 400, "CodeChunk": 800, "External": 20,
+    }))
+    repo = GraphRepository(conn)  # type: ignore[arg-type]
+
+    counts = await repo.clone_project("src", "dst")
+
+    assert counts == {"nodes": 440, "chunks": 800, "externals": 20, "edges": 0}
+    # Every group with enough rows was split, so there are more copy statements than groups.
+    assert conn.copy_calls > 4
+    assert conn.max_in_flight > 1, "the clone still issues one statement at a time"
+    assert conn.max_in_flight <= 4, "more statements in flight than CLONE_WORKERS allows"
+    assert conn.edge_phase_started_after == conn.copy_calls, (
+        "the edge phase started while node statements were still running"
+    )
+    # And the copy is complete: every id, once, under the target project.
+    for label, ids in conn.projects["src"].items():
+        assert conn.projects["dst"][label] == sorted(ids)
+
+
+@pytest.mark.asyncio
+async def test_clone_shards_are_disjoint_so_no_node_is_copied_twice() -> None:
+    """S13b: sharding an id range must not duplicate a row at a boundary.
+
+    The windows are half-open on the low side (``id > after``) and closed on the high side,
+    and the last one is deliberately left unbounded — this is the test that says the two
+    conventions meet exactly once at every boundary.
+    """
+    source = _fake_source({"Code:Function": 97, "CodeChunk": 3, "Code:Directory": 1})
+    conn = _FakeCloneConn(source)
+    repo = GraphRepository(conn)  # type: ignore[arg-type]
+
+    await repo.clone_project("src", "dst")
+
+    for label, ids in source.items():
+        copied = conn.projects["dst"][label]
+        assert copied == sorted(ids), f"{label} was not copied exactly once per id"
+        assert len(copied) == len(set(copied))
+
+
+@pytest.mark.asyncio
+async def test_clone_worker_failure_cancels_its_siblings_before_raising() -> None:
+    """S13c: a failed worker leaves nothing still writing into the half-clone.
+
+    The caller's recovery is "delete the partial copy and fall back". That is only safe if
+    the failure waits for its siblings — otherwise a straggler statement would keep creating
+    nodes in a project the caller has already deleted, resurrecting it with no clone marker
+    to mark it as junk.
+    """
+    conn = _FakeCloneConn(
+        _fake_source({"Code:Function": 400, "CodeChunk": 800, "External": 20}), delay=0.05
+    )
+    conn.fail_label = "CodeChunk"
+    repo = GraphRepository(conn)  # type: ignore[arg-type]
+
+    with pytest.raises(ProjectCloneError) as excinfo:
+        await repo.clone_project("src", "dst")
+
+    assert "induced failure copying CodeChunk" in str(excinfo.value)
+    assert conn.in_flight == 0, "a clone statement was still running when the error propagated"
+    assert conn.cancelled > 0, "the siblings were left to finish instead of being cancelled"
+    assert conn.edge_phase_started_after is None, "the edge phase ran after a node failure"

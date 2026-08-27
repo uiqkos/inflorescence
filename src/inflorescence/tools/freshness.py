@@ -33,7 +33,9 @@ read as "you are seeing everything" to a reviewer asking the main checkout about
 lives on a branch. So a query against a main checkout that has live worktrees says how
 many — the answer is elsewhere, and one query with ``directory`` set to the worktree gets
 it (indexing a worktree is near-free, seeded from this very index). Present only when the
-queried directory is *not* itself a worktree and the count is non-zero.
+queried directory is *not* itself a worktree and the count is non-zero, and phrased as a
+sentence rather than a number: a bare count beside ``checked``/``stale`` reads as a defect
+count for *this* answer, which is the opposite of what it means.
 
 Cost: one MD5 per *distinct* path on the page (memoized here), so a 50-item page of one
 module reads one file. Nothing outside the page is scanned. The worktree count adds one
@@ -60,6 +62,19 @@ UNKNOWN = "unknown"
 # The per-item flag each status raises, if any. ``unknown`` is absent on purpose (see
 # the module docstring): it is a meta-only signal.
 _ITEM_FLAG = {STALE: "stale", MISSING: "file_missing"}
+
+
+def _live_worktrees_notice(count: int) -> str:
+    """Phrase the worktree count as the warning it is, not as a bare number.
+
+    A field reading ``"live_worktrees": 55`` sitting next to ``checked``/``stale`` counts was
+    read in the field as a *property of this answer* — "55 of something here is off" — and
+    agents stopped to re-check which tree they were querying. The count alone cannot say
+    which; the sentence can, and it carries the next action inside it, so the meaning does
+    not depend on the reader having the tool description in context.
+    """
+    noun = "worktree is" if count == 1 else "worktrees are"
+    return f"{count} {noun} not in this index; pass a worktree directory to query its branch state"
 
 
 def count_live_worktrees(root: Path) -> int:
@@ -161,7 +176,8 @@ class FreshnessChecker:
 
         ``checked`` counts *distinct files*, not entities: the page's unique paths.
         ``live_worktrees`` appears only when there are any — an absent field costs no
-        tokens and says the same thing a zero would.
+        tokens and says the same thing a zero would — and its value is a self-describing
+        sentence rather than a count (see :func:`_live_worktrees_notice`).
         """
         buckets: dict[str, list[str]] = {STALE: [], MISSING: [], UNKNOWN: []}
         for file_path, status in self._statuses.items():
@@ -174,7 +190,7 @@ class FreshnessChecker:
             "unknown": sorted(buckets[UNKNOWN]),
         }
         if self._live_worktrees:
-            block["live_worktrees"] = self._live_worktrees
+            block["live_worktrees"] = _live_worktrees_notice(self._live_worktrees)
         return block
 
     def stamp(self, payload: MutableMapping[str, Any]) -> MutableMapping[str, Any]:

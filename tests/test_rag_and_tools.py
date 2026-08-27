@@ -521,6 +521,77 @@ async def test_index_summaries_reembeds_stale_vector_reuses_fresh_and_legacy() -
 
 
 @pytest.mark.asyncio
+async def test_index_summaries_skips_nodes_whose_fresh_vector_is_already_in_this_project() -> None:
+    """INV-5 oracle: a same-project update must not re-write a vector that is already there.
+
+    ``get_stored_summaries_light`` hands over ``has_embedding`` instead of the vector — the
+    node's embedding never left the database, because it does not need to move. Writing it
+    back would produce byte-identical properties at the price of a Bolt round trip and a
+    vector-index update per node; on an incremental run that was the most expensive thing
+    this method did. So the node is skipped outright, and the count reports what was
+    actually written.
+
+    Fails on the old code, which re-stored every reused vector.
+    """
+    repo = FakeVectorRepository()
+    indexer = RAGIndexer(repo, Settings(_env_file=None), chunker=FakeChunker())
+    # Exactly TWO fresh embeds are allowed: the embedder is handed every node the run
+    # decided to re-embed, and a mismatched length raises rather than passing quietly.
+    indexer._summary_embedder = FakeEmbedder([[7.0], [8.0]])
+
+    def node(nid: str) -> CodeNode:
+        n = CodeNode(id=nid, name=nid, node_type=NodeType.FUNCTION,
+                     file_path="a.py", line_start=1, line_end=1, summary="s")
+        n.summary_input_hash = "H1"
+        return n
+
+    nodes = [node("fresh"), node("legacy"), node("stale"), node("never-embedded")]
+    light = {
+        "fresh":  {"summary": "s", "summary_input_hash": "H1", "summary_embedding_hash": "H1", "has_embedding": True},
+        # No marker: a pre-marker vector is assumed fresh (same rule the repair query
+        # applies), so it is left exactly as it is — not re-stamped, not re-embedded.
+        "legacy": {"summary": "s", "summary_input_hash": "H1", "summary_embedding_hash": None, "has_embedding": True},
+        # The summary was regenerated and the vector never caught up: the skip must not
+        # hide it from re-embedding (audit finding 8a).
+        "stale":  {"summary": "s", "summary_input_hash": "H1", "summary_embedding_hash": "H0", "has_embedding": True},
+        "never-embedded": {"summary": "s", "summary_input_hash": "H1", "summary_embedding_hash": None, "has_embedding": False},
+    }
+
+    stored_count = await indexer.index_summaries(
+        "fixture", nodes, stored_summaries=light, dirty_ids=set()
+    )
+
+    written = {i["node_id"]: i for i in repo.summary_embeddings}
+    assert set(written) == {"stale", "never-embedded"}
+    assert written["stale"]["embedding"] == [7.0] and written["stale"]["embedding_hash"] == "H1"
+    assert written["never-embedded"]["embedding"] == [8.0]
+    assert stored_count == len(written)
+
+
+@pytest.mark.asyncio
+async def test_index_summaries_still_copies_a_donors_vector_across_projects() -> None:
+    """The other reuse shape must not be swept up by the skip: when the entry carries an
+    actual ``summary_embedding`` the vector lives in *another* project (client-side worktree
+    seeding) and this project has nothing — it has to be written, under its original hash."""
+    repo = FakeVectorRepository()
+    indexer = RAGIndexer(repo, Settings(_env_file=None), chunker=FakeChunker())
+    indexer._summary_embedder = FakeEmbedder([])  # any embed call would blow up
+
+    n = CodeNode(id="a.py::foo", name="foo", node_type=NodeType.FUNCTION,
+                 file_path="a.py", line_start=1, line_end=1, summary="s")
+    n.summary_input_hash = "H1"
+    donor = {"a.py::foo": {"summary": "s", "summary_input_hash": "H1",
+                           "summary_embedding": [1.0, 2.0], "summary_embedding_hash": "H1"}}
+
+    stored_count = await indexer.index_summaries("fixture", [n], stored_summaries=donor, dirty_ids=set())
+
+    assert stored_count == 1
+    assert repo.summary_embeddings == [
+        {"node_id": "a.py::foo", "embedding": [1.0, 2.0], "embedding_hash": "H1"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_index_code_stamps_chunk_coverage_only_on_full_success() -> None:
     """INV-8 oracle (audit finding 8b): the chunk-coverage marker is stamped for a file only
     when every one of its chunks stored without an embedding failure.
@@ -1093,6 +1164,64 @@ async def test_repository_get_stored_summaries_maps_by_node_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_repository_light_summaries_carry_freshness_without_the_vectors() -> None:
+    """The reuse map an incremental run reads: same decisions, none of the payload.
+
+    A summary vector is 1536 floats; a project of a few thousand nodes moved tens of
+    megabytes over Bolt just to answer "which summaries can I reuse?" — which needs the
+    text, the input hash, and whether a *fresh* vector already exists. The light read
+    replaces the vector with that last fact, and must never hand out a vector, or a caller
+    could copy one somewhere it does not belong.
+    """
+    conn = RecordingQueryConnection([
+        {"id": "a.py::foo", "summary": "does foo", "summary_input_hash": "h1",
+         "summary_embedding_hash": "h1", "has_embedding": True},
+        {"id": "a.py", "summary": "module a", "summary_input_hash": "h2",
+         "summary_embedding_hash": None, "has_embedding": False},
+    ])
+    repo = GraphRepository(conn)
+
+    stored = await repo.get_stored_summaries_light("project-id")
+
+    assert conn.params == {"project": "project-id"}
+    assert stored["a.py::foo"] == {
+        "summary": "does foo", "summary_input_hash": "h1",
+        "summary_embedding_hash": "h1", "has_embedding": True,
+    }
+    assert stored["a.py"]["has_embedding"] is False
+    assert all("summary_embedding" not in entry for entry in stored.values())
+    assert "n.summary_embedding AS" not in queries.GET_STORED_SUMMARIES_LIGHT
+
+
+@pytest.mark.asyncio
+async def test_repository_call_facts_are_scoped_and_normalized() -> None:
+    """The cross-file half of a node row, for the files an update did not touch.
+
+    Everything else in the row is a function of the file's own bytes, so an unchanged
+    checksum settles it; these three come from the whole-project resolution and can move
+    under an untouched file. Nulls (a legacy row, a cloned one) must read as the empty
+    defaults a freshly parsed node carries, or every such node would look "changed" forever.
+    """
+    conn = RecordingQueryConnection([
+        {"id": "a.py::foo", "file_path": "a.py", "external_calls": ["json.dumps"],
+         "unresolved_calls": [], "calls_provenance": ""},
+        {"id": "a.py", "file_path": "a.py", "external_calls": None,
+         "unresolved_calls": None, "calls_provenance": None},
+    ])
+    repo = GraphRepository(conn)
+
+    facts = await repo.get_stored_call_facts("project-id", ["a.py"])
+
+    assert conn.params == {"project": "project-id", "file_paths": ["a.py"]}
+    assert facts["a.py::foo"]["external_calls"] == ["json.dumps"]
+    assert facts["a.py"] == {
+        "file_path": "a.py", "external_calls": [], "unresolved_calls": [], "calls_provenance": "",
+    }
+    # No files, no query: an update where every file changed asks the database nothing.
+    assert await repo.get_stored_call_facts("project-id", []) == {}
+
+
+@pytest.mark.asyncio
 async def test_repository_list_entities_passes_pagination_and_returns_compact_refs() -> None:
     conn = RecordingQueryConnection([
         {
@@ -1426,6 +1555,15 @@ class FakeVectorRepository:
         self.chunk_index: dict[str, str] = {}  # chunk_id -> file_path, for scoped pruning
         self.checksums = checksums or {}        # file_path -> md5, for chunk-coverage stamping
         self.chunks_covered: list[dict[str, object]] = []
+
+    async def get_stored_chunk_facts(self, project: str, chunk_ids: list[str]) -> dict[str, dict[str, object]]:
+        """This fake never reports a chunk as already stored: these tests are about embedding
+        failure, pruning, coverage and windowing, none of which involve the skip. The skip is
+        covered in tests/test_chunk_reuse.py against a store that models it."""
+        return {}
+
+    async def get_stored_chunk_embeddings_for_ids(self, project: str, chunk_ids: list[str]) -> dict[str, list[float]]:
+        return {}
 
     async def store_code_chunks(self, project: str, chunks: list[dict[str, object]]) -> int:
         self.code_chunks.extend(chunks)
@@ -3119,7 +3257,9 @@ async def test_freshness_counts_only_worktrees_that_still_exist_on_disk(tmp_path
 
     payload = _payload(await mcp.call_tool("list_entities", {"directory": str(main), "limit": 10}))
 
-    assert payload["meta"]["index_freshness"]["live_worktrees"] == 1
+    assert payload["meta"]["index_freshness"]["live_worktrees"] == (
+        "1 worktree is not in this index; pass a worktree directory to query its branch state"
+    )
 
 
 @pytest.mark.asyncio
@@ -3157,7 +3297,7 @@ async def test_search_tools_report_live_worktrees_too(tmp_path: Path, monkeypatc
 
     payload = _payload(await mcp.call_tool("search_semantic", {"directory": str(main), "query": "worker"}))
 
-    assert payload["meta"]["index_freshness"]["live_worktrees"] == 1
+    assert "1 worktree is not in this index" in payload["meta"]["index_freshness"]["live_worktrees"]
 
 
 @pytest.mark.asyncio
@@ -3171,7 +3311,23 @@ async def test_search_text_reports_live_worktrees_on_its_empty_page(tmp_path: Pa
     payload = _payload(await mcp.call_tool("search_text", {"directory": str(main), "query": "***"}))
 
     assert payload["items"] == []
-    assert payload["meta"]["index_freshness"]["live_worktrees"] == 1
+    assert "1 worktree is not in this index" in payload["meta"]["index_freshness"]["live_worktrees"]
+
+
+@pytest.mark.asyncio
+async def test_live_worktrees_value_explains_itself_and_pluralizes(tmp_path: Path) -> None:
+    """A bare count read as "you are looking at the wrong tree"; the string says what it means."""
+    main = make_repo(tmp_path / "main")
+    git("-C", str(main), "worktree", "add", str(tmp_path / "wt1"))
+    git("-C", str(main), "worktree", "add", str(tmp_path / "wt2"))
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+
+    payload = _payload(await mcp.call_tool("list_entities", {"directory": str(main), "limit": 10}))
+
+    assert payload["meta"]["index_freshness"]["live_worktrees"] == (
+        "2 worktrees are not in this index; pass a worktree directory to query its branch state"
+    )
 
 
 @pytest.mark.parametrize(
@@ -3511,3 +3667,289 @@ async def test_search_hybrid_caps_matches_at_three_and_reports_the_total(monkeyp
     item = payload["items"][0]
     assert [match["chunk_id"] for match in item["matches"]] == ["chunk:11", "chunk:10", "chunk:9"]
     assert item["matches_total"] == 12
+
+
+# ---------------------------------------------------------------------------
+# Weak vector hits. A cosine search always returns its top-k, so a query about a
+# feature that simply does not exist comes back with confident-looking 0.44s. The
+# vectors cannot prove absence — but they must say plainly that nothing was close.
+# ---------------------------------------------------------------------------
+
+_VECTOR_TOOLS = ["search_code", "search_semantic", "search_hybrid"]
+
+
+class _ScoredVectorRepository(StoredChecksums):
+    """Serves the same caller-chosen (id, score) rows to both vector searches."""
+
+    def __init__(self, scored: list[tuple[str, float]]) -> None:
+        super().__init__()
+        self.scored = scored
+
+    def _rows(self) -> list[dict[str, object]]:
+        return [
+            {**entity(node_id, node_id.split("::")[1], "function", node_id.split("::")[0], 1, 2, "S."), "score": score}
+            for node_id, score in self.scored
+        ]
+
+    async def search_code_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+        return [
+            {
+                **row,
+                "chunk_id": f"chunk:{row['id']}",
+                "chunk_kind": "function_body",
+                "match_start_line": 1,
+                "match_end_line": 2,
+            }
+            for row in self._rows()
+        ]
+
+    async def search_summary_vectors(self, project: str, embedding: list[float], top_k: int) -> list[dict[str, object]]:
+        return self._rows()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", _VECTOR_TOOLS)
+async def test_vector_search_flags_only_the_hits_below_the_weak_threshold(tool_name: str, monkeypatch) -> None:
+    mcp = FastMCP("test")
+    repo = _ScoredVectorRepository([("pkg/a.py::strong", 0.81), ("pkg/b.py::faint", 0.44)])
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": "/tmp/project", "query": "q"}))
+
+    assert [(item["entity"]["id"], item.get("weak")) for item in payload["items"]] == [
+        ("pkg/a.py::strong", None),
+        ("pkg/b.py::faint", True),
+    ]
+    assert "weak_results" not in payload["meta"], "a mixed page still has a real answer on it"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", _VECTOR_TOOLS)
+async def test_vector_search_says_weak_results_when_the_whole_page_is_weak(tool_name: str, monkeypatch) -> None:
+    mcp = FastMCP("test")
+    repo = _ScoredVectorRepository([("pkg/a.py::far", 0.46), ("pkg/b.py::farther", 0.43)])
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": "/tmp/project", "query": "q"}))
+
+    assert all(item["weak"] is True for item in payload["items"])
+    assert payload["meta"]["weak_results"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", _VECTOR_TOOLS)
+async def test_vector_search_leaves_a_strong_page_unflagged(tool_name: str, monkeypatch) -> None:
+    mcp = FastMCP("test")
+    repo = _ScoredVectorRepository([("pkg/a.py::near", 0.72), ("pkg/b.py::alsonear", 0.5)])
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": "/tmp/project", "query": "q"}))
+
+    assert len(payload["items"]) == 2
+    assert "weak" not in str(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", _VECTOR_TOOLS)
+async def test_vector_search_takes_the_weak_threshold_from_settings(tool_name: str, monkeypatch) -> None:
+    """The threshold is a setting because it is model-dependent, not a constant of nature."""
+    mcp = FastMCP("test")
+    repo = _ScoredVectorRepository([("pkg/a.py::high", 0.9)])
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None, semantic_weak_threshold=0.95))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(tool_name, {"directory": "/tmp/project", "query": "q"}))
+
+    assert payload["items"][0]["weak"] is True
+    assert payload["meta"]["weak_results"] is True
+
+
+@pytest.mark.asyncio
+async def test_vector_search_reports_no_weak_results_on_an_empty_page(monkeypatch) -> None:
+    """Zero hits is `min_score`'s or the index's answer — not evidence that hits were weak."""
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), _ScoredVectorRepository([]), Settings(_env_file=None))
+    monkeypatch.setattr(EmbeddingClient, "embed", lambda self, texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool("search_semantic", {"directory": "/tmp/project", "query": "q"}))
+
+    assert payload["items"] == []
+    assert "weak_results" not in payload["meta"]
+
+
+@pytest.mark.asyncio
+async def test_search_text_never_flags_weak_because_bm25_is_a_different_scale() -> None:
+    mcp = FastMCP("test")
+    repo = FakeTextSearchRepository()
+    repo.summary_rows = [{**entity("pkg/a.py::a", "a", "function", "pkg/a.py", 1, 2, "A."), "score": 0.2}]
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/project", "query": "a"}))
+
+    assert len(payload["items"]) == 1
+    assert "weak" not in str(payload)
+
+
+@pytest.mark.parametrize("tool_name", _VECTOR_TOOLS)
+def test_vector_search_tools_document_the_weak_flag(tool_name: str) -> None:
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), FakeSearchRepository(), Settings(_env_file=None))
+
+    description = mcp._tool_manager.get_tool(tool_name).description
+
+    assert "weak" in description and "weak_results" in description
+    assert "search_text" in description
+
+
+def test_search_text_documents_multilingual_token_noise() -> None:
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), FakeSearchRepository(), Settings(_env_file=None))
+
+    description = mcp._tool_manager.get_tool("search_text").description
+
+    assert "phrase" in description.lower()
+    assert "include_paths" in description
+
+
+# ---------------------------------------------------------------------------
+# "Who calls X" in one call: get_related_entities resolves a name itself, and
+# refuses — with candidates — rather than silently picking one.
+# ---------------------------------------------------------------------------
+
+
+class _NameResolvingRepository(FakeGraphRepositoryV2):
+    """Records what `search_entities` was asked and what `get_related_entities` got."""
+
+    def __init__(self, matches: list[dict[str, object]]) -> None:
+        super().__init__()
+        self.matches = matches
+        self.name_queries: list[str] = []
+        self.related_node_ids: list[str] = []
+
+    async def search_entities(
+        self, project: str, query: str, node_types: list[str] | None, limit: int, offset: int
+    ) -> list[dict[str, object]]:
+        self.name_queries.append(query)
+        return self.matches[:limit]
+
+    async def get_related_entities(
+        self,
+        project: str,
+        node_id: str,
+        direction: str,
+        relation_types: list[str] | None,
+        limit: int,
+        offset: int,
+    ) -> list[dict[str, object]]:
+        self.related_node_ids.append(node_id)
+        return [{"relation": "CALLS", "direction": "incoming", "entity": entity()}]
+
+
+@pytest.mark.asyncio
+async def test_get_related_entities_resolves_a_unique_name() -> None:
+    mcp = FastMCP("test")
+    repo = _NameResolvingRepository([entity("pkg/a.py::run", "run", "function", "pkg/a.py", 2, 4, "Runs.")])
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool(
+        "get_related_entities",
+        {"directory": "/tmp/project", "name": "run", "direction": "in", "relation_types": ["CALLS"]},
+    ))
+
+    assert repo.name_queries == ["run"]
+    assert repo.related_node_ids == ["pkg/a.py::run"]
+    assert payload["meta"]["resolved_node_id"] == "pkg/a.py::run"
+    assert payload["items"][0]["relation"] == "CALLS"
+
+
+@pytest.mark.asyncio
+async def test_get_related_entities_refuses_an_ambiguous_name_with_candidates() -> None:
+    mcp = FastMCP("test")
+    repo = _NameResolvingRepository([
+        entity("pkg/a.py::run", "run", "function", "pkg/a.py", 2, 4, "Runs."),
+        entity("pkg/b.py::Runner.run", "Runner.run", "method", "pkg/b.py", 9, 11, "Runs."),
+    ])
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("get_related_entities", {"directory": "/tmp/project", "name": "run"}))
+
+    assert payload["error"]["code"] == "ambiguous_name"
+    message = payload["error"]["message"]
+    for fragment in ("pkg/a.py::run", "function", "pkg/b.py::Runner.run", "method", "pkg/b.py"):
+        assert fragment in message
+    assert repo.related_node_ids == [], "an ambiguous name must not pick one silently"
+
+
+@pytest.mark.asyncio
+async def test_get_related_entities_caps_the_candidate_list_and_counts_the_rest() -> None:
+    mcp = FastMCP("test")
+    repo = _NameResolvingRepository([
+        entity(f"pkg/f{i}.py::run", "run", "function", f"pkg/f{i}.py", 1, 2, "Runs.") for i in range(14)
+    ])
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("get_related_entities", {"directory": "/tmp/project", "name": "run"}))
+
+    message = payload["error"]["message"]
+    assert message.count("::run") == 10
+    assert "and 4 more" in message
+
+
+@pytest.mark.asyncio
+async def test_get_related_entities_reports_an_unknown_name_as_not_found() -> None:
+    mcp = FastMCP("test")
+    repo = _NameResolvingRepository([])
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("get_related_entities", {"directory": "/tmp/project", "name": "nope"}))
+
+    assert payload["error"]["code"] == "not_found"
+    assert "search_text" in payload["error"]["message"]
+    assert repo.related_node_ids == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args",
+    [
+        pytest.param({"node_id": "pkg/a.py::run", "name": "run"}, id="both"),
+        pytest.param({}, id="neither"),
+    ],
+)
+async def test_get_related_entities_requires_exactly_one_of_node_id_and_name(args: dict) -> None:
+    mcp = FastMCP("test")
+    repo = _NameResolvingRepository([entity()])
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("get_related_entities", {"directory": "/tmp/project", **args}))
+
+    assert payload["error"]["code"] == "invalid_argument"
+    assert repo.name_queries == [] and repo.related_node_ids == []
+
+
+def test_get_related_entities_documents_the_name_shortcut() -> None:
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), FakeGraphRepositoryV2())
+
+    description = mcp._tool_manager.get_tool("get_related_entities").description
+
+    assert "name" in description
+    assert "ambiguous_name" in description
+
+
+@pytest.mark.asyncio
+async def test_get_related_entities_marks_the_surplus_as_approximate_past_the_scan_cap() -> None:
+    """Past the scan the exact total is unknown, so the count says "+" instead of inventing one."""
+    mcp = FastMCP("test")
+    repo = _NameResolvingRepository([
+        entity(f"pkg/f{i}.py::run", "run", "function", f"pkg/f{i}.py", 1, 2, "Runs.") for i in range(200)
+    ])
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("get_related_entities", {"directory": "/tmp/project", "name": "run"}))
+
+    assert payload["error"]["code"] == "ambiguous_name"
+    assert "and 41+ more" in payload["error"]["message"]

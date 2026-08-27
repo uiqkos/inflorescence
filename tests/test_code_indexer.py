@@ -416,6 +416,14 @@ class RecordingRepository:
         self.summaries_stored: list[dict] = []
         self.upserted_external: list = []
         self.calls: list[str] = []
+        # What the store already holds for the incremental write-narrowing (task C):
+        # {node_id: {file_path, external_calls, unresolved_calls, calls_provenance}}. Empty
+        # means "no row is provably identical", i.e. every node is written — which is what
+        # every pre-existing test in this file expects.
+        self.stored_call_facts: dict[str, dict[str, object]] = {}
+        self.call_fact_queries: list[list[str]] = []
+        # (source, TYPE, target) triples the store already holds.
+        self.stored_edges: list[tuple[str, str, str]] = []
 
     async def upsert_external_nodes(self, project: str, refs: list) -> int:
         self.calls.append("upsert_external_nodes")
@@ -453,6 +461,18 @@ class RecordingRepository:
     async def get_stored_summaries(self, project: str) -> dict[str, dict[str, object]]:
         return {}
 
+    async def get_stored_summaries_light(self, project: str) -> dict[str, dict[str, object]]:
+        return {}
+
+    async def get_stored_call_facts(
+        self, project: str, file_paths: list[str]
+    ) -> dict[str, dict[str, object]]:
+        self.call_fact_queries.append(list(file_paths))
+        return {
+            nid: facts for nid, facts in self.stored_call_facts.items()
+            if facts["file_path"] in set(file_paths)
+        }
+
     async def get_node_ids(self, project: str) -> set[str]:
         return set()
 
@@ -460,7 +480,7 @@ class RecordingRepository:
         return []
 
     async def get_code_edges(self, project: str) -> list[tuple[str, str, str]]:
-        return []
+        return list(self.stored_edges)
 
     async def delete_nodes_by_ids(self, project: str, ids: list) -> int:
         self.deleted_node_ids.extend(ids)
@@ -492,6 +512,22 @@ class RebuildRepository(RecordingRepository):
 
     async def get_stored_summaries(self, project: str) -> dict[str, dict[str, object]]:
         return self._stored
+
+    async def get_stored_summaries_light(self, project: str) -> dict[str, dict[str, object]]:
+        """The vector-free view of the same rows — what the update path reads.
+
+        Modelled the way the repository builds it: the vector itself never crosses, only
+        the fact that one exists (``has_embedding``) plus the freshness hash.
+        """
+        return {
+            nid: {
+                "summary": entry.get("summary"),
+                "summary_input_hash": entry.get("summary_input_hash"),
+                "summary_embedding_hash": entry.get("summary_embedding_hash"),
+                "has_embedding": entry.get("summary_embedding") is not None,
+            }
+            for nid, entry in self._stored.items()
+        }
 
     async def get_node_ids(self, project: str) -> set[str]:
         return set(self._node_ids)
@@ -1498,3 +1534,217 @@ def test_calls_never_reach_the_external_path() -> None:
     resolved, refs = _resolve_external_edges(edges, nodes, {"a.py::f"})
 
     assert resolved == [] and refs == []
+
+
+# ---------------------------------------------------------------------------
+# Incremental write narrowing: an update must not re-write rows the store already
+# provably holds, and must still write every row it cannot prove identical.
+# ---------------------------------------------------------------------------
+
+
+_INCREMENTAL_CONFIG = IndexerConfig(use_llm_summaries=False, use_llm_fallback_parser=False)
+
+
+async def _seed_store(tmp_path: Path) -> tuple[dict[str, dict[str, object]], list[tuple[str, str, str]], set[str]]:
+    """Index the tree once and return the store state a previous run would have left.
+
+    The expected call facts are read off that run's own nodes rather than hand-written:
+    the point of the narrowing is "the row the store holds equals the row this run would
+    write", and hard-coding one side of that equality would test the fixture, not the rule.
+    """
+    seed_repo = RecordingRepository()
+    seed = GraphBuilder(repo=seed_repo, llm=None, config=_INCREMENTAL_CONFIG)
+    nodes, edges = await seed.build("fixture", tmp_path)
+    facts = {
+        n.id: {
+            "file_path": n.file_path,
+            "external_calls": list(n.external_calls),
+            "unresolved_calls": list(n.unresolved_calls),
+            "calls_provenance": n.calls_provenance,
+        }
+        for n in nodes
+    }
+    edge_keys = [(e.source, e.edge_type.value.upper(), e.target) for e in edges]
+    return facts, edge_keys, {n.id for n in nodes}
+
+
+def _two_file_project(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("import b\n\ndef call():\n    return b.target()\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def target():\n    return 1\n", encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_update_does_not_rewrite_nodes_of_files_whose_checksum_did_not_move(tmp_path: Path) -> None:
+    """INV-5 oracle: a one-file edit must not cost a MERGE for every other file's nodes.
+
+    The whole project is still parsed and resolved (cross-file CALLS depend on it) and the
+    full graph still comes back in the result — only the *writes* are narrowed, and only for
+    rows the store is proven to already hold.
+    """
+    _two_file_project(tmp_path)
+    facts, edge_keys, node_ids = await _seed_store(tmp_path)
+
+    repo = RebuildRepository(
+        {"a.py": FileChecksum.compute(tmp_path / "a.py", tmp_path).md5, "b.py": "stale"},
+        node_ids=node_ids,
+    )
+    repo.stored_call_facts = facts
+    repo.stored_edges = edge_keys
+    builder = GraphBuilder(repo=repo, llm=None, config=_INCREMENTAL_CONFIG)
+
+    result = await builder.update("fixture", tmp_path)
+
+    written = {n.id for n in repo.upserted_nodes}
+    assert "a.py" not in written and "a.py::call" not in written  # unchanged file: nothing to write
+    assert {"b.py", "b.py::target"} <= written                     # the changed file still is
+    assert "dir:." in written                                      # directories are never "a file"
+    # The in-memory graph is unaffected: callers (RAG, stats) still see the whole project.
+    assert {"a.py", "a.py::call", "b.py", "b.py::target"} <= {n.id for n in result.nodes}
+    # Only the unchanged files are asked about, so the read stays smaller than the write it
+    # replaces even when almost nothing changed.
+    assert repo.call_fact_queries == [["a.py"]]
+
+
+@pytest.mark.asyncio
+async def test_update_reports_the_files_it_found_different(tmp_path: Path) -> None:
+    """The result names the changed files so the caller need not re-derive the diff.
+
+    ``ProjectManager`` scopes its chunk-vector read to exactly this set. The distinction that
+    matters is ``None`` versus empty: a full build narrows nothing and reports ``None``, and a
+    caller that read that as "no file changed" would turn a scoped read into an empty one.
+    """
+    _two_file_project(tmp_path)
+    _facts, _edge_keys, node_ids = await _seed_store(tmp_path)
+    repo = RebuildRepository(
+        {"a.py": FileChecksum.compute(tmp_path / "a.py", tmp_path).md5, "b.py": "stale"},
+        node_ids=node_ids,
+    )
+    builder = GraphBuilder(repo=repo, llm=None, config=_INCREMENTAL_CONFIG)
+
+    result = await builder.update("fixture", tmp_path)
+    assert result.changed_files == {"b.py"}
+
+    build_result = await builder.build("fixture", tmp_path)
+    assert build_result.changed_files is None, "a full build must not claim it narrowed anything"
+
+
+@pytest.mark.asyncio
+async def test_update_rewrites_an_unchanged_files_node_when_its_cross_file_calls_moved(tmp_path: Path) -> None:
+    """The narrowing may not hide a cross-file effect: editing one file can change what an
+    untouched file's function is recorded as calling, and that row must still be written."""
+    _two_file_project(tmp_path)
+    facts, edge_keys, node_ids = await _seed_store(tmp_path)
+    facts["a.py::call"] = {**facts["a.py::call"], "unresolved_calls": ["something_else"]}
+
+    repo = RebuildRepository(
+        {"a.py": FileChecksum.compute(tmp_path / "a.py", tmp_path).md5, "b.py": "stale"},
+        node_ids=node_ids,
+    )
+    repo.stored_call_facts = facts
+    repo.stored_edges = edge_keys
+    builder = GraphBuilder(repo=repo, llm=None, config=_INCREMENTAL_CONFIG)
+
+    await builder.update("fixture", tmp_path)
+
+    written = {n.id for n in repo.upserted_nodes}
+    assert "a.py::call" in written   # the stored call facts disagree with this run's
+    assert "a.py" not in written     # its module row still matches, so it stays untouched
+
+
+@pytest.mark.asyncio
+async def test_update_writes_nodes_of_unchanged_files_that_the_store_never_got(tmp_path: Path) -> None:
+    """A row a killed run never wrote has no stored facts — "unchanged file" must not be
+    read as "already stored", or the gap would never heal (INV-1/INV-3)."""
+    _two_file_project(tmp_path)
+    facts, edge_keys, node_ids = await _seed_store(tmp_path)
+    del facts["a.py::call"]
+
+    repo = RebuildRepository(
+        {"a.py": FileChecksum.compute(tmp_path / "a.py", tmp_path).md5, "b.py": "stale"},
+        node_ids=node_ids,
+    )
+    repo.stored_call_facts = facts
+    repo.stored_edges = edge_keys
+    builder = GraphBuilder(repo=repo, llm=None, config=_INCREMENTAL_CONFIG)
+
+    await builder.update("fixture", tmp_path)
+
+    assert "a.py::call" in {n.id for n in repo.upserted_nodes}
+
+
+@pytest.mark.asyncio
+async def test_update_skips_stored_structural_edges_but_always_remerges_calls(tmp_path: Path) -> None:
+    """Edges: re-MERGEing a key the store holds writes nothing — except CALLS, whose MERGE
+    also refreshes resolution/callee_text, which can move while the key does not."""
+    _two_file_project(tmp_path)
+    facts, edge_keys, node_ids = await _seed_store(tmp_path)
+    # The store holds everything except one CONTAINS link, which must be re-MERGEd.
+    missing = next(key for key in edge_keys if key[1] == "CONTAINS" and key[2] == "b.py::target")
+    repo = RebuildRepository(
+        {"a.py": FileChecksum.compute(tmp_path / "a.py", tmp_path).md5, "b.py": "stale"},
+        node_ids=node_ids,
+    )
+    repo.stored_call_facts = facts
+    repo.stored_edges = [key for key in edge_keys if key != missing]
+    builder = GraphBuilder(repo=repo, llm=None, config=_INCREMENTAL_CONFIG)
+
+    result = await builder.update("fixture", tmp_path)
+
+    submitted = {(e.source, e.edge_type.value.upper(), e.target) for e in repo.upserted_edges}
+    produced = {(e.source, e.edge_type.value.upper(), e.target) for e in result.edges}
+    calls = {key for key in produced if key[1] == "CALLS"}
+    assert calls, "sanity: this fixture has a cross-file call"
+    assert calls <= submitted                    # provenance may have moved: always re-MERGE
+    assert missing in submitted                  # absent from the store: must be written
+    # Everything else was already there and MERGEs no properties — not re-written.
+    assert submitted == calls | {missing}
+    assert repo.deleted_edge_keys == []          # nothing stale: narrowing is not deletion
+
+
+@pytest.mark.asyncio
+async def test_update_writes_a_file_that_changed_on_disk_without_a_watcher_event(tmp_path: Path) -> None:
+    """"Unchanged" is decided by checksum, never by the watcher's silence.
+
+    A file the watcher never reported may still have changed (a missed event, a batch
+    coalesced away). It is not what triggers the update, but its nodes must be written, or
+    the graph would keep serving the old content forever.
+    """
+    _two_file_project(tmp_path)
+    facts, edge_keys, node_ids = await _seed_store(tmp_path)
+    checksums = {
+        "a.py": FileChecksum.compute(tmp_path / "a.py", tmp_path).md5,
+        "b.py": FileChecksum.compute(tmp_path / "b.py", tmp_path).md5,
+    }
+    repo = RebuildRepository(checksums, node_ids=node_ids)
+    repo.stored_call_facts = facts
+    repo.stored_edges = edge_keys
+    builder = GraphBuilder(repo=repo, llm=None, config=_INCREMENTAL_CONFIG)
+
+    (tmp_path / "a.py").write_text("import b\n\ndef call():\n    return b.target()\n\ndef added():\n    return 2\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("def target():\n    return 2\n\ndef silent():\n    return 3\n", encoding="utf-8")
+    # Only a.py is reported; b.py changed behind the watcher's back.
+    await builder.update("fixture", tmp_path, changed_files=[str((tmp_path / "a.py").resolve())])
+
+    written = {n.id for n in repo.upserted_nodes}
+    assert {"a.py", "a.py::added"} <= written
+    assert {"b.py", "b.py::silent"} <= written
+
+
+@pytest.mark.asyncio
+async def test_full_build_writes_every_node_and_edge_even_when_the_store_agrees(tmp_path: Path) -> None:
+    """The narrowing belongs to the incremental path alone. A plain build — a first index,
+    a donor-seeded worktree, a force_rebuild after an indexer upgrade — rewrites everything,
+    which is the only thing that can propagate a change in how rows are produced."""
+    _two_file_project(tmp_path)
+    facts, edge_keys, _ = await _seed_store(tmp_path)
+
+    repo = RecordingRepository()
+    repo.stored_call_facts = facts
+    repo.stored_edges = edge_keys
+    builder = GraphBuilder(repo=repo, llm=None, config=_INCREMENTAL_CONFIG)
+
+    result = await builder.build("fixture", tmp_path)
+
+    assert {n.id for n in repo.upserted_nodes} == {n.id for n in result.nodes}
+    assert len(repo.upserted_edges) == len(result.edges)
+    assert repo.call_fact_queries == []  # not even asked: a build has nothing to narrow

@@ -80,6 +80,26 @@ _DOCUMENT_LANGUAGES: dict[str, str] = {
     ".tex": "latex",
     ".txt": "text",
     ".text": "text",
+    # Styles, markup and configuration are documents too (see config.DEFAULT_DOCUMENT_
+    # EXTENSIONS): one node per file, body chunked in overlapping windows. Listed here so a
+    # chunk of index.css is labelled "css" rather than falling through to "text" — and so
+    # chunk_file takes the document branch for them instead of asking a tree-sitter
+    # CodeSplitter to build an AST of a stylesheet.
+    ".css": "css",
+    ".scss": "scss",
+    ".sass": "sass",
+    ".less": "less",
+    ".styl": "stylus",
+    ".html": "html",
+    ".htm": "html",
+    ".json": "json",
+    ".jsonc": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".ini": "ini",
+    ".cfg": "ini",
+    ".conf": "ini",
 }
 
 _BINARY_EXTENSIONS: frozenset[str] = frozenset({
@@ -141,17 +161,19 @@ class Chunker:
         ext = file_path.suffix.lower()
         language = _EXT_TO_LANGUAGE.get(ext, "")
 
-        if language:
-            return self._chunk_code(text, rel, language)
         if ext in _DOCUMENT_LANGUAGES or ext in _TEXT_EXTENSIONS:
-            # Same windows the pipeline gives a Document node, so this entry point and
-            # chunk_repository can't drift into chunking the same README two ways.
+            # Checked *before* _EXT_TO_LANGUAGE: several document formats (.css, .html,
+            # .json, .yaml, .toml) also have a CodeSplitter grammar, and the pipeline gives
+            # them a Document node, whose body is windowed as text. Preferring the AST here
+            # would make this entry point chunk the same stylesheet a second, different way.
             return self._chunk_text(
                 text, rel,
                 language=_DOCUMENT_LANGUAGES.get(ext, "text"),
                 chunk_size=self.config.document_chunk_size,
                 chunk_overlap=self.config.document_chunk_overlap,
             )
+        if language:
+            return self._chunk_code(text, rel, language)
         return self._chunk_text(text, rel)
 
     def chunk_repository(

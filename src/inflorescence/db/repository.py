@@ -87,6 +87,28 @@ _NODE_TYPE_VALUE_BY_LABEL = {label: value for value, label in _NODE_TYPE_LABEL_B
 # ones ever paginate.
 CLONE_BATCH_SIZE = 5000
 
+# How many clone statements are in flight at once.
+#
+# The node half of a clone is a set of *independent* writes — one per node-type label, plus
+# chunks and externals, each further splittable into disjoint id ranges — but it used to be
+# issued one statement at a time, so the client sat waiting on a round trip while Memgraph
+# had nothing else to do.
+#
+# Four, because four is where it stops helping. Measured on a 3.8k-node / 8.1k-chunk /
+# 14.3k-edge project, best of two runs each, same source and the same verified result:
+#
+#     serial (before)   33.6s      2 workers   19.6s
+#     1 worker          32.5s      4 workers   13.6s
+#                                  8 workers   18.4s
+#
+# Past four the writes contend — one storage engine, one shared vector index — and it gets
+# *worse*, and every concurrent statement also holds a Bolt connection and makes Memgraph
+# materialise its own window of copied vectors. The 1-worker row is the other half of the
+# reading: it matches the serial time, so splitting the groups costs nothing when it cannot
+# be exploited. Deliberately NOT a `Settings` knob: it describes these statement shapes, not
+# the deployment, and nothing an operator can measure would tell them what to set it to.
+CLONE_WORKERS = 4
+
 # Which label a cloned edge endpoint should be matched by. A Code node also carries its
 # node-type label, and the clone needs the *class* label that has a project index on it.
 _EDGE_ENDPOINT_LABELS = ("Code", "CodeChunk", "External")
@@ -419,6 +441,17 @@ class GraphRepository:
         of a few thousand nodes, nearly all of it spent moving vectors the database already
         has. Here nothing but ids and counts crosses the wire.
 
+        **Concurrency.** The node half runs on up to :data:`CLONE_WORKERS` connections at
+        once: each node-type label, the chunks and the externals are independent writes, and
+        each is further split into disjoint id ranges (:meth:`_clone_shards`) — 33.6s to
+        13.6s on an 8.1k-chunk project, measured. The **edge
+        phase starts only after every node statement has finished** — an edge is created by
+        re-finding both endpoints by id *in the target*, so a relationship copied while its
+        endpoint was still being written would simply not be created, and the recount below
+        would refuse the clone. If any node statement fails, its siblings are cancelled and
+        awaited before the error propagates, so no straggler is still writing into the target
+        when the caller deletes the half-clone.
+
         **Atomicity contract.** There is no transaction spanning the whole copy, so the
         interruption story is explicit instead of hoped for:
 
@@ -456,18 +489,24 @@ class GraphRepository:
             queries.SET_CLONE_MARKER, {"project": target, "source": source}
         )
         try:
-            nodes = 0
-            for label in _NODE_TYPE_LABEL_BY_VALUE.values():
-                nodes += await self._clone_keyset(
-                    queries.CLONE_NODES_TEMPLATE.format(node_label=label), source, target
-                )
-            chunks = await self._clone_keyset(queries.CLONE_CHUNKS, source, target)
-            externals = await self._clone_keyset(queries.CLONE_EXTERNALS, source, target)
+            # (statement, label to shard by) for every independent node-ish copy.
+            groups: list[tuple[str, str]] = [
+                (queries.CLONE_NODES_TEMPLATE.format(node_label=label), f"Code:{label}")
+                for label in _NODE_TYPE_LABEL_BY_VALUE.values()
+            ]
+            groups.append((queries.CLONE_CHUNKS, "CodeChunk"))
+            groups.append((queries.CLONE_EXTERNALS, "External"))
+            written = await self._clone_groups(source, target, groups)
+            # Positional: the chunk and external groups were appended last, in that order.
+            nodes = sum(written[:-2])
+            chunks, externals = written[-2], written[-1]
             # Before any verification, so an interrupted clone cannot masquerade as a project
             # rooted at the donor's directory (contract step 3).
             await self._conn.execute_write(
                 queries.CLEAR_CLONED_ROOT_IDENTITY, {"project": target}
             )
+            # Every node exists by now — `_clone_groups` does not return until all of its
+            # statements have completed — so the edge phase can re-find both endpoints.
             edges = await self._clone_edges(source, target)
             counts = await self._verify_clone(source, target)
         except ProjectCloneError:
@@ -495,14 +534,97 @@ class GraphRepository:
         records = await self._conn.execute_query(queries.COUNT_EDGES_BY_TYPE, {"project": project})
         return {str(r["type"]): int(r["count"]) for r in records}
 
-    async def _clone_keyset(self, query: str, source: str, target: str) -> int:
-        """Run one keyset-paginated clone statement to exhaustion. Returns rows written."""
+    async def _clone_groups(
+        self, source: str, target: str, groups: Sequence[tuple[str, str]]
+    ) -> list[int]:
+        """Copy every *(statement, label)* group concurrently. Returns rows written per group.
+
+        Each group is first split into disjoint id ranges (:meth:`_clone_shards`) and every
+        range becomes its own keyset-paginated worker, so a project whose nodes sit almost
+        entirely under one label parallelises just as well as one spread over ten. At most
+        :data:`CLONE_WORKERS` statements are ever in flight.
+
+        The whole set is run inside a task group: the first failure cancels its siblings and
+        **waits for them**, then propagates unwrapped, so the caller's "delete the half-clone"
+        recovery can never race a statement that is still writing into the target. The result
+        is positional — ``written[i]`` belongs to ``groups[i]`` — because the caller reports
+        node, chunk and external counts separately.
+        """
+        semaphore = asyncio.Semaphore(CLONE_WORKERS)
+
+        async def shards_for(label: str) -> list[tuple[str, str]]:
+            # Under the same limit as the copies: splitting a group costs a sorted label scan
+            # that materialises its ids server-side, and a dozen of those at once would spike
+            # Memgraph's memory for no gain.
+            async with semaphore:
+                return await self._clone_shards(source, label)
+
+        shard_lists = await asyncio.gather(*(shards_for(label) for _query, label in groups))
+        written = [0] * len(groups)
+
+        async def run(index: int, query: str, after: str, upper: str) -> None:
+            async with semaphore:
+                rows = await self._clone_keyset(query, source, target, after=after, upper=upper)
+            # Only mutated after the await, and asyncio gives us no preemption inside this
+            # statement, so a plain += is safe across the concurrent workers.
+            written[index] += rows
+
+        try:
+            async with asyncio.TaskGroup() as group:
+                for index, ((query, _label), shards) in enumerate(zip(groups, shard_lists, strict=True)):
+                    for after, upper in shards:
+                        group.create_task(run(index, query, after, upper))
+        except BaseExceptionGroup as failures:
+            # Re-raise the first real failure with its own type, so a lost cursor still
+            # arrives at the caller as ProjectCloneError rather than as an ExceptionGroup.
+            raise failures.exceptions[0] from failures
+        return written
+
+    async def _clone_shards(self, source: str, label: str) -> list[tuple[str, str]]:
+        """Split one label group into up to :data:`CLONE_WORKERS` ``(after, upper]`` id ranges.
+
+        ``''`` means unbounded, matching the keyset cursor's own convention (every id sorts
+        above the empty string). The last range is always left open-ended, so anything written
+        to the source after the boundaries were sampled is still copied — the copy stays a
+        superset of the sample, and the recount, not the sample, decides whether it was exact.
+        """
+        records = await self._conn.execute_query(
+            queries.CLONE_SHARD_BOUNDARIES_TEMPLATE.format(label=label),
+            {"source": source, "shards": CLONE_WORKERS},
+        )
+        raw = list(records[0].get("boundaries") or []) if records else []
+        boundaries: list[str] = []
+        for value in raw:
+            # Defensive: a null or a duplicate boundary would produce an empty or overlapping
+            # range. Empty is merely wasteful; overlapping would duplicate nodes.
+            text = str(value) if value is not None else ""
+            if text and (not boundaries or text > boundaries[-1]):
+                boundaries.append(text)
+
+        shards: list[tuple[str, str]] = []
         after = ""
+        for boundary in boundaries:
+            shards.append((after, boundary))
+            after = boundary
+        shards.append((after, ""))
+        return shards
+
+    async def _clone_keyset(
+        self, query: str, source: str, target: str, after: str = "", upper: str = ""
+    ) -> int:
+        """Run one keyset-paginated clone statement to exhaustion. Returns rows written.
+
+        Copies the ``(after, upper]`` id range only; ``''`` is unbounded on either end, so the
+        default arguments reproduce the whole-group behaviour this had before it was sharded.
+        """
         written = 0
         while True:
             records = await self._conn.execute_write_query(
                 query,
-                {"source": source, "target": target, "after": after, "limit": CLONE_BATCH_SIZE},
+                {
+                    "source": source, "target": target,
+                    "after": after, "upper": upper, "limit": CLONE_BATCH_SIZE,
+                },
             )
             batch = _written(records)
             if not batch:
@@ -608,6 +730,68 @@ class GraphRepository:
             {"project": project, "file_paths": file_paths},
         )
         return {r["chunk_id"]: r["embedding"] for r in records if r["embedding"] is not None}
+
+    async def get_stored_chunk_embeddings_for_ids(
+        self, project: str, chunk_ids: Sequence[str]
+    ) -> dict[str, list[float]]:
+        """``{chunk_id: embedding}`` for the named chunks only (null embeddings dropped).
+
+        The narrowest of the three reads: used to recover the vector of a chunk that is
+        stored but has to be re-written anyway, so that re-writing it never costs a paid
+        embedding call (see :meth:`RAGIndexer.index_code`).
+        """
+        chunk_ids = list(chunk_ids)
+        if not chunk_ids:
+            return {}
+        found: dict[str, list[float]] = {}
+        for start in range(0, len(chunk_ids), self._batch_size):
+            records = await self._conn.execute_query(
+                queries.GET_STORED_CHUNK_EMBEDDINGS_FOR_IDS,
+                {"project": project, "ids": chunk_ids[start : start + self._batch_size]},
+            )
+            found.update(
+                {r["chunk_id"]: r["embedding"] for r in records if r["embedding"] is not None}
+            )
+        return found
+
+    async def get_stored_chunk_facts(
+        self, project: str, chunk_ids: Sequence[str]
+    ) -> dict[str, dict[str, object]]:
+        """``{chunk_id: {"language": str, "node_ids": set[str]}}`` for chunks already stored
+        *with* an embedding.
+
+        Answers "does the database already hold this exact chunk?" without moving a single
+        vector: an id match already proves the node, file, line span, kind and content equal
+        (they are all hashed into the id), so only the language and the owning node's id are
+        left to compare — see ``queries.GET_STORED_CHUNK_FACTS`` for why those two, and why a
+        vector-less chunk is deliberately reported as absent.
+
+        Scoped by id and batched, never a project scan: an incremental update must cost in
+        proportion to what it changed, not to how big the project is. A chunk id that does not
+        appear in the result has no usable stored row and must be written.
+        """
+        chunk_ids = list(chunk_ids)
+        if not chunk_ids:
+            return {}
+        facts: dict[str, dict[str, object]] = {}
+        for start in range(0, len(chunk_ids), self._batch_size):
+            records = await self._conn.execute_query(
+                queries.GET_STORED_CHUNK_FACTS,
+                {"project": project, "ids": chunk_ids[start : start + self._batch_size]},
+            )
+            for record in records:
+                chunk_id = record.get("id")
+                if not chunk_id:
+                    continue
+                entry = facts.setdefault(
+                    str(chunk_id), {"language": str(record.get("language") or ""), "node_ids": set()}
+                )
+                node_id = record.get("node_id")
+                if node_id:
+                    # A chunk should have exactly one owner, but the read does not assume it:
+                    # the writer only needs to know whether *its* node is among them.
+                    entry["node_ids"].add(str(node_id))  # type: ignore[union-attr]
+        return facts
 
     async def get_node_ids(self, project: str) -> set[str]:
         """Return the ids of all stored Code nodes for a project."""
@@ -924,6 +1108,11 @@ class GraphRepository:
 
         ``summary_embedding_hash`` lets the caller reuse a stored embedding only when it is
         still fresh for the current summary (audit finding 8a).
+
+        Every vector travels over Bolt here, which is only worth paying when the vectors are
+        going to be **copied into another project** — the client-side worktree seeding. A
+        caller that reuses summaries *within* the same project wants
+        :meth:`get_stored_summaries_light` instead: same reuse decisions, none of the payload.
         """
         records = await self._conn.execute_query(queries.GET_STORED_SUMMARIES, {"project": project})
         return {
@@ -934,6 +1123,63 @@ class GraphRepository:
                 "summary_embedding_hash": r["summary_embedding_hash"],
             }
             for r in records
+        }
+
+    async def get_stored_summaries_light(self, project: str) -> dict[str, dict[str, object]]:
+        """Vector-free summary reuse map: ``{node_id: {summary, summary_input_hash,
+        summary_embedding_hash, has_embedding}}``.
+
+        The same reuse decisions as :meth:`get_stored_summaries` at a fraction of the wire
+        cost: summarization reuses by ``summary_input_hash``, and the only thing the stored
+        *vector* was ever inspected for on this path is whether one exists and is still fresh
+        — which ``has_embedding`` plus ``summary_embedding_hash`` answer. Measured on ~3k
+        nodes: 2.7s with the vectors, 0.06s without.
+
+        Because the entries carry no ``summary_embedding``, a consumer cannot copy the vector
+        anywhere — which is exactly right for a same-project run, where the vector is already
+        in place and re-writing it is pure cost (see :meth:`RAGIndexer.index_summaries`).
+        Cross-project seeding must keep using :meth:`get_stored_summaries`.
+        """
+        records = await self._conn.execute_query(
+            queries.GET_STORED_SUMMARIES_LIGHT, {"project": project}
+        )
+        return {
+            r["id"]: {
+                "summary": r["summary"],
+                "summary_input_hash": r["summary_input_hash"],
+                "summary_embedding_hash": r["summary_embedding_hash"],
+                "has_embedding": bool(r["has_embedding"]),
+            }
+            for r in records
+        }
+
+    async def get_stored_call_facts(
+        self, project: str, file_paths: Sequence[str]
+    ) -> dict[str, dict[str, object]]:
+        """Return ``{node_id: {file_path, external_calls, unresolved_calls, calls_provenance}}``
+        for the nodes of *file_paths*.
+
+        The cross-file half of a node row — what the whole-project call resolution decided
+        about this node, as opposed to what its own file's bytes say. An incremental update
+        uses it to prove that an unchanged file's stored row is already exactly what this run
+        would write, and skip the MERGE (see ``GraphBuilder._narrow_writes``). A node id
+        missing from the result has no stored row and must always be written.
+        """
+        file_paths = list(file_paths)
+        if not file_paths:
+            return {}
+        records = await self._conn.execute_query(
+            queries.GET_STORED_CALL_FACTS, {"project": project, "file_paths": file_paths}
+        )
+        return {
+            str(r["id"]): {
+                "file_path": str(r["file_path"] or ""),
+                "external_calls": list(r["external_calls"] or []),
+                "unresolved_calls": list(r["unresolved_calls"] or []),
+                "calls_provenance": str(r["calls_provenance"] or ""),
+            }
+            for r in records
+            if r.get("id")
         }
 
     # ------------------------------------------------------------------

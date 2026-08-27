@@ -36,7 +36,7 @@ from inflorescence.code_indexer.summarizer import (
     summarize_single,
     summary_input_hash,
 )
-from inflorescence.config import Settings
+from inflorescence.config import LOCKFILE_NAMES, Settings
 from inflorescence.db.repository import GraphRepository
 from inflorescence.llm_client import LLMClient
 from inflorescence.progress import ProgressReporter, resolve
@@ -69,12 +69,35 @@ class BuildResult:
     # Chunk pruning is scoped to these so a read/parse failure that hid a good file
     # from the scan can't strip its stored chunks (INV-1/INV-3, audit finding 4).
     reconcilable_files: set[str] = field(default_factory=set)
+    # Root-relative paths whose content actually moved: changed on disk, or deleted. Set by
+    # :meth:`GraphBuilder.update` — the only caller that *has* narrowed anything. ``None``
+    # means "this run did not narrow" (a full build), and a consumer must not read it as "no
+    # file changed": the distinction is what keeps a scoped read from silently becoming an
+    # empty one. Everything else in this result still covers the whole project, because an
+    # update re-parses and re-resolves all of it (a one-line edit changes cross-file CALLS).
+    changed_files: set[str] | None = None
 
     def __iter__(self) -> Iterator[Any]:
         # Backward-compatible unpacking: `nodes, edges = await builder.build(...)`. Production
         # code reads the typed .nodes/.edges attributes; this is only for terse call sites.
         yield self.nodes
         yield self.edges
+
+
+@dataclass
+class _ReconcilePlan:
+    """What a reconcile may delete, and what the store already holds.
+
+    ``stored_edge_keys`` is the set of ``(source, TYPE, target)`` relationships that existed
+    in the database when the plan was computed — read once, and used for both halves of the
+    reconcile: the stale-edge diff, and deciding which of this run's edges are already there
+    and need no MERGE at all.
+    """
+
+    stale_node_ids: set[str]
+    stale_edges: list[dict[str, str]]
+    reconcilable_files: set[str]
+    stored_edge_keys: set[tuple[str, str, str]]
 
 
 def _build_default_registry(config: IndexerConfig | None = None) -> ParserRegistry:
@@ -253,8 +276,17 @@ class GraphBuilder:
         exclude_patterns: list[str] | None = None,
         stored_summaries: dict[str, dict[str, object]] | None = None,
         progress: ProgressReporter | None = None,
+        unchanged_files: set[str] | None = None,
     ) -> BuildResult:
-        """Full build: scan -> parse -> resolve -> directories -> store skeleton -> summarize -> checksums."""
+        """Full build: scan -> parse -> resolve -> directories -> store skeleton -> summarize -> checksums.
+
+        *unchanged_files* is the incremental path's contribution: root-relative paths whose
+        on-disk checksum still equals the stored one. Everything is still parsed and resolved
+        across the whole project (CALLS edges are cross-file, so nothing less is correct) —
+        the set only narrows what is **written back**, since a node whose file did not change
+        and whose cross-file call facts still match the store is already exactly what this run
+        would MERGE. ``None`` (a plain build) writes everything, unconditionally.
+        """
         root = root_path.resolve()
         bar = resolve(progress)
         files, skipped_large_files = self._scan_files(
@@ -332,27 +364,39 @@ class GraphBuilder:
                 len(external_refs),
                 dict(Counter(ref.kind for ref in external_refs)),
             )
-        stale_node_ids, stale_edges, reconcilable_files = await self._plan_reconcile(
+        plan = await self._plan_reconcile(
             project, root, all_nodes, all_edges, current_paths, produced_ids
         )
+
+        # What still has to be written. On a plain build that is everything; on an
+        # incremental update the rows already provably identical in the store are dropped —
+        # see _narrow_writes. The reconcile above ran on the FULL fresh graph, so what may be
+        # deleted is decided from the same world as before (INV-1/INV-3).
+        nodes_to_upsert, edges_to_upsert = all_nodes, all_edges
+        if unchanged_files is not None:
+            nodes_to_upsert, edges_to_upsert = await self._narrow_writes(
+                project, all_nodes, all_edges, unchanged_files, plan.stored_edge_keys
+            )
 
         # Report the store phase across nodes then edges so the bar advances monotonically.
         # Nodes carry summary='' here; the upsert query preserves stored non-empty
         # summaries (INV-1/INV-3), so a rebuild never wipes paid work.
         store_total = len(all_nodes) + len(all_edges)
-        await self._repo.upsert_nodes(project, all_nodes)
+        await self._repo.upsert_nodes(project, nodes_to_upsert)
         if external_refs:
             await self._repo.upsert_external_nodes(project, external_refs)
         bar.update("store", len(all_nodes), store_total)
         # Edges are MERGEd in BEFORE any deletion, so the graph never passes through an
         # edgeless window — a concurrent reader (or a crash) sees old∪new edges, then the
-        # exact set, never "no edges" (audit finding 9). Stale edges are then removed one
-        # by one; a run killed mid-prune leaves edges no worse than stale.
-        await self._repo.upsert_edges(project, all_edges)
-        if stale_node_ids:
-            await self._repo.delete_nodes_by_ids(project, sorted(stale_node_ids))
-        if stale_edges:
-            await self._repo.delete_edges_by_keys(project, stale_edges)
+        # exact set, never "no edges" (audit finding 9). Skipping an edge already present in
+        # the store keeps that property: the edge stays, it is simply not re-MERGEd. Stale
+        # edges are then removed one by one; a run killed mid-prune leaves edges no worse
+        # than stale.
+        await self._repo.upsert_edges(project, edges_to_upsert)
+        if plan.stale_node_ids:
+            await self._repo.delete_nodes_by_ids(project, sorted(plan.stale_node_ids))
+        if plan.stale_edges:
+            await self._repo.delete_edges_by_keys(project, plan.stale_edges)
         # An :External node carries no file and no checksum, so the reconcile above — which
         # decides staleness from re-parsed files — can never reach it. A dependency the
         # project stopped using would linger forever; sweep the ones nothing points at.
@@ -416,8 +460,73 @@ class GraphBuilder:
             stored_summaries=resolved_stored,
             dirty_summary_ids=dirty_summary_ids,
             skipped_large_files=skipped_large_files,
-            reconcilable_files=reconcilable_files,
+            reconcilable_files=plan.reconcilable_files,
         )
+
+    async def _narrow_writes(
+        self,
+        project: str,
+        all_nodes: list[CodeNode],
+        all_edges: list[Edge],
+        unchanged_files: set[str],
+        stored_edge_keys: set[tuple[str, str, str]],
+    ) -> tuple[list[CodeNode], list[Edge]]:
+        """Drop the upserts that provably cannot change the stored graph.
+
+        An incremental update re-parses the whole project — it has to, since CALLS edges
+        depend on every other file — and then used to re-MERGE all of it: thousands of writes
+        of unchanged data for a one-file edit (measured: ~2s of the ~3s the store phase took
+        on 3k nodes). Two removals, each with its own proof:
+
+        **Nodes.** A row is skipped only when (a) its file's checksum is unchanged, so
+        everything the parser derives from that file's bytes — type, name, lines, signature,
+        docstring, parent — is what the store already holds; (b) the store actually has a row
+        for that id (a node the last run never wrote is not in ``stored_call_facts`` and is
+        always written); and (c) the three properties that do *not* come from the file's own
+        bytes — ``external_calls``, ``unresolved_calls``, ``calls_provenance``, all products
+        of the whole-project resolution — still equal what this run computed. Nothing else in
+        the row can differ: ``summary``/``summary_input_hash`` are sent empty here and the
+        upsert query preserves the stored ones anyway (INV-1).
+
+        What this deliberately does NOT cover is a *code* change: a new indexer version that
+        would parse the same bytes into different rows never reaches an unchanged file this
+        way. That is precisely what ``force_rebuild`` exists for (see
+        ``ProjectManager.index_directory``), and it writes everything unconditionally.
+
+        **Edges.** A relationship whose ``(source, TYPE, target)`` key is already in the store
+        is not re-MERGEd — except CALLS, whose MERGE also refreshes ``resolution`` and
+        ``callee_text``, and those can change while the key does not (a heuristic edge
+        upgraded by a semantic pass). Every other edge type MERGEs no properties at all, so
+        re-writing an existing key is a provable no-op. Existing edges are left in place, so
+        the "never edgeless" property is strengthened, not weakened.
+        """
+        stored_facts: dict[str, dict[str, object]] = {}
+        if unchanged_files:
+            stored_facts = await self._repo.get_stored_call_facts(project, sorted(unchanged_files))
+
+        def already_stored(node: CodeNode) -> bool:
+            facts = stored_facts.get(node.id)
+            return (
+                facts is not None
+                and facts.get("file_path") == node.file_path
+                and node.file_path in unchanged_files
+                and list(facts.get("external_calls") or []) == list(node.external_calls)
+                and list(facts.get("unresolved_calls") or []) == list(node.unresolved_calls)
+                and str(facts.get("calls_provenance") or "") == node.calls_provenance
+            )
+
+        nodes = [n for n in all_nodes if not already_stored(n)]
+        edges = [
+            e for e in all_edges
+            if e.edge_type is EdgeType.CALLS
+            or (e.source, e.edge_type.value.upper(), e.target) not in stored_edge_keys
+        ]
+        logger.info(
+            "Incremental store: %d/%d node(s) and %d/%d edge(s) need writing for project=%s "
+            "(%d unchanged file(s))",
+            len(nodes), len(all_nodes), len(edges), len(all_edges), project, len(unchanged_files),
+        )
+        return nodes, edges
 
     async def _plan_reconcile(
         self,
@@ -427,10 +536,11 @@ class GraphBuilder:
         all_edges: list[Edge],
         current_paths: set[str],
         produced_ids: set[str],
-    ) -> tuple[set[str], list[dict[str, str]], set[str]]:
+    ) -> _ReconcilePlan:
         """Decide what a reconcile may delete without destroying data a failure only hid.
 
-        Returns ``(stale_node_ids, stale_edges, reconcilable_files)``.
+        Returns a :class:`_ReconcilePlan` — what to delete, which files this run may prune
+        chunks for, and (read in the same pass) which edges the store already holds.
 
         A stored node is stale only when its file was handled *authoritatively* this run:
         either re-parsed clean (its id is in the fresh node set) or confirmed gone from
@@ -496,7 +606,12 @@ class GraphBuilder:
             for (s, ty, t) in stored_edges
             if (s, ty, t) not in produced_edge_keys and s in produced_ids and t in produced_ids
         ]
-        return stale_node_ids, stale_edges, reconcilable_files
+        return _ReconcilePlan(
+            stale_node_ids=stale_node_ids,
+            stale_edges=stale_edges,
+            reconcilable_files=reconcilable_files,
+            stored_edge_keys=set(stored_edges),
+        )
 
     async def _scan_for_changes(
         self,
@@ -505,13 +620,22 @@ class GraphBuilder:
         changed_files: list[str] | None,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
-    ) -> tuple[list[Path], list[str]]:
+        full_checksums: bool = False,
+    ) -> tuple[list[Path], list[str], set[str]]:
         """Scan + checksum diff only — no parsing, LLM, or embedding.
 
-        Returns ``(changed_paths, deleted_rel_paths)``. This is the cheap part of an update:
-        a directory walk and per-file MD5, nothing billable. ``has_pending_changes`` uses it
-        so a watcher flush can detect a no-op *before* paying for a preflight embedding or an
-        O(project) vector dump (INV-5, audit finding: no-op flush costs an API call + full dump).
+        Returns ``(changed_paths, deleted_rel_paths, unchanged_rel_paths)``. This is the cheap
+        part of an update: a directory walk and per-file MD5, nothing billable.
+        ``has_pending_changes`` uses it so a watcher flush can detect a no-op *before* paying
+        for a preflight embedding or an O(project) vector dump (INV-5, audit finding: no-op
+        flush costs an API call + full dump).
+
+        The third element is only populated with *full_checksums*, and is what the write phase
+        may treat as untouched. It is defined by MD5 alone, never by "the watcher did not
+        mention it": a file that changed on disk without an event must still be rewritten, so
+        it must not land in this set. That costs the watcher path an MD5 pass over the tree,
+        which the caller (an update that is about to read and parse every one of those files
+        anyway) can afford and ``has_pending_changes`` — which must stay cheap — does not pay.
         """
         files, _ = self._scan_files(root, include_patterns=include_patterns, exclude_patterns=exclude_patterns)
         current_paths = {str(f.relative_to(root)) for f in files}
@@ -519,6 +643,7 @@ class GraphBuilder:
 
         changed: list[Path] = []
         deleted: list[str] = []
+        unchanged: set[str] = set()
         if changed_files is not None:
             # Watcher-reported paths arrive absolute; callers/tests may pass root-relative
             # paths. Normalize both to a root-relative key before classifying.
@@ -530,19 +655,39 @@ class GraphBuilder:
             # A file unreadable at checksum time (vanished mid-flush) yields None and is
             # dropped from `changed` — never crashing the run; if it was truly deleted it
             # is already in `deleted`, otherwise it stays stale and is retried next flush.
-            changed = [
-                f for f in reported_changed
-                if (ck := FileChecksum.try_compute(f, root)) is not None
-                and stored_checksums.get(str(f.relative_to(root))) != ck.md5
-            ]
+            current: dict[str, str] = {}
+            if full_checksums:
+                current = {
+                    ck.file_path: ck.md5
+                    for f in files
+                    if (ck := FileChecksum.try_compute(f, root)) is not None
+                }
+                unchanged = {
+                    rel for rel, md5 in current.items() if stored_checksums.get(rel) == md5
+                }
+            for f in reported_changed:
+                rel = str(f.relative_to(root))
+                # The whole-tree pass, when it ran, already holds this file's digest —
+                # hashing it a second time would only buy a different answer if the file
+                # changed mid-run, and then `changed` should still describe one consistent
+                # scan rather than a mix of two.
+                md5 = current.get(rel) if full_checksums else (
+                    ck.md5 if (ck := FileChecksum.try_compute(f, root)) is not None else None
+                )
+                if md5 is not None and stored_checksums.get(rel) != md5:
+                    changed.append(f)
         else:
             deleted = sorted(set(stored_checksums) - current_paths)
             for f in files:
                 rel = str(f.relative_to(root))
                 ck = FileChecksum.try_compute(f, root)
-                if ck is not None and stored_checksums.get(rel) != ck.md5:
+                if ck is None:
+                    continue
+                if stored_checksums.get(rel) != ck.md5:
                     changed.append(f)
-        return changed, deleted
+                else:
+                    unchanged.add(rel)
+        return changed, deleted, unchanged
 
     async def has_pending_changes(
         self,
@@ -560,7 +705,7 @@ class GraphBuilder:
         this before the expensive preflight/embedding-load path.
         """
         root = root_path.resolve()
-        changed, deleted = await self._scan_for_changes(
+        changed, deleted, _ = await self._scan_for_changes(
             project, root, changed_files,
             include_patterns=include_patterns, exclude_patterns=exclude_patterns,
         )
@@ -582,11 +727,23 @@ class GraphBuilder:
         place, only stale nodes/chunks are deleted, and summary embeddings on unchanged
         nodes survive untouched. Nothing is wiped up front, so a failed run degrades to
         stale data instead of data loss.
+
+        Two things make this cheaper than a build without making it narrower. The summary
+        reuse map is fetched **without the vectors** (they are already on the nodes; nothing
+        here has to move them), and the files whose checksum did not move are handed to
+        :meth:`build` so their unchanged rows and already-present edges are not re-written.
+        Both are write/wire economies only: the scan, the parse and the call resolution still
+        cover the whole project, because a one-line edit in one file can change what another
+        file is recorded as calling.
+
+        The result carries ``changed_files`` — the paths this scan found different — so the
+        caller can scope its own reads to them without re-deriving the diff.
         """
         root = root_path.resolve()
-        changed, deleted = await self._scan_for_changes(
+        changed, deleted, unchanged = await self._scan_for_changes(
             project, root, changed_files,
             include_patterns=include_patterns, exclude_patterns=exclude_patterns,
+            full_checksums=True,
         )
 
         if not changed and not deleted:
@@ -595,7 +752,7 @@ class GraphBuilder:
                 project,
                 len(changed_files) if changed_files is not None else 0,
             )
-            return BuildResult(nodes=[], edges=[])
+            return BuildResult(nodes=[], edges=[], changed_files=set())
 
         logger.info(
             "Detected %d changed and %d deleted file(s) for project=%s; reconciling project",
@@ -607,14 +764,20 @@ class GraphBuilder:
             logger.debug("Changed: %s", ", ".join(sorted(str(p.relative_to(root)) for p in changed)))
         if deleted:
             logger.debug("Deleted: %s", ", ".join(sorted(deleted)))
-        stored_summaries = await self._repo.get_stored_summaries(project)
-        return await self.build(
+        # Vector-free: this project's own summary vectors never have to leave the database
+        # for a same-project reuse decision, and dragging ~1.5k floats per node over Bolt was
+        # the single most expensive read an update did (INV-5).
+        stored_summaries = await self._repo.get_stored_summaries_light(project)
+        result = await self.build(
             project, root,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
             stored_summaries=stored_summaries,
             progress=progress,
+            unchanged_files=unchanged,
         )
+        result.changed_files = {str(p.relative_to(root)) for p in changed} | set(deleted)
+        return result
 
     async def repair_missing_summaries(self, project: str, root_path: Path) -> list[CodeNode]:
         """Regenerate summaries a killed run left missing, without a full rebuild.
@@ -785,6 +948,10 @@ class GraphBuilder:
                 f = current_path / filename
                 if f.suffix not in extensions:
                     continue
+                if filename in LOCKFILE_NAMES:
+                    # By name, unconditionally — before includes, so not even an explicit
+                    # include_patterns can pull a resolver transcript into the index.
+                    continue
                 rel = f.relative_to(root).as_posix()
                 if _matches_patterns(rel, filename, excludes):
                     continue
@@ -905,7 +1072,7 @@ class GraphBuilder:
                 rel = str(f.relative_to(root))
             except ValueError:
                 continue
-            if rel in seen or f.suffix not in extensions:
+            if rel in seen or f.suffix not in extensions or f.name in LOCKFILE_NAMES:
                 continue
             seen.add(rel)
             try:
@@ -936,6 +1103,23 @@ _PREVIEW_LANGUAGES: dict[str, str] = {
     ".org": "org",
     ".txt": "text",
     ".text": "text",
+    # Styles, markup and configuration — same grouping rule: variants of one format count
+    # together, so the estimate reads "yaml: 12 files", not ".yml: 7" plus ".yaml: 5".
+    ".css": "css",
+    ".scss": "sass",
+    ".sass": "sass",
+    ".less": "less",
+    ".styl": "stylus",
+    ".html": "html",
+    ".htm": "html",
+    ".json": "json",
+    ".jsonc": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".ini": "ini",
+    ".cfg": "ini",
+    ".conf": "ini",
 }
 
 

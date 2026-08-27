@@ -73,6 +73,13 @@ async def test_unchanged_path_rechunks_files_with_no_stored_chunks(tmp_path: Pat
     assert rag.code_indexes == 1
     assert rag.code_nodes == [file_nodes]
     assert rag.summary_indexes == 0
+    # The repair rebuilds a named set of files, so it reads back the vectors of those files
+    # and no others — the whole-project dump it used to be handed was paid for on every
+    # unchanged re-index, whether or not anything needed repairing at all.
+    assert repo.scoped_chunk_embedding_requests == [
+        (manager.get_project(str(tmp_path)), ["pkg/a.py"])
+    ]
+    assert repo.chunk_embedding_requests == []
 
 
 @pytest.mark.asyncio
@@ -147,6 +154,12 @@ async def test_index_directory_force_rebuild_bypasses_checksum_shortcircuit(tmp_
     assert builder.updates == 0
     assert result["reused"] is False
     assert result["nodes"] == 2 and result["edges"] == 1
+    # Reuse is by summary hash, and the vectors are already on this project's own nodes:
+    # the rebuild must read the summaries WITHOUT dragging every vector over Bolt. Only
+    # cross-project seeding has a use for the payload version.
+    project = manager.get_project(str(tmp_path))
+    assert repo.light_summary_requests == [project]
+    assert repo.summary_requests == []
 
 
 @pytest.mark.asyncio
@@ -295,6 +308,31 @@ async def test_update_project_inherits_persisted_scope(tmp_path: Path) -> None:
     # A watcher update scans the SAME universe as the index that created the project, so it
     # cannot widen scope and silently pay for excluded paths (5c). Was: no scope passed at all.
     assert builder.update_filters == [(["backend/**"], ["vendor"])]
+
+
+@pytest.mark.asyncio
+async def test_update_project_reads_chunk_vectors_only_for_the_files_that_moved(
+    tmp_path: Path,
+) -> None:
+    """A file save must not unload every vector in the project.
+
+    The read used to happen *before* the update — the only place it could, when the caller
+    had no idea which files had really changed — and it dumped the whole project: seconds of
+    Bolt traffic per keystroke-triggered flush, to serve the handful of chunks the edit
+    touched (INV-5). It now runs after the update, scoped to what the update found different.
+    """
+    repo = FakeProjectRepository({"nodes": 1, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder(update_result=([object()], [object()]))
+    builder.update_changed_files = {"backend/app.py"}
+    rag = FakeRAGIndexer()
+    manager = ProjectManager(repo=repo, graph_builder=builder, rag_indexer=rag, settings=Settings(_env_file=None))
+    project = manager.get_project(str(tmp_path))
+
+    await manager.update_project(project, ["backend/app.py"])
+
+    assert repo.chunk_embedding_requests == [], "the whole project's vectors were unloaded"
+    assert repo.scoped_chunk_embedding_requests == [(project, ["backend/app.py"])]
+    assert rag.code_stored_embeddings == [repo.stored_chunk_embeddings.get(project, {})]
 
 
 @pytest.mark.asyncio
@@ -640,6 +678,7 @@ async def test_reindexing_an_already_indexed_worktree_uses_its_own_caches(tmp_pa
     main, worktree = _worktree_dirs(tmp_path)
     repo = FakeProjectRepository({"nodes": 12, "edges": 34, "chunks": 5, "summaries": 6})
     builder = FakeGraphBuilder(update_result=([_SummaryNode("a.py", "s", "h1")], [object()]))
+    builder.update_changed_files = {"a.py"}
     rag = FakeRAGIndexer()
     manager = _worktree_manager(repo, builder, rag, main)
     donor = manager.get_project(str(main))
@@ -654,7 +693,10 @@ async def test_reindexing_an_already_indexed_worktree_uses_its_own_caches(tmp_pa
     assert builder.updates == 1 and builder.builds == 0
     assert repo.project_is_indexed_calls == []
     assert repo.summary_requests == []
-    assert repo.chunk_embedding_requests == [project]
+    # Its own caches, and only for the file that moved: an update rewrites almost no chunk
+    # rows, so unloading every vector in the project to feed one file was pure cost.
+    assert repo.scoped_chunk_embedding_requests == [(project, ["a.py"])]
+    assert repo.chunk_embedding_requests == []
     assert repo.summaries_written == []
     assert repo.worktree_meta == [(project, donor, str(main.resolve()))]
 
@@ -1324,6 +1366,7 @@ class FakeProjectRepository:
         self.project_is_indexed_calls: list[str] = []
         self.checksum_requests: list[str] = []
         self.summary_requests: list[str] = []
+        self.light_summary_requests: list[str] = []
         self.chunk_embedding_requests: list[str] = []
         self.summaries_written: list[tuple[str, list[dict[str, object]]]] = []
         self.worktree_meta: list[tuple[str, str, str]] = []
@@ -1353,6 +1396,21 @@ class FakeProjectRepository:
     async def get_stored_summaries(self, project: str) -> dict[str, dict[str, object]]:
         self.summary_requests.append(project)
         return self.stored_summaries.get(project, {})
+
+    async def get_stored_summaries_light(self, project: str) -> dict[str, dict[str, object]]:
+        """The vector-free read. Recorded apart from :meth:`get_stored_summaries` so a test
+        can pin *which* of the two a path uses — the difference is megabytes of Bolt traffic
+        on a real project, and only cross-project seeding has any use for the vectors."""
+        self.light_summary_requests.append(project)
+        return {
+            nid: {
+                "summary": entry.get("summary"),
+                "summary_input_hash": entry.get("summary_input_hash"),
+                "summary_embedding_hash": entry.get("summary_embedding_hash"),
+                "has_embedding": entry.get("summary_embedding") is not None,
+            }
+            for nid, entry in self.stored_summaries.get(project, {}).items()
+        }
 
     async def get_stored_chunk_embeddings(self, project: str) -> dict[str, list[float]]:
         self.chunk_embedding_requests.append(project)
@@ -1465,6 +1523,9 @@ class FakeGraphBuilder:
         self.update_reconcilable: set[str] = set()
         self.update_dirty_ids: set[str] = set()
         self.update_stored_summaries: dict[str, dict[str, object]] = {}
+        # The files an update found different. `None` (a full build reports nothing) means
+        # "not narrowed"; the manager scopes its chunk-vector read to this set.
+        self.update_changed_files: set[str] | None = None
 
     def scan_checksums(
         self,
@@ -1535,6 +1596,9 @@ class FakeGraphBuilder:
             stored_summaries=dict(self.update_stored_summaries),
             dirty_summary_ids=set(self.update_dirty_ids),
             reconcilable_files=set(self.update_reconcilable),
+            changed_files=(
+                set(self.update_changed_files) if self.update_changed_files is not None else None
+            ),
         )
 
     async def repair_missing_summaries(self, project: str, root_path: Path) -> list[object]:

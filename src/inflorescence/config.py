@@ -50,11 +50,24 @@ DEFAULT_EXCLUDE_PATTERNS: list[str] = [
     ".cache",
 ]
 
-# Prose files indexed as whole documents: one node per file, body chunked with overlap,
-# no structure parsing (see parser/document_parser.py). Deliberately excludes data/config
-# formats (.json, .yaml, .csv): those carry no prose an LLM summary or a semantic query can
-# use, and a large lockfile would be paid for in summaries and embeddings for nothing.
+# Files indexed as whole documents: one node per file, body chunked with overlap, no
+# structure parsing (see parser/document_parser.py). Prose was the original case; styles,
+# markup and configuration joined it because they answer the same *kind* of question and
+# no parser here understands them either. A frontend bug lived in
+# `@media (prefers-reduced-motion)` inside index.css and was unfindable — not ranked low,
+# absent — because no scan ever opened the file. A cascade rule, a `<meta>` tag and a
+# `vite.config.ts`'s sibling `tsconfig.json` are half of what a frontend question is about.
+#
+# They are NOT parsed: CSS has no call graph and a JSON object is not a class, so inventing
+# symbols above them would produce nodes no edge points at. One node, chunked body, BM25 and
+# chunk search over the text — which is exactly what finds a media query by its own words.
+#
+# The cost of admitting data formats is generated bulk, and it is bounded three ways:
+# lock files are dropped by name (LOCKFILE_NAMES), anything over MAX_FILE_SIZE_BYTES lands
+# in `skipped_large_files` instead of being summarized, and .gitignore/exclude patterns
+# already keep node_modules, dist and build output out of the scan.
 DEFAULT_DOCUMENT_EXTENSIONS: list[str] = [
+    # prose
     ".md",
     ".markdown",
     ".mdx",
@@ -64,7 +77,52 @@ DEFAULT_DOCUMENT_EXTENSIONS: list[str] = [
     ".adoc",
     ".asciidoc",
     ".org",
+    # styles — hand-written, prose-free, and where layout/theme/media-query answers live
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    ".styl",
+    # markup — index.html carries the meta tags, the mount point and the script tags
+    ".html",
+    ".htm",
+    # configuration and build/tool settings
+    ".json",
+    ".jsonc",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
 ]
+
+# Dependency lock files, dropped from every scan **by name**, whatever the extension set or
+# the include patterns say. They are machine-written transcripts of a resolver's output:
+# thousands of lines that mention every package name in the tree, so they win keyword
+# searches they have no business winning, and they change on every install. `.lock` / `.sum`
+# are not indexable extensions today, so only a few of these can currently match — the rest
+# are listed so that admitting a new extension never silently admits its lock file too.
+LOCKFILE_NAMES: frozenset[str] = frozenset({
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "deno.lock",
+    "poetry.lock",
+    "pdm.lock",
+    "uv.lock",
+    "Pipfile.lock",
+    "Cargo.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "go.sum",
+    "mix.lock",
+    "flake.lock",
+    "packages.lock.json",
+})
 
 GENERATED_FILE_PATTERNS: list[str] = [
     # protobuf / gRPC (many of these lack an in-file marker, esp. JS/TS/Python)
@@ -74,7 +132,7 @@ GENERATED_FILE_PATTERNS: list[str] = [
     "*.pb.ts", "*_pb.ts", "*_connect.ts", "*_connectweb.ts",      # ts-proto / connect
     "*.pb.cc", "*.pb.h",                                          # C/C++
     # common build/codegen output
-    "*.min.js", "*.bundle.js",
+    "*.min.js", "*.bundle.js", "*.min.css", "*.bundle.css",
 ]
 
 
@@ -115,6 +173,17 @@ class Settings(BaseSettings):
     # -embed defaults to 1536, matching the summary model) and re-index the project.
     code_embedding_base_url: str | None = None
     code_embedding_api_key: str | None = None
+    # Below this cosine similarity a vector hit is reported with "weak": true, and a page
+    # where *every* hit is weak also gets meta.weak_results (search_code / search_semantic /
+    # search_hybrid). Vectors cannot prove absence — a top-k search always returns its k —
+    # so this does not filter anything (that is `min_score`, a hard cut-off the caller
+    # chooses per query); it only stops a page of far-away neighbours from reading like a
+    # page of answers. 0.5 is the line for the default `text-embedding-3-small`: unrelated
+    # English text pairs land in ~0.0–0.35 with that model, queries about code the repository
+    # does not contain were measured at 0.43–0.46, and genuine matches sit at 0.6–0.9. Raise
+    # it for a model whose similarities run hot (many older models floor around 0.7), lower
+    # it if real matches start arriving flagged.
+    semantic_weak_threshold: float = 0.5
 
     # Chunking
     chunk_size: int = 3000
@@ -137,10 +206,12 @@ class Settings(BaseSettings):
     max_file_size_bytes: int = 262144
     skip_generated: bool = True
     use_llm_summaries: bool = True
-    # Index prose documents (README, docs/**.md, notes.txt) alongside code. They are the
-    # part of a repository that says *why*, which no amount of AST parsing recovers — but
-    # they are also summarized and embedded like code, so this is an off switch for a repo
-    # where documentation is huge, generated, or not worth the spend.
+    # Index non-code files (README and docs/**.md, but also stylesheets, HTML and
+    # JSON/YAML/TOML/INI configuration) alongside code. They are the part of a repository
+    # that says *why* and *with what settings*, which no amount of AST parsing recovers —
+    # but they are also summarized and embedded like code, so this is an off switch for a
+    # repo where they are huge, generated, or not worth the spend. Narrow
+    # DOCUMENT_EXTENSIONS instead of turning this off to keep only some of them.
     index_documents: bool = True
     document_extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_DOCUMENT_EXTENSIONS))
     # Rows per UNWIND write to Memgraph (nodes/edges/chunks/summaries/checksums).

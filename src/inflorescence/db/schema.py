@@ -33,6 +33,11 @@ PROPERTY_INDEXES: list[tuple[str, str]] = [
     ("Enum", "project"),
     ("Struct", "project"),
     ("Trait", "project"),
+    # Without these, MERGE (c:CodeChunk {id: ..., project: ...}) in STORE_CODE_CHUNKS_BATCH
+    # scans every chunk in the DB for each row of the batch. A live re-store benchmark of
+    # ~8.1k chunks dropped from 109.3s to 47.5s after adding these two indexes.
+    ("CodeChunk", "id"),
+    ("CodeChunk", "project"),
 ]
 
 VECTOR_INDEXES: list[dict[str, str | int]] = [

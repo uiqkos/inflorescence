@@ -1,12 +1,16 @@
-"""Whole-file indexing for prose documents (.md, .rst, .txt, ...).
+"""Whole-file indexing for documents: prose (.md, .rst, .txt), styles (.css, .scss),
+markup (.html) and configuration (.json, .yaml, .toml, .ini) — see
+:data:`inflorescence.config.DEFAULT_DOCUMENT_EXTENSIONS` for the full set.
 
 A document has no structure this graph can model: a heading is not a symbol, nothing
-CALLS a paragraph, and an ``##`` section boundary is a typographic choice, not a
-containment relation. Parsing one into pseudo-symbols would produce nodes no edge ever
-points at and a containment tree that says nothing true. So a document becomes exactly
-**one** node — the file — and retrieval happens at the chunk level: ``rag/chunker.py``
-splits the body into overlapping sentence windows, which is what makes a passage in the
-middle of a long README findable without inventing a symbol tree above it.
+CALLS a paragraph, a CSS rule is not a function and a JSON object is not a class. An
+``##`` section boundary is a typographic choice, not a containment relation. Parsing one
+into pseudo-symbols would produce nodes no edge ever points at and a containment tree that
+says nothing true. So a document becomes exactly **one** node — the file — and retrieval
+happens at the chunk level: ``rag/chunker.py`` splits the body into overlapping sentence
+windows, which is what makes a passage in the middle of a long README — or a
+``@media (prefers-reduced-motion)`` block in the middle of a stylesheet — findable without
+inventing a symbol tree above it.
 
 The parser therefore reads the file only to know how many lines it has; the text itself
 is read again by the summarizer (``node_source``) and the chunker, both of which work
@@ -33,7 +37,7 @@ def _normalize_extension(extension: str) -> str:
 
 
 class DocumentParser(BaseParser):
-    """Emits one node per prose file, with no structure extraction."""
+    """Emits one node per document file, with no structure extraction."""
 
     def __init__(self, extensions: Sequence[str] | None = None) -> None:
         source = DEFAULT_DOCUMENT_EXTENSIONS if extensions is None else extensions

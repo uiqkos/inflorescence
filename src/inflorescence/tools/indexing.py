@@ -29,6 +29,19 @@ def register_indexing_tools(mcp: FastMCP, manager: ProjectManager, watcher: File
         LLM calls). Review the estimate, then call again with preview=false to actually index.
         Re-indexing only re-summarizes and re-embeds the files/nodes that actually changed.
 
+        WHAT IS INDEXED: source files for the supported languages (Python, JS/TS, Go, Rust),
+        plus non-code files stored whole as ``document`` entities — prose (.md, .markdown,
+        .mdx, .rst, .txt, .text, .adoc, .asciidoc, .org), styles (.css, .scss, .sass, .less,
+        .styl), markup (.html, .htm) and configuration (.json, .jsonc, .yaml, .yml, .toml,
+        .ini, .cfg, .conf). Documents are chunked and summarized but never parsed for
+        structure. Always skipped: dependency lock files by name (package-lock.json,
+        npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, poetry.lock, uv.lock, Cargo.lock,
+        composer.lock, Gemfile.lock, go.sum, …), .gitignore'd paths, files above
+        MAX_FILE_SIZE_BYTES (reported as ``skipped_large_files`` in both the preview and the
+        index result), and generated output (*.min.js, *.min.css, protobuf stubs). Set
+        INDEX_DOCUMENTS=false, or narrow DOCUMENT_EXTENSIONS, to index less than that —
+        which also lowers what preview=true quotes.
+
         The index is persisted incrementally: the full graph skeleton (entities + edges,
         searchable by name) lands right after parsing, and summaries stream into the DB in
         batches as they are generated. A run that is killed mid-summarization loses nothing —
@@ -61,7 +74,9 @@ def register_indexing_tools(mcp: FastMCP, manager: ProjectManager, watcher: File
                 Summaries and embeddings are still reused; no LLM re-spend. NOT a data wipe.
 
         Returns:
-            Indexing statistics (nodes, edges, chunks, ...), or a dry-run estimate when preview=true.
+            Indexing statistics — ``nodes``/``edges``/``chunks``/``summaries`` count what this
+            run wrote (an incremental run writes only what changed); ``db`` carries the project
+            totals. With preview=true, a dry-run estimate instead.
         """
         if preview:
             return await manager.preview_directory(

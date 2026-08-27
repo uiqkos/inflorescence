@@ -58,6 +58,51 @@ def _normalize_direction(direction: str) -> str | dict:
     return normalized
 
 
+# Candidates listed when a name is ambiguous. Enough to recognise the one you meant,
+# short enough that an error stays an error rather than a search result; anything past it
+# is reported as a count so the caller knows the list was cut.
+MAX_NAME_CANDIDATES = 10
+# How many matches are fetched to produce that list. Beyond this the surplus is reported
+# as "N+ more" — the exact total is not worth a full scan of a common substring.
+_NAME_CANDIDATE_SCAN = 50
+
+
+def _describe_candidate(row: dict[str, object]) -> str:
+    """One candidate as ``id (node_type, file_path)`` — everything a precise re-call needs."""
+    return f"{row.get('id')} ({row.get('node_type')}, {row.get('file_path')})"
+
+
+async def _resolve_name(repo: GraphRepository, project: str, name: str) -> str | dict:
+    """Resolve a name substring to exactly one node id, or to the error explaining why not.
+
+    Returns the id on success and an ``error_response`` payload otherwise, so the caller
+    checks ``isinstance(result, dict)``. Ambiguity is never resolved by picking the first
+    match: "who calls X" answered about the wrong X is a wrong answer that looks right, and
+    the caller cannot tell. The error carries the candidates instead, so the next call is
+    exact rather than another guess.
+    """
+    rows = await repo.search_entities(project, name, None, _NAME_CANDIDATE_SCAN + 1, 0)
+    if not rows:
+        return error_response(
+            "not_found",
+            f"No indexed entity's name contains {name!r}. Names are matched case-insensitively "
+            "as a substring; for a term that appears in code or text rather than in a name, "
+            "use search_text.",
+        )
+    if len(rows) == 1:
+        return str(rows[0]["id"])
+    shown = [_describe_candidate(row) for row in rows[:MAX_NAME_CANDIDATES]]
+    surplus = len(rows) - len(shown)
+    more = ""
+    if surplus:
+        more = f", and {surplus}+ more" if len(rows) > _NAME_CANDIDATE_SCAN else f", and {surplus} more"
+    return error_response(
+        "ambiguous_name",
+        f"{name!r} matches more than one entity — re-call with node_id set to one of: "
+        f"{'; '.join(shown)}{more}.",
+    )
+
+
 async def _fetch_filtered_page(
     fetch_rows: FetchRows,
     filters: PathFilterConfig,
@@ -122,9 +167,10 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         so an unflagged item was checked and still matches the index. This is file-level:
         "stale" means the file changed after indexing (lines may have shifted, the summary
         may describe older code), not that this particular entity changed.
-        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
-        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
-        query indexes it almost for free (no LLM spend).
+        ``index_freshness.live_worktrees``, when present, is a sentence naming how many git
+        worktrees of this checkout are NOT in this index — their branch state is elsewhere;
+        ask with ``directory`` set to the worktree itself, which indexes it almost for free
+        (no LLM spend).
         """
         node_types = normalize_node_types(node_types)
         if isinstance(node_types, dict):
@@ -179,9 +225,10 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         ``"file_missing": true`` — so an unflagged item was checked and still matches the
         index. This is file-level: "stale" means the file changed after indexing (lines may
         have shifted, the summary may describe older code), not that this entity changed.
-        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
-        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
-        query indexes it almost for free (no LLM spend).
+        ``index_freshness.live_worktrees``, when present, is a sentence naming how many git
+        worktrees of this checkout are NOT in this index — their branch state is elsewhere;
+        ask with ``directory`` set to the worktree itself, which indexes it almost for free
+        (no LLM spend).
         """
         node_types = normalize_node_types(node_types)
         if isinstance(node_types, dict):
@@ -252,9 +299,10 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         ``"stale": true`` / ``"file_missing": true``, so an unflagged one was checked and
         still matches the index. This is file-level: "stale" means the file changed after
         indexing (lines may have shifted, the summary may describe older code), not that
-        this entity changed. ``index_freshness.live_worktrees`` > 0 means the state of those
-        worktrees' branches is NOT in this index — ask with ``directory`` set to the
-        worktree itself; that first query indexes it almost for free (no LLM spend).
+        this entity changed. ``index_freshness.live_worktrees``, when present, is a
+        sentence naming how many git worktrees of this checkout are NOT in this index —
+        their branch state is elsewhere; ask with ``directory`` set to the worktree itself,
+        which indexes it almost for free (no LLM spend).
         """
         project, not_indexed = await ensure_indexed(manager, directory)
         if not_indexed is not None:
@@ -297,7 +345,8 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
     @mcp.tool()
     async def get_related_entities(
         directory: str,
-        node_id: str,
+        node_id: str | None = None,
+        name: str | None = None,
         direction: str = "both",
         relation_types: list[str] | None = None,
         include_paths: list[str] | None = None,
@@ -307,7 +356,18 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
     ) -> dict:
         """Return entities related to a node by graph relationship.
 
-        ``direction`` selects which edges to follow relative to ``node_id``:
+        Name the entity with **exactly one** of ``node_id`` (an id from any search tool) or
+        ``name`` (a case-insensitive substring of an entity's name, resolved here). Passing
+        both, or neither, returns ``invalid_argument``. ``name`` is the one-call form of
+        "who calls X": ``get_related_entities(directory, name="load_board",
+        direction="incoming", relation_types=["CALLS"])``. It is resolved the way
+        ``search_entities`` matches, and ``meta.resolved_node_id`` reports what it resolved
+        to. A substring matching several entities is never resolved by picking one: the call
+        fails with ``ambiguous_name`` and lists the candidates (id, node_type, file_path) so
+        the next call can pass an exact ``node_id``; a substring matching nothing fails with
+        ``not_found``.
+
+        ``direction`` selects which edges to follow relative to that entity:
         ``"both"`` (default), ``"outgoing"`` (alias ``"out"``), or ``"incoming"``
         (alias ``"in"``). Matching is case-insensitive. Any other value returns
         an ``invalid_direction`` error instead of an empty result.
@@ -322,23 +382,38 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         — so an unflagged one was checked and still matches the index. This is file-level:
         "stale" means the file changed after indexing (lines may have shifted, the summary
         may describe older code), not that this entity changed.
-        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
-        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
-        query indexes it almost for free (no LLM spend).
+        ``index_freshness.live_worktrees``, when present, is a sentence naming how many git
+        worktrees of this checkout are NOT in this index — their branch state is elsewhere;
+        ask with ``directory`` set to the worktree itself, which indexes it almost for free
+        (no LLM spend).
         """
+        # Argument validation before anything that touches the DB or auto-indexes.
+        if bool(node_id) == bool(name):
+            return error_response(
+                "invalid_argument",
+                "Pass exactly one of node_id (an id from a search result) or name (a "
+                "case-insensitive substring of an entity's name), not both and not neither.",
+            )
         normalized_direction = _normalize_direction(direction)
         if isinstance(normalized_direction, dict):
             return normalized_direction
         project, not_indexed = await ensure_indexed(manager, directory)
         if not_indexed is not None:
             return not_indexed
+        resolved_node_id: str | None = None
+        if name:
+            resolved = await _resolve_name(repo, project, name)
+            if isinstance(resolved, dict):
+                return resolved
+            resolved_node_id = resolved
+        target_id = resolved_node_id or str(node_id)
         bounded_limit = clamp_limit(limit)
         bounded_offset = clamp_offset(offset)
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
         rows, truncated = await _fetch_filtered_page(
             lambda page_limit, page_offset: repo.get_related_entities(
                 project,
-                node_id,
+                target_id,
                 normalized_direction,
                 relation_types,
                 page_limit,
@@ -356,17 +431,22 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
                 "direction": row["direction"],
                 "entity": entity_ref(entity, summary_max_chars=NAV_SUMMARY_MAX_CHARS),
             })
+        meta: dict[str, object] = {
+            "project": project,
+            "node_id": target_id,
+            "direction": normalized_direction,
+            "relation_types": relation_types or [],
+            "path_filters": filters.meta(),
+        }
+        if resolved_node_id is not None:
+            # Present only on the name path: its presence *is* the statement "this id was
+            # resolved from a name, not given" (INV-7's flag convention).
+            meta["resolved_node_id"] = resolved_node_id
         payload = paginated_response(
             filtered_rows,
             bounded_limit,
             bounded_offset,
-            {
-                "project": project,
-                "node_id": node_id,
-                "direction": normalized_direction,
-                "relation_types": relation_types or [],
-                "path_filters": filters.meta(),
-            },
+            meta,
             truncated=truncated,
         )
         checker = await build_checker(repo, project, directory)
@@ -400,9 +480,10 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         so an unflagged item was checked and still matches the index. This is file-level:
         "stale" means the file changed after indexing (lines may have shifted, the summary
         may describe older code), not that this particular entity changed.
-        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
-        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
-        query indexes it almost for free (no LLM spend).
+        ``index_freshness.live_worktrees``, when present, is a sentence naming how many git
+        worktrees of this checkout are NOT in this index — their branch state is elsewhere;
+        ask with ``directory`` set to the worktree itself, which indexes it almost for free
+        (no LLM spend).
         """
         node_types = normalize_node_types(node_types)
         if isinstance(node_types, dict):

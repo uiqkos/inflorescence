@@ -16,9 +16,13 @@ First public release.
   instead of being dropped or guessed. See [docs/calls-resolution.md](docs/calls-resolution.md).
 - **External dependencies** — packages and base classes the project names but does not contain
   are stored as `:External` nodes rather than dropped at write time.
-- **Documents** — prose files (`.md`, `.rst`, `.txt`, `.adoc`, `.org` and friends) are indexed
-  as `Document` nodes: one node per file, no structure parsing, body split into overlapping
-  chunks and summarized by a prose-specific prompt. Turn off with `INDEX_DOCUMENTS=false`.
+- **Documents** — non-code files are indexed as `Document` nodes: prose (`.md`, `.rst`, `.txt`,
+  `.adoc`, `.org` and friends), stylesheets (`.css`, `.scss`, `.sass`, `.less`, `.styl`),
+  markup (`.html`, `.htm`) and configuration (`.json`, `.jsonc`, `.yaml`, `.yml`, `.toml`,
+  `.ini`, `.cfg`, `.conf`). One node per file, no structure parsing, body split into
+  overlapping chunks and summarized by a prose-specific prompt — so a CSS media query or a
+  build-config key is findable by its own text. Dependency lock files are never indexed;
+  oversized files are reported as `skipped_large_files`. Turn off with `INDEX_DOCUMENTS=false`.
 - **Dual RAG plus BM25** — code chunks and LLM summaries embedded into separate HNSW indexes
   and fused per entity; full-text indexes over names, signatures, summaries and raw code.
 - **12 MCP tools** — search by meaning, by text, by name and by code similarity; entity

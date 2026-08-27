@@ -1,18 +1,27 @@
-"""Documents (.md/.txt/...) are indexed whole: one node per file, body chunked with overlap.
+"""Documents are indexed whole: one node per file, body chunked with overlap.
+
+"Document" started as prose (.md/.txt/...) and now also covers styles, markup and
+configuration — the files a frontend question is half about. The bug that forced the
+widening: a real defect lived in ``@media (prefers-reduced-motion)`` inside ``index.css``
+and was not merely ranked low but *absent*, because no scan ever opened the file.
 
 The contract these guard:
-  * a prose file is *scanned* at all — before this it fell outside the registry's
-    extensions, so no scan saw it, no chunker touched it, and a repository's entire
-    documentation was invisible to every search tool;
-  * it produces exactly ONE node — no invented heading/section symbols;
+  * such a file is *scanned* at all — outside the registry's extensions, no scan sees it,
+    no chunker touches it, and it is invisible to every search tool;
+  * it produces exactly ONE node — no invented heading/section/selector symbols, and no
+    attempt to build an AST of a stylesheet;
   * its content reaches the index as overlapping chunks, so a passage cut by a window
     boundary survives whole in the neighbouring window;
   * the file-level bookkeeping (checksums, chunk-coverage) addresses it, so an unchanged
-    document costs nothing on re-index.
+    document costs nothing on re-index;
+  * the bulk that comes with admitting data formats stays out: lock files by name,
+    oversized files into ``skipped_large_files``, ignored trees not at all.
 """
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -20,7 +29,7 @@ import pytest
 from inflorescence.code_indexer.graph_builder import GraphBuilder
 from inflorescence.code_indexer.models import CodeNode, EdgeType, IndexerConfig, NodeType
 from inflorescence.code_indexer.parser.document_parser import DocumentParser
-from inflorescence.config import Settings
+from inflorescence.config import DEFAULT_DOCUMENT_EXTENSIONS, LOCKFILE_NAMES, Settings
 from inflorescence.db.repository import _NODE_TYPE_LABEL_BY_VALUE
 from inflorescence.rag.chunker import Chunker
 from inflorescence.rag.config import RAGConfig
@@ -287,3 +296,416 @@ def test_file_level_queries_address_documents_too(query_name: str) -> None:
     lowered = query.lower()
     assert ":code:module" not in lowered
     assert "module" in lowered and "document" in lowered
+
+
+# ===========================================================================
+# Styles, markup and configuration are documents too
+# ===========================================================================
+
+INDEX_CSS = """:root {
+  --accent: #2f6fed;
+  --card-radius: 12px;
+}
+
+.card {
+  border-radius: var(--card-radius);
+  transition: transform 220ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .card {
+    transition: none;
+    animation: none;
+  }
+}
+"""
+
+INDEX_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Widget console</title>
+    <link rel="stylesheet" href="/src/index.css" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+"""
+
+TSCONFIG_JSON = """{
+  "compilerOptions": {
+    "target": "ES2022",
+    "jsx": "react-jsx",
+    "strict": true,
+    "moduleResolution": "bundler"
+  },
+  "include": ["src"]
+}
+"""
+
+COMPOSE_YAML = """services:
+  memgraph:
+    image: memgraph/memgraph-mage:latest
+    ports:
+      - "7687:7687"
+"""
+
+# One representative file per newly admitted family, keyed by the extension under test.
+_NEW_DOCUMENT_FILES: dict[str, tuple[str, str]] = {
+    ".css": ("src/index.css", INDEX_CSS),
+    ".scss": ("src/theme.scss", "$accent: #2f6fed;\n.card { color: $accent; }\n"),
+    ".sass": ("src/theme.sass", ".card\n  color: #2f6fed\n"),
+    ".less": ("src/theme.less", "@accent: #2f6fed;\n.card { color: @accent; }\n"),
+    ".styl": ("src/theme.styl", "accent = #2f6fed\n.card\n  color accent\n"),
+    ".html": ("index.html", INDEX_HTML),
+    ".htm": ("legacy.htm", "<html><body>legacy entry point</body></html>\n"),
+    ".json": ("tsconfig.json", TSCONFIG_JSON),
+    ".jsonc": ("tsconfig.build.jsonc", '// build overrides\n{ "extends": "./tsconfig.json" }\n'),
+    ".yaml": ("docker-compose.yaml", COMPOSE_YAML),
+    ".yml": ("docker-compose.yml", COMPOSE_YAML),
+    ".toml": ("pyproject.toml", '[project]\nname = "widget"\nversion = "0.1.0"\n'),
+    ".ini": ("pytest.ini", "[pytest]\nasyncio_mode = auto\n"),
+    ".cfg": ("setup.cfg", "[flake8]\nmax-line-length = 100\n"),
+    ".conf": ("nginx.conf", "server {\n  listen 80;\n}\n"),
+}
+
+
+@pytest.mark.parametrize("extension", sorted(_NEW_DOCUMENT_FILES))
+def test_styles_markup_and_config_are_document_extensions(extension: str) -> None:
+    """The registry is what every downstream stage keys off — scan, watcher, preview, reconcile.
+
+    An extension missing here is not "ranked low", it is invisible: the walk never opens
+    the file. That is exactly how a defect in ``@media (prefers-reduced-motion)`` inside
+    index.css was unfindable through this server.
+    """
+    assert extension in DEFAULT_DOCUMENT_EXTENSIONS
+    assert extension in DocumentParser().get_supported_extensions()
+    assert extension in GraphBuilder(repo=None, llm=None, config=_NO_LLM).extensions
+
+
+@pytest.mark.parametrize("extension", [".xml", ".vue", ".svelte", ".csv", ".env", ".lock", ".svg"])
+def test_deliberately_excluded_extensions_stay_out(extension: str) -> None:
+    """Pinned decisions, so widening one of them is a conscious edit rather than a drift.
+
+    ``.xml`` is dominated by machine-written trees (IDE settings, JUnit/coverage reports,
+    generated resources) whose tag soup chunks and embeds badly, and its hand-written uses
+    belong to toolchains with no parser here. ``.vue``/``.svelte`` are *code* with no parser
+    — indexing them as prose would claim coverage the graph does not have. ``.csv`` is data
+    with no prose at all, ``.env`` holds secrets, ``.lock``/``.svg`` are generated bulk.
+    """
+    assert extension not in DEFAULT_DOCUMENT_EXTENSIONS
+
+
+@pytest.mark.asyncio
+async def test_build_stores_styles_markup_and_config_as_documents_with_checksums(
+    tmp_path: Path,
+) -> None:
+    """One Document node per file, hung off its directory, with a checksum.
+
+    The checksum is the whole freshness/reuse story: it is what ``GET_CHECKSUMS`` reads
+    (``n:Module OR n:Document``), what makes an unchanged stylesheet free on the next run,
+    and what stale-detection compares against disk. A new file kind that produced nodes but
+    no checksums would be re-summarized and re-embedded on every single update.
+    """
+    (tmp_path / "src").mkdir()
+    for rel, text in _NEW_DOCUMENT_FILES.values():
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    (tmp_path / "app.py").write_text("def app():\n    return 1\n", encoding="utf-8")
+
+    repo = _RecordingRepository()
+    nodes, edges = await GraphBuilder(repo=repo, llm=None, config=_NO_LLM).build("fixture", tmp_path)
+
+    expected = {rel for rel, _ in _NEW_DOCUMENT_FILES.values()}
+    documents = {n.file_path: n for n in nodes if n.node_type == NodeType.DOCUMENT}
+    assert expected <= set(documents)
+    # Exactly one node per file: no selectors, no `<head>`, no JSON keys became symbols.
+    assert [n.file_path for n in nodes].count("src/index.css") == 1
+    assert not any(n.id.startswith("src/index.css::") for n in nodes)
+    contains = {(e.source, e.target) for e in edges if e.edge_type == EdgeType.CONTAINS}
+    assert ("dir:src", "src/index.css") in contains
+    assert ("dir:.", "index.html") in contains
+    assert expected <= repo.checksums
+
+
+@pytest.mark.asyncio
+async def test_lock_files_are_never_indexed(tmp_path: Path) -> None:
+    """A resolver transcript mentions every package in the tree and changes on every install.
+
+    Dropped **by name**, before include patterns are consulted — an explicit
+    ``include_patterns=["*"]`` must not pull one in either.
+    """
+    (tmp_path / "package.json").write_text('{"name": "widget"}\n', encoding="utf-8")
+    lock_body = json.dumps({"packages": {f"node_modules/pkg{i}": {"version": "1.0.0"} for i in range(40)}})
+    for name in ("package-lock.json", "npm-shrinkwrap.json", "packages.lock.json"):
+        (tmp_path / name).write_text(lock_body, encoding="utf-8")
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\npackages:\n  pkg: {}\n", encoding="utf-8")
+
+    builder = GraphBuilder(repo=_RecordingRepository(), llm=None, config=_NO_LLM)
+    nodes, _ = await builder.build("fixture", tmp_path, include_patterns=["*"])
+
+    indexed = {n.file_path for n in nodes if n.file_path}
+    assert "package.json" in indexed, "package.json is hand-written and belongs in the index"
+    assert not (indexed & LOCKFILE_NAMES)
+    # The preview must quote the same world it would index, or the estimate is a lie.
+    preview = builder.preview(tmp_path)
+    assert preview["files"] == 1
+    assert not any(f["path"] in LOCKFILE_NAMES for f in preview["largest_files"])  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_generated_config_is_reported_not_indexed(tmp_path: Path) -> None:
+    """``skipped_large_files`` is the honest channel for "this exists and I did not read it".
+
+    A generated 200-key JSON blob is exactly the bulk that admitting data formats risks
+    paying for. It must be named in the response — both in the preview and in the build
+    result — rather than silently dropped or silently summarized.
+    """
+    (tmp_path / "small.json").write_text('{"a": 1}\n', encoding="utf-8")
+    (tmp_path / "generated.json").write_text(
+        json.dumps({f"key{i}": "x" * 200 for i in range(200)}), encoding="utf-8"
+    )
+    (tmp_path / "huge.css").write_text(".a { color: red; }\n" * 4000, encoding="utf-8")
+
+    config = IndexerConfig(
+        use_llm_summaries=False, use_llm_fallback_parser=False, max_file_size_bytes=4096
+    )
+    builder = GraphBuilder(repo=_RecordingRepository(), llm=None, config=config)
+    result = await builder.build("fixture", tmp_path)
+
+    assert set(result.skipped_large_files) == {"generated.json", "huge.css"}
+    assert {n.file_path for n in result.nodes if n.node_type == NodeType.DOCUMENT} == {"small.json"}
+    assert set(builder.preview(tmp_path)["skipped_large_files"]) == {"generated.json", "huge.css"}  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_ignored_and_excluded_trees_do_not_leak_config_or_styles(tmp_path: Path) -> None:
+    """node_modules and dist are where generated JSON/CSS lives by the megabyte.
+
+    They were already kept out for code; the point here is that widening the extension set
+    did not open a side door into them.
+    """
+    (tmp_path / ".gitignore").write_text("dist/\ncoverage.json\n", encoding="utf-8")
+    for rel in (
+        "node_modules/pkg/package.json",
+        "node_modules/pkg/style.css",
+        "dist/assets/index.css",
+        "dist/index.html",
+        ".next/build-manifest.json",
+    ):
+        target = tmp_path / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n", encoding="utf-8")
+    (tmp_path / "coverage.json").write_text('{"total": 1}\n', encoding="utf-8")
+    (tmp_path / "index.html").write_text(INDEX_HTML, encoding="utf-8")
+
+    nodes, _ = await GraphBuilder(repo=_RecordingRepository(), llm=None, config=_NO_LLM).build(
+        "fixture", tmp_path
+    )
+
+    assert {n.file_path for n in nodes if n.node_type == NodeType.DOCUMENT} == {"index.html"}
+
+
+def test_preview_prices_the_new_document_types(tmp_path: Path) -> None:
+    """Widening the scan raises the estimate for existing projects — the preview must say so.
+
+    ``index_directory(preview=true)`` is the only thing between a user and an unexpected
+    bill, so the new files have to be inside its file count, its byte total and its
+    per-language breakdown, not appear for the first time when the run is already paying.
+    """
+    (tmp_path / "app.py").write_text("def app():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "index.html").write_text(INDEX_HTML, encoding="utf-8")
+    (tmp_path / "index.css").write_text(INDEX_CSS, encoding="utf-8")
+    (tmp_path / "tsconfig.json").write_text(TSCONFIG_JSON, encoding="utf-8")
+    (tmp_path / "docker-compose.yml").write_text(COMPOSE_YAML, encoding="utf-8")
+
+    with_documents = GraphBuilder(repo=None, llm=None, config=_NO_LLM).preview(tmp_path)
+    code_only = GraphBuilder(
+        repo=None, llm=None,
+        config=IndexerConfig(use_llm_summaries=False, use_llm_fallback_parser=False, index_documents=False),
+    ).preview(tmp_path)
+
+    assert with_documents["files"] == 5 and code_only["files"] == 1
+    assert set(with_documents["languages"]) == {"python", "html", "css", "json", "yaml"}  # type: ignore[arg-type]
+    assert with_documents["estimated_tokens"] > code_only["estimated_tokens"]  # type: ignore[operator]
+    assert with_documents["estimated_nodes"] > code_only["estimated_nodes"]  # type: ignore[operator]
+
+
+def test_a_stylesheet_is_chunked_as_a_document_not_parsed_as_code(tmp_path: Path) -> None:
+    """The media query must survive verbatim in a chunk — that is what BM25 will match.
+
+    And the chunk must come from the document path: a CSS AST split would produce chunks
+    bound to symbols this graph never created.
+    """
+    (tmp_path / "index.css").write_text(INDEX_CSS, encoding="utf-8")
+    nodes, _ = DocumentParser().parse_file(tmp_path / "index.css", tmp_path)
+
+    chunks = Chunker().chunk_repository(tmp_path, nodes)
+
+    assert {c.chunk_kind for c in chunks} == {"document"}
+    assert {c.node_id for c in chunks} == {"index.css"}
+    assert {c.language for c in chunks} == {"css"}
+    assert any("prefers-reduced-motion" in c.content for c in chunks)
+
+
+@pytest.mark.parametrize(
+    ("name", "language"),
+    [("index.css", "css"), ("index.html", "html"), ("tsconfig.json", "json"), ("app.yml", "yaml")],
+)
+def test_chunk_file_takes_the_document_path_for_document_formats(
+    tmp_path: Path, name: str, language: str
+) -> None:
+    """``chunk_file`` and ``chunk_repository`` must not chunk the same stylesheet two ways.
+
+    Several document formats (.css, .html, .json, .yaml, .toml) also have a tree-sitter
+    CodeSplitter grammar, so the ordering of the two lookups decides whether this entry
+    point builds an AST of a file the pipeline treats as text.
+    """
+    (tmp_path / name).write_text(INDEX_CSS if name.endswith(".css") else INDEX_HTML, encoding="utf-8")
+
+    chunks = Chunker().chunk_file(tmp_path / name, tmp_path)
+
+    assert chunks and {c.language for c in chunks} == {language}
+    assert {c.chunk_kind for c in chunks} == {"fallback_text"}  # the text path, not _chunk_code
+
+
+# ===========================================================================
+# Live · the regression the widening exists for
+# ===========================================================================
+
+LIVE_URL = os.environ.get("INFLORESCENCE_TEST_MEMGRAPH_URL")
+live = pytest.mark.skipif(
+    not LIVE_URL,
+    reason="set INFLORESCENCE_TEST_MEMGRAPH_URL to a throwaway Memgraph-MAGE instance to run",
+)
+
+_DIM = 1536
+
+
+class _LiveLLM:
+    """Summarizes without spending: the claim under test is retrieval, not summary quality."""
+
+    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+        return "a concise summary"
+
+    async def close(self) -> None:
+        return None
+
+
+class _LiveEmbedder:
+    """Deterministic 1536-dim vectors — BM25 needs the chunk rows, not their geometry."""
+
+    def __init__(self) -> None:
+        self.model = "fake-embed"
+
+    def preflight(self) -> None:
+        return None
+
+    def embed(self, texts):
+        return [[0.01 * ((i % 97) + 1)] * _DIM for i, _ in enumerate(list(texts))]
+
+
+@live
+@pytest.mark.asyncio
+async def test_a_css_media_query_is_findable_by_search_text_live(tmp_path: Path) -> None:
+    """The dogfooding miss, end to end against a real Memgraph and the real MCP tool.
+
+    A frontend defect lived in ``@media (prefers-reduced-motion)`` inside ``index.css``.
+    Asking this server for it returned nothing — not a bad ranking, an empty result, because
+    the file was never scanned. This indexes a mini project the same way the server does and
+    asks ``search_text`` the question that failed: the stylesheet must come back, as a
+    ``document`` entity, with the media query among its matches.
+    """
+    import json as _json
+
+    from mcp.server.fastmcp import FastMCP
+
+    from inflorescence.code_indexer.graph_builder import GraphBuilder as _GraphBuilder
+    from inflorescence.db.connection import MemgraphConnection
+    from inflorescence.db.repository import GraphRepository
+    from inflorescence.db.schema import setup_schema
+    from inflorescence.project_manager import ProjectManager
+    from inflorescence.rag.indexer import RAGIndexer
+    from inflorescence.tools.search import register_search_tools
+
+    project_root = tmp_path / "frontend"
+    (project_root / "src").mkdir(parents=True)
+    (project_root / "src" / "index.css").write_text(INDEX_CSS, encoding="utf-8")
+    (project_root / "index.html").write_text(INDEX_HTML, encoding="utf-8")
+    (project_root / "tsconfig.json").write_text(TSCONFIG_JSON, encoding="utf-8")
+    (project_root / "package-lock.json").write_text(
+        _json.dumps({"packages": {"node_modules/motion": {"version": "1.0.0"}}}), encoding="utf-8"
+    )
+    (project_root / "src" / "main.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+
+    settings = Settings(_env_file=None, memgraph_url=LIVE_URL, embedding_dimension=_DIM)
+    conn = MemgraphConnection(settings)
+    await setup_schema(conn)
+    repo = GraphRepository(conn)
+    builder = _GraphBuilder(
+        repo=repo, llm=_LiveLLM(), settings=settings,
+        config=IndexerConfig.from_settings(settings).model_copy(update={"use_scip_semantic": False}),
+    )
+    rag = RAGIndexer(repo=repo, settings=settings)
+    rag._code_embedder = _LiveEmbedder()  # type: ignore[assignment]
+    rag._summary_embedder = _LiveEmbedder()  # type: ignore[assignment]
+    manager = ProjectManager(
+        repo=repo, graph_builder=builder, rag_indexer=rag, settings=settings, conn=conn
+    )
+    project = manager.get_project(str(project_root))
+    try:
+        await conn.execute_write("MATCH (n {project: $p}) DETACH DELETE n", {"p": project})
+        await manager.index_directory(str(project_root))
+
+        mcp = FastMCP("t")
+        register_search_tools(mcp, manager, repo, settings)
+
+        def _payload(res):
+            content = res[0] if isinstance(res, tuple) else res
+            return _json.loads(content[0].text)
+
+        payload = _payload(await mcp.call_tool(
+            "search_text", {"directory": str(project_root), "query": "prefers-reduced-motion"}
+        ))
+
+        assert "error" not in payload, payload
+        hits = {item["entity"]["file_path"]: item for item in payload["items"]}
+        assert "src/index.css" in hits, (
+            "the stylesheet holding @media (prefers-reduced-motion) was not findable — "
+            f"got {sorted(hits)}"
+        )
+        assert hits["src/index.css"]["entity"]["node_type"] == "document"
+        # The hit came from a chunk of the file body — and that chunk really holds the media
+        # query, so the match is the rule itself and not the file name catching a token.
+        chunk_ids = [m["chunk_id"] for m in hits["src/index.css"].get("matches", [])]
+        assert chunk_ids, hits["src/index.css"]
+        chunk_rows = await conn.execute_query(
+            "MATCH (c:CodeChunk {project: $p}) WHERE c.id IN $ids RETURN c.content AS content",
+            {"p": project, "ids": chunk_ids},
+        )
+        assert any("prefers-reduced-motion" in str(r["content"]) for r in chunk_rows)
+
+        # The other newly admitted kinds landed too, and the lock file did not.
+        indexed = {
+            str(r["p"]) for r in await conn.execute_query(
+                "MATCH (n:Document {project: $p}) RETURN n.file_path AS p", {"p": project}
+            )
+        }
+        assert indexed == {"src/index.css", "index.html", "tsconfig.json"}
+
+        # The bookkeeping the recent features hang off, read back from the live graph for a
+        # file kind that did not exist when they were written:
+        #   * a checksum, so freshness/stale-detection can compare it against disk and so a
+        #     re-index reuses it instead of paying again (GET_CHECKSUMS: n:Module OR n:Document);
+        #   * no stale-chunk entry, so MARK_CHUNKS_COVERED stamped it and the repair pass will
+        #     not re-chunk and re-embed the stylesheet on every run.
+        checksums = await repo.get_checksums(project)
+        assert {"src/index.css", "index.html", "tsconfig.json"} <= set(checksums)
+        assert await repo.get_files_with_stale_chunks(project) == []
+    finally:
+        await conn.execute_write("MATCH (n {project: $p}) DETACH DELETE n", {"p": project})
+        await conn.close()

@@ -27,6 +27,29 @@ def _chunk_id(chunk: Chunk) -> str:
     return f"chunk:{hashlib.sha256(identity.encode()).hexdigest()[:16]}"
 
 
+def _already_stored(fact: dict[str, object] | None, chunk: Chunk) -> bool:
+    """True when storing *chunk* would write a row the database already holds.
+
+    *fact* is what :meth:`GraphRepository.get_stored_chunk_facts` found for this chunk's id
+    (``None`` when nothing is stored, or nothing usable). The id itself proves the node id,
+    file path, line span, kind and content match — it is a hash of exactly those — so the
+    only fields left to compare are the two the hash does not cover: the language, and
+    whether the HAS_CHUNK edge from *this* chunk's owning node exists, since the store
+    statement creates that edge and skipping the store would skip it too.
+
+    Deliberately *not* compared: whether the stored vector was produced by the currently
+    configured embedding model. Nothing records that per chunk, and the reuse this replaces
+    made the same assumption — a model change is a re-index, not something an incremental
+    run can detect.
+    """
+    if fact is None:
+        return False
+    if str(fact.get("language") or "") != (chunk.language or ""):
+        return False
+    node_ids = fact.get("node_ids")
+    return isinstance(node_ids, set) and chunk.node_id in node_ids
+
+
 class RAGIndexer:
     """Chunks source files, embeds them, and stores vectors in Memgraph."""
 
@@ -95,15 +118,31 @@ class RAGIndexer:
         reconcilable_files: set[str] | None = None,
         progress: ProgressReporter | None = None,
     ) -> int:
-        """Chunk source files, embed only new/changed chunks, store CodeChunk nodes.
+        """Chunk source files, embed only new chunks, store the CodeChunk rows that changed.
 
-        Chunks whose content-derived id is already in *stored_chunk_embeddings* reuse that
-        embedding (no API call). With *prune_stale*, chunks stored in the DB but absent
-        from this run are deleted afterwards — skipped when any embedding failed, so an
-        API outage can never shrink the stored chunk set. When *reconcilable_files* is
-        given, pruning is scoped to those files: a file a read/parse failure dropped from
-        the build keeps its stale chunks instead of being emptied (INV-1/INV-3, finding 4).
-        Returns the number of chunks stored.
+        Two different economies, in this order:
+
+        * **Skip.** A chunk the database already holds *exactly as this run would write it*
+          is not written at all (:meth:`GraphRepository.get_stored_chunk_facts`). The chunk
+          id hashes node, file, line span, kind and content, so a stored id proves all of
+          those; the read confirms the two facts the id does not cover — the language and the
+          HAS_CHUNK owner — plus that a vector is present. On an incremental update, where
+          the whole project is re-chunked but one file moved, this is the difference between
+          re-writing every chunk row (and its vector-index entry) and touching a handful
+          (INV-5). Skipped chunks still count as **kept** for pruning and their files are
+          still marked covered: nothing about the world the repair pass sees changes.
+        * **Reuse.** A chunk that must be written but whose vector the database (or a donor
+          project, via *stored_chunk_embeddings*) already has is written with that vector
+          instead of a paid embedding call.
+
+        With *prune_stale*, chunks stored in the DB but absent from this run are deleted
+        afterwards — skipped when any embedding failed, so an API outage can never shrink the
+        stored chunk set. When *reconcilable_files* is given, pruning is scoped to those
+        files: a file a read/parse failure dropped from the build keeps its stale chunks
+        instead of being emptied (INV-1/INV-3, finding 4).
+
+        Returns the number of chunks **written**, which no longer counts the chunks that were
+        already correct in the database.
         """
         stored = stored_chunk_embeddings or {}
         bar = resolve(progress)
@@ -137,17 +176,48 @@ class RAGIndexer:
         total = len(prepared)
         logger.info("Indexing %d code chunks in windows of %d for project=%s", total, self._batch_size, project)
 
+        # One scoped read decides, for the whole run, which rows are already correct. Done
+        # up front rather than per window so the store phase stays a straight loop, and
+        # because the answer also tells us which stored vectors have to be recovered below.
+        already = await self._repo.get_stored_chunk_facts(project, [cid for _, cid in prepared])
+        skip_ids = {
+            chunk_id for chunk, chunk_id in prepared
+            if _already_stored(already.get(chunk_id), chunk)
+        }
+        rewrite_ids = [
+            chunk_id for _chunk, chunk_id in prepared
+            if chunk_id in already and chunk_id not in skip_ids
+        ]
+        if rewrite_ids:
+            # Present, but not in the shape this run would write it (a re-mapped language, a
+            # HAS_CHUNK edge its node's deletion took with it). The row must be re-written —
+            # but its vector is right there in the database, so paying to embed the same text
+            # again would be spending money to learn what we already know (INV-5).
+            logger.info(
+                "Re-writing %d stored chunk(s) whose row no longer matches this run for "
+                "project=%s (their stored vectors are reused, not re-embedded)",
+                len(rewrite_ids), project,
+            )
+            stored = {**stored, **await self._repo.get_stored_chunk_embeddings_for_ids(project, rewrite_ids)}
+
         stored_count = 0
         embedded_count = 0
         failed_count = 0
         reused_count = 0
+        skipped_count = 0
         # Embed + store one window at a time so peak embedding-vector memory is
         # bounded and each window commits to Memgraph before the next is built.
         for start in range(0, total, self._batch_size):
             window = prepared[start : start + self._batch_size]
+            # Chunks the database already holds exactly as written drop out here: no embed
+            # call, no store, no vector-index update. They stay in `prepared`, so pruning
+            # and coverage below still see them as this run's own chunks.
+            pending = [(chunk, chunk_id) for chunk, chunk_id in window if chunk_id not in skip_ids]
+            skipped_count += len(window) - len(pending)
+
             local_idx: list[int] = []
             texts: list[str] = []
-            for j, (chunk, chunk_id) in enumerate(window):
+            for j, (chunk, chunk_id) in enumerate(pending):
                 if chunk_id not in stored:
                     local_idx.append(j)
                     texts.append(chunk.content)
@@ -158,7 +228,7 @@ class RAGIndexer:
             failed_count += sum(1 for e in fresh if e is None)
 
             batch: list[dict[str, object]] = []
-            for j, (chunk, chunk_id) in enumerate(window):
+            for j, (chunk, chunk_id) in enumerate(pending):
                 if j in fresh_by_local:
                     embedding = fresh_by_local[j]
                 else:
@@ -194,12 +264,18 @@ class RAGIndexer:
             if prune_stale:
                 keep = {chunk_id for _, chunk_id in prepared}
                 await self._prune_stale_chunks(project, keep, reconcilable_files)
-            # No embedding failed: every chunk of every file this run handled is now stored,
-            # so mark those files fully covered for their current content (audit finding 8b).
+            # No embedding failed: every chunk of every file this run handled is now stored —
+            # the ones it wrote and the ones that were already stored — so mark those files
+            # fully covered for their current content (audit finding 8b). A file whose chunks
+            # were *all* skipped is just as covered as one that was rewritten; anything else
+            # would flag it as stale forever and re-chunk it on every run.
             await self._mark_chunks_covered(project, run_files)
 
-        logger.info("Stored %d code chunks (%d embedded, %d reused, %d failed) for project=%s",
-                    stored_count, embedded_count, reused_count, failed_count, project)
+        logger.info(
+            "Stored %d code chunks (%d embedded, %d reused, %d already in the database, "
+            "%d failed) for project=%s",
+            stored_count, embedded_count, reused_count, skipped_count, failed_count, project,
+        )
         return stored_count
 
     async def _prune_stale_chunks(
@@ -252,7 +328,27 @@ class RAGIndexer:
     ) -> int:
         """Embed summaries and store them, reusing stored embeddings for non-dirty nodes.
 
-        Returns the number of embeddings stored.
+        Reuse takes one of two shapes, decided by what the *stored_summaries* entry carries:
+
+        * the entry holds a ``summary_embedding`` — the vector lives somewhere this project
+          cannot read it from (the donor of a client-side worktree seeding), so it is written
+          into this project verbatim, keeping its **original** hash so a legacy vector is
+          never silently stamped fresh;
+        * the entry only reports ``has_embedding`` — the vector is already stored on this very
+          node (:meth:`GraphRepository.get_stored_summaries_light`), so the node is **skipped
+          entirely**. Re-writing an identical vector costs a Bolt round trip and a
+          vector-index update per node and changes nothing (INV-5); on an incremental update
+          that was the single most expensive thing this method did.
+
+        Either way reuse requires the vector to still be *fresh* for the current summary: its
+        recorded hash matches this node's input hash, or it is a legacy vector predating the
+        marker (hash absent, assumed fresh — the same rule
+        ``GET_STALE_SUMMARY_EMBEDDINGS`` applies, so skipping can never hide a genuinely
+        stale vector from the repair pass). A mismatched hash means the summary was
+        regenerated but its embedding never caught up — re-embed it (audit finding 8a).
+
+        Returns the number of embeddings **written**, which no longer counts nodes that were
+        already correct in the database.
         """
         stored = stored_summaries or {}
         bar = resolve(progress)
@@ -265,6 +361,7 @@ class RAGIndexer:
         stored_count = 0
         embedded_count = 0
         failed_count = 0
+        skipped_count = 0
         # Window the embed + store so peak memory stays bounded and each window persists.
         for start in range(0, total, self._batch_size):
             window = nodes_with_summaries[start : start + self._batch_size]
@@ -275,16 +372,23 @@ class RAGIndexer:
                     prev = stored.get(node.id) or {}
                     reused = prev.get("summary_embedding")
                     prev_hash = prev.get("summary_embedding_hash")
-                    # Reuse a stored vector only when it is still *fresh* for the current
-                    # summary: its recorded hash matches this node's input hash, or it is a
-                    # legacy vector predating the marker (hash absent, assumed fresh). A
-                    # vector whose hash no longer matches means the summary was regenerated
-                    # but its embedding never caught up — re-embed it (audit finding 8a).
-                    # The reused vector is re-stored with its *original* hash so a legacy
-                    # embedding is never silently stamped fresh.
-                    if reused is not None and (prev_hash is None or prev_hash == node.summary_input_hash):
-                        items.append({"node_id": node.id, "embedding": reused, "embedding_hash": prev_hash})
-                        continue
+                    # Freshness gate first (audit finding 8a): a vector whose recorded hash no
+                    # longer matches this node's input hash is stale whichever shape it came
+                    # in, and falls through to re-embedding.
+                    if prev_hash is None or prev_hash == node.summary_input_hash:
+                        if reused is not None:
+                            # Cross-project reuse: carry the vector over under its ORIGINAL
+                            # hash, so a legacy embedding is never stamped fresh.
+                            items.append({"node_id": node.id, "embedding": reused, "embedding_hash": prev_hash})
+                            continue
+                        if prev.get("has_embedding"):
+                            # Same-project reuse: the fresh vector is already on this node.
+                            # Writing it back would produce byte-identical properties at the
+                            # cost of a vector-index update — pure spend, so skip the node
+                            # (INV-5). The database is left exactly as the freshness gate
+                            # found it, so the repair pass keeps seeing the same world.
+                            skipped_count += 1
+                            continue
                 to_embed.append(node)
 
             if to_embed:
@@ -313,7 +417,8 @@ class RAGIndexer:
                 failed_count, project,
             )
         logger.info(
-            "Stored %d summary embeddings (%d re-embedded, %d failed) for project=%s",
-            stored_count, embedded_count, failed_count, project,
+            "Stored %d summary embeddings (%d re-embedded, %d already fresh in the database, "
+            "%d failed) for project=%s",
+            stored_count, embedded_count, skipped_count, failed_count, project,
         )
         return stored_count

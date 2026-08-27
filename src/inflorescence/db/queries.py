@@ -213,9 +213,86 @@ RETURN n.id AS id, n.summary AS summary,
        n.summary_embedding_hash AS summary_embedding_hash
 """
 
+# The same rows as GET_STORED_SUMMARIES **without the vectors**. A summary embedding is
+# 1536 floats; a project of a few thousand nodes moves tens of megabytes over Bolt just to
+# answer "which summaries can I reuse by hash?" — which needs only the text and the two
+# hashes. Measured on 5.5k nodes: 5.3s with the vectors, ~0.1s without.
+#
+# `has_embedding` replaces the vector for the one remaining decision it was used for: an
+# incremental run must know whether a *fresh* vector already exists for this node (skip it
+# entirely) or not (embed it). The vector itself is only needed when it has to be COPIED
+# somewhere else — the client-side worktree seeding, which reads another project's summaries
+# and writes them into a new one — and that path still uses GET_STORED_SUMMARIES.
+GET_STORED_SUMMARIES_LIGHT = """
+MATCH (n:Code {project: $project})
+WHERE n.summary IS NOT NULL AND n.summary <> ''
+RETURN n.id AS id, n.summary AS summary,
+       n.summary_input_hash AS summary_input_hash,
+       n.summary_embedding_hash AS summary_embedding_hash,
+       (n.summary_embedding IS NOT NULL) AS has_embedding
+"""
+
 GET_STORED_CHUNK_EMBEDDINGS = """
 MATCH (c:CodeChunk {project: $project})
 RETURN c.id AS chunk_id, c.embedding AS embedding
+"""
+
+# "Which of these chunks does the database already hold exactly as this run would write
+# them?" — the question that lets an incremental index stop re-writing thousands of
+# byte-identical chunk rows (INV-5). A chunk id hashes the owning node, the file path, the
+# line span, the chunk kind and the content, so an id match already proves all of those
+# equal; this returns the only two facts a matching id does *not* pin down, so the writer can
+# prove the row is a no-op before skipping it:
+#
+#   * `language` is not part of the id hash, so a chunker whose language mapping changed
+#     would otherwise leave the old value behind forever;
+#   * the owning node's id comes from the HAS_CHUNK edge, so a chunk whose edge is missing
+#     (its Code node was deleted and recreated) is re-written rather than left dangling —
+#     STORE_CODE_CHUNKS_BATCH creates that edge, and skipping the write would skip the edge.
+#
+# `c.embedding IS NOT NULL` is the third condition: a chunk row with no vector is unusable
+# for search, so it is not "already stored" in any sense that matters.
+#
+# Scoped by id, never by project: the whole point is that an update pays in proportion to
+# what changed, so the caller batches its own chunk ids in instead of scanning the project.
+GET_STORED_CHUNK_FACTS = """
+MATCH (c:CodeChunk {project: $project})
+WHERE c.id IN $ids AND c.embedding IS NOT NULL
+OPTIONAL MATCH (n:Code)-[:HAS_CHUNK]->(c)
+RETURN c.id AS id, c.language AS language, n.id AS node_id
+"""
+
+# The stored vectors of named chunks. Used for the one case GET_STORED_CHUNK_FACTS above
+# reports as "present but not what this run would write": the row has to be re-written, and
+# its embedding is already in the database, so re-embedding it would be paying twice for the
+# same vector (INV-5). Addressed by id and expected to match a handful of chunks — the
+# whole-project and per-file variants exist for the paths that really do need bulk vectors.
+GET_STORED_CHUNK_EMBEDDINGS_FOR_IDS = """
+MATCH (c:CodeChunk {project: $project})
+WHERE c.id IN $ids
+RETURN c.id AS chunk_id, c.embedding AS embedding
+"""
+
+# The node properties an *unchanged file's* row can still legitimately differ in, and
+# nothing else. Everything else a node row carries — name, lines, signature, docstring,
+# labels, parent — is a pure function of the file's own content, so an unchanged checksum
+# already proves it unchanged. These three are not: they are produced by the whole-project
+# call resolution, so editing file B can change what file A's untouched function is
+# recorded as calling (an unresolved call becoming an external one, a heuristic file being
+# upgraded to semantic provenance).
+#
+# An incremental update re-parses and re-resolves the whole project (it must — CALLS edges
+# are cross-file), then re-upserts every node in it, which is thousands of idempotent MERGEs
+# for data that did not move. Reading these three fields for the unchanged files is what lets
+# the writer prove a row is already correct and skip it. A node id absent from the result
+# has no stored row at all and must always be written.
+GET_STORED_CALL_FACTS = """
+MATCH (n:Code {project: $project})
+WHERE n.file_path IN $file_paths
+RETURN n.id AS id, n.file_path AS file_path,
+       n.external_calls AS external_calls,
+       n.unresolved_calls AS unresolved_calls,
+       n.calls_provenance AS calls_provenance
 """
 
 # Repair queries: detect state a killed index run left incomplete. The unchanged
@@ -638,6 +715,28 @@ MATCH (m:CloneMarker {project: $project})
 DELETE m
 """
 
+# The id ranges one label group is split into so its copy can run on several connections at
+# once. Returned as *interior* boundaries: with `$shards` = 4 this yields 3 ids, which the
+# repository turns into 4 contiguous `(after, upper]` windows.
+#
+# Computed server-side and returning only `$shards - 1` ids, so splitting a group costs one
+# sorted label scan and a handful of strings on the wire — never the id list itself. The
+# `collect` does hold the group's ids in server memory for the length of the query; that is
+# the same order of magnitude the copy it plans is about to move, and it happens once per
+# group instead of once per batch (the keyset loop re-sorts the group for *every* window).
+#
+# The CASE guard is not decorative: `ids[k]` on a list shorter than `k` is an error, so a
+# group smaller than the shard count declines to be split and is copied by a single worker.
+CLONE_SHARD_BOUNDARIES_TEMPLATE = """
+MATCH (n:{label} {{project: $source}})
+WITH n.id AS id ORDER BY id
+WITH collect(id) AS ids
+RETURN size(ids) AS total,
+       CASE WHEN size(ids) < $shards THEN []
+            ELSE [i IN range(1, $shards - 1) | ids[toInteger(size(ids) * i / $shards)]]
+       END AS boundaries
+"""
+
 # One label group of Code nodes, keyset-paginated by id so a huge project is copied in
 # bounded transactions instead of one that has to hold every vector in the project at once.
 # `SET m = properties(n)` copies *everything* — summary, summary_embedding, checksum,
@@ -645,9 +744,15 @@ DELETE m
 # the order matters, since properties(n) carries the source's own project value.
 # `max(n.id)` is the cursor: ORDER BY + LIMIT yields a contiguous prefix, so the largest id
 # in the batch is where the next one resumes.
+#
+# `$after`/`$upper` bound the window this statement is allowed to touch, so several copies of
+# it can run concurrently on disjoint id ranges (see CLONE_SHARD_BOUNDARIES_TEMPLATE). Empty
+# string means "unbounded" on both ends — every id sorts above `''`, and the *last* shard is
+# always left open so a row appended to the source after the boundaries were sampled is still
+# copied rather than silently dropped between the last boundary and the end of the group.
 CLONE_NODES_TEMPLATE = """
 MATCH (n:Code:{node_label} {{project: $source}})
-WHERE n.id > $after
+WHERE n.id > $after AND ($upper = '' OR n.id <= $upper)
 WITH n ORDER BY n.id LIMIT $limit
 CREATE (m:Code:{node_label})
 SET m = properties(n)
@@ -656,12 +761,12 @@ RETURN count(m) AS written, max(n.id) AS last
 """
 
 # Chunks carry the code embeddings — the expensive half of the copy, and the whole reason
-# this path exists. Same keyset pagination, and the vector index picks the created nodes up
-# exactly as it does for a client-side write (verified live: vector search over the clone
-# returns the cloned chunks).
+# this path exists. Same keyset pagination, same shard bounds, and the vector index picks the
+# created nodes up exactly as it does for a client-side write (verified live: vector search
+# over the clone returns the cloned chunks).
 CLONE_CHUNKS = """
 MATCH (n:CodeChunk {project: $source})
-WHERE n.id > $after
+WHERE n.id > $after AND ($upper = '' OR n.id <= $upper)
 WITH n ORDER BY n.id LIMIT $limit
 CREATE (m:CodeChunk)
 SET m = properties(n)
@@ -673,7 +778,7 @@ RETURN count(m) AS written, max(n.id) AS last
 # (:External nodes carry `project`), so they are cloned rather than shared.
 CLONE_EXTERNALS = """
 MATCH (n:External {project: $source})
-WHERE n.id > $after
+WHERE n.id > $after AND ($upper = '' OR n.id <= $upper)
 WITH n ORDER BY n.id LIMIT $limit
 CREATE (m:External)
 SET m = properties(n)

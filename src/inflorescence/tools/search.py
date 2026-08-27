@@ -168,6 +168,31 @@ def _page_hits(
     return paginated_response(hits[offset : offset + limit + 1], limit, offset, meta, truncated=truncated)
 
 
+def _flag_weak(payload: dict, threshold: float) -> dict:
+    """Mark every hit on the page that scored below *threshold*, and say when all of them did.
+
+    A vector search returns its top-k whatever the corpus holds, so a query about code that
+    does not exist comes back looking exactly like a query about code that does — same shape,
+    same ranking, merely lower numbers. The numbers are already there; what was missing was
+    the reading of them, which every caller had to hard-code a cut-off to get.
+
+    Only weak hits carry ``"weak": true`` (the flag convention: absence is the common case),
+    and ``meta.weak_results`` appears only when the whole page is weak — the one arrangement
+    that is worth acting on, because a page with even one strong hit still has an answer on
+    it. Nothing is removed: this is a label, not the ``min_score`` cut. An empty page gets
+    neither flag — no hits is not the same claim as "the hits were far away".
+
+    BM25 scores are unbounded relevance, not similarities, so ``search_text`` never calls this.
+    """
+    items = [item for item in payload["items"] if isinstance(item, dict)]
+    weak = [item for item in items if float(item.get("score") or 0) < threshold]
+    for item in weak:
+        item["weak"] = True
+    if items and len(weak) == len(items):
+        payload["meta"]["weak_results"] = True
+    return payload
+
+
 def _embed_one(embedder: EmbeddingClient, query: str, label: str) -> list[float] | dict[str, dict[str, str]]:
     try:
         embeddings = embedder.embed([query])
@@ -230,14 +255,21 @@ def register_search_tools(
         is a heuristic over the path only — it never reads the file — so treat it as a hint,
         not a verdict. ``include_tests=false`` drops those hits before pagination.
 
+        A vector search always returns its nearest neighbours, so low scores still look like
+        results: a hit below the weak-similarity threshold carries ``"weak": true``, and
+        ``meta.weak_results`` is set when *every* hit on the page is weak — nothing matched
+        closely, so the code probably is not there; confirm absence with ``search_text`` on
+        exact terms. (This only labels; ``min_score`` is the separate hard cut-off.)
+
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
         file-level: "stale" means the file changed after indexing (lines may have shifted,
         the summary may describe older code), not that this entity changed.
-        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
-        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
-        query indexes it almost for free (no LLM spend).
+        ``index_freshness.live_worktrees``, when present, is a sentence naming how many git
+        worktrees of this checkout are NOT in this index — their branch state is elsewhere;
+        ask with ``directory`` set to the worktree itself, which indexes it almost for free
+        (no LLM spend).
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -259,7 +291,7 @@ def register_search_tools(
         truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types, include_tests)
         rows = _drop_test_rows(_filter_node_types(filter_records_by_path(raw_rows, filters), node_types), include_tests)
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(_page_hits(
+        return checker.stamp(_flag_weak(_page_hits(
             _code_hits(rows, min_score),
             bounded_limit,
             bounded_offset,
@@ -271,7 +303,7 @@ def register_search_tools(
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
-        ))
+        ), settings.semantic_weak_threshold))
 
     @mcp.tool()
     async def search_semantic(
@@ -312,14 +344,21 @@ def register_search_tools(
         is a heuristic over the path only — it never reads the file — so treat it as a hint,
         not a verdict. ``include_tests=false`` drops those hits before pagination.
 
+        A vector search always returns its nearest neighbours, so low scores still look like
+        results: a hit below the weak-similarity threshold carries ``"weak": true``, and
+        ``meta.weak_results`` is set when *every* hit on the page is weak — nothing matched
+        closely, so the code probably is not there; confirm absence with ``search_text`` on
+        exact terms. (This only labels; ``min_score`` is the separate hard cut-off.)
+
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
         file-level: "stale" means the file changed after indexing (lines may have shifted,
         the summary may describe older code), not that this entity changed.
-        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
-        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
-        query indexes it almost for free (no LLM spend).
+        ``index_freshness.live_worktrees``, when present, is a sentence naming how many git
+        worktrees of this checkout are NOT in this index — their branch state is elsewhere;
+        ask with ``directory`` set to the worktree itself, which indexes it almost for free
+        (no LLM spend).
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -341,7 +380,7 @@ def register_search_tools(
         truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types, include_tests)
         rows = _drop_test_rows(_filter_node_types(filter_records_by_path(raw_rows, filters), node_types), include_tests)
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(_page_hits(
+        return checker.stamp(_flag_weak(_page_hits(
             _summary_hits(rows, min_score),
             bounded_limit,
             bounded_offset,
@@ -353,7 +392,7 @@ def register_search_tools(
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
-        ))
+        ), settings.semantic_weak_threshold))
 
     @mcp.tool()
     async def search_hybrid(
@@ -395,14 +434,21 @@ def register_search_tools(
         is a heuristic over the path only — it never reads the file — so treat it as a hint,
         not a verdict. ``include_tests=false`` drops those hits before pagination.
 
+        A vector search always returns its nearest neighbours, so low scores still look like
+        results: a hit below the weak-similarity threshold carries ``"weak": true``, and
+        ``meta.weak_results`` is set when *every* hit on the page is weak — nothing matched
+        closely, so the code probably is not there; confirm absence with ``search_text`` on
+        exact terms. (This only labels; ``min_score`` is the separate hard cut-off.)
+
         ``meta.index_freshness`` ({checked, stale, missing, unknown}) covers the files on
         this page, and affected hits carry ``"stale": true`` / ``"file_missing": true`` on
         their entity — so an unflagged hit was checked and still matches the index. This is
         file-level: "stale" means the file changed after indexing (lines may have shifted,
         the summary may describe older code), not that this entity changed.
-        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
-        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
-        query indexes it almost for free (no LLM spend).
+        ``index_freshness.live_worktrees``, when present, is a sentence naming how many git
+        worktrees of this checkout are NOT in this index — their branch state is elsewhere;
+        ask with ``directory`` set to the worktree itself, which indexes it almost for free
+        (no LLM spend).
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -452,7 +498,7 @@ def register_search_tools(
             if hit["source_type"] != "hybrid" and hit["matches"]:
                 hit["source_type"] = "hybrid"
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(_page_hits(
+        return checker.stamp(_flag_weak(_page_hits(
             _cap_matches(hits),
             bounded_limit,
             bounded_offset,
@@ -464,7 +510,7 @@ def register_search_tools(
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
-        ))
+        ), settings.semantic_weak_threshold))
 
     @mcp.tool()
     async def search_text(
@@ -492,6 +538,11 @@ def register_search_tools(
         present only when the list was trimmed — a long document matches on many chunks and the
         tail of that list is repetition, not evidence.
 
+        A multi-word phrase in any language is tokenized into independent, stemmed words with
+        no phrase matching (Russian ``"Загружаем доску"`` also matches anything about
+        ``загруж…`` or ``доск…``), so the top hit is usually right while the tail can be token
+        noise — narrow with the most distinctive single word, or add ``include_paths``.
+
         While an index run is in progress, summary and raw-code fields cover only what has
         already landed; name/signature hits are complete as soon as the skeleton is stored.
 
@@ -514,9 +565,10 @@ def register_search_tools(
         their entity — so an unflagged hit was checked and still matches the index. This is
         file-level: "stale" means the file changed after indexing (lines may have shifted,
         the summary may describe older code), not that this entity changed.
-        ``index_freshness.live_worktrees`` > 0 means the state of those worktrees' branches
-        is NOT in this index — ask with ``directory`` set to the worktree itself; that first
-        query indexes it almost for free (no LLM spend).
+        ``index_freshness.live_worktrees``, when present, is a sentence naming how many git
+        worktrees of this checkout are NOT in this index — their branch state is elsewhere;
+        ask with ``directory`` set to the worktree itself, which indexes it almost for free
+        (no LLM spend).
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.

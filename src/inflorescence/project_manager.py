@@ -610,10 +610,12 @@ class ProjectManager:
             seeded_summaries = 0
             stored_chunk_embeddings: dict[str, list[float]] = {}
             if existing_stats["nodes"] > 0:
-                stored_chunk_embeddings = await self._repo.get_stored_chunk_embeddings(project)
                 if force_rebuild:
                     logger.info("Force rebuild requested for project=%s", project)
-                    stored_summaries = await self._repo.get_stored_summaries(project)
+                    # Same project, so the stored vectors stay where they are: only the
+                    # summary text and its hashes are needed to reuse paid work (the light
+                    # read skips the per-node 1536-float payload entirely).
+                    stored_summaries = await self._repo.get_stored_summaries_light(project)
                     result = await self._builder.build(
                         project,
                         root,
@@ -631,13 +633,21 @@ class ProjectManager:
                         progress=progress,
                     )
                 nodes, edges = result.nodes, result.edges
+                # Chunk vectors this project might reuse, read *after* the build so the read
+                # can be scoped to the files that actually moved (an update re-chunks the
+                # whole project but rewrites almost none of it — see RAGIndexer.index_code).
+                # `changed_files is None` means the run narrowed nothing, i.e. a force
+                # rebuild: an empty map is correct there too, because same-project reuse is
+                # decided per chunk id inside index_code and needs no vectors on the wire.
+                if result.changed_files:
+                    stored_chunk_embeddings = await self._repo.get_stored_chunk_embeddings_for_files(
+                        project, sorted(result.changed_files)
+                    )
                 if not nodes and not edges:
                     await self._repo.set_project_root_path(project, str(root))
                     await self._stamp_worktree_meta(project, main_root)
                     await self._persist_scope(project, include_patterns, exclude_patterns)
-                    repaired = await self._repair_incomplete_index(
-                        project, root, stored_chunk_embeddings, progress
-                    )
+                    repaired = await self._repair_incomplete_index(project, root, progress)
                     stats: dict[str, object] = {
                         "project": project,
                         "directory": str(root),
@@ -764,7 +774,6 @@ class ProjectManager:
         self,
         project: str,
         root: Path,
-        stored_chunk_embeddings: dict[str, list[float]],
         progress: ProgressReporter | None = None,
     ) -> dict[str, int]:
         """Heal state a killed index run left incomplete, without a rebuild.
@@ -772,6 +781,11 @@ class ProjectManager:
         The unchanged fast path never reaches the summarize/chunk/embed phases, so a
         run killed between them would otherwise leave gaps that no re-run repairs.
         Returns {stat_key: count} for the repairs performed (empty when complete).
+
+        Reads nothing up front. The chunk half repairs a *named* set of files, so the vectors
+        it can reuse are fetched for those files only — this used to receive a dump of every
+        vector in the project, paid for on every unchanged re-index whether or not anything
+        needed repairing.
         """
         repaired: dict[str, int] = {}
 
@@ -789,6 +803,9 @@ class ProjectManager:
                 logger.info(
                     "Repairing chunks for %d file(s) with missing/stale chunks for project=%s",
                     len(stale_chunk_files), project,
+                )
+                stored_chunk_embeddings = await self._repo.get_stored_chunk_embeddings_for_files(
+                    project, stale_chunk_files
                 )
                 chunks_stored = await self._rag.index_code(
                     project, root, nodes,
@@ -924,7 +941,6 @@ class ProjectManager:
             # then reproduce the persisted include/exclude so vendor/** excluded at index time is
             # not silently re-scanned, parsed, summarized and embedded on the first file save.
             self._gate_update_cost(root_path, changed_files)
-            stored_chunk_embeddings = await self._repo.get_stored_chunk_embeddings(project)
             result = await self._builder.update(
                 project,
                 root_path,
@@ -938,6 +954,17 @@ class ProjectManager:
                 logger.info("Update was a no-op for project=%s", project)
                 return {"project": project, "nodes": 0, "edges": 0, "chunks": 0,
                         "summaries": 0, "changed_files": len(changed_files), "noop": True}
+
+            # Scoped to the files that actually moved, and read only once the update has said
+            # which those are. The whole-project dump this replaces cost seconds and a
+            # project's worth of vectors on the wire on every single file save, to serve a
+            # handful of chunks (INV-5); everything else an update can reuse is decided per
+            # chunk id inside index_code, without moving a vector at all.
+            stored_chunk_embeddings: dict[str, list[float]] = {}
+            if result.changed_files:
+                stored_chunk_embeddings = await self._repo.get_stored_chunk_embeddings_for_files(
+                    project, sorted(result.changed_files)
+                )
 
             chunks_stored = await self._rag.index_code(
                 project, root_path, nodes,
