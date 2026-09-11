@@ -1,57 +1,31 @@
-/* Inflorescence dashboard SPA. No build step: plain DOM + cytoscape + highlight.js. */
+/* Inflorescence dashboard.
+ *
+ * No build step: plain DOM, one <canvas> engine (static/pack.js) and highlight.js.
+ * The graph view is the site's specimen — the whole index as nested discs, CONTAINS drawn as
+ * nesting, CALLS / IMPORTS / INHERITS bundled through the discs they cross — driven here by
+ * hand: wheel, drag, pin, route. Everything on screen is a number the index actually holds.
+ */
 "use strict";
 
-// ---------------------------------------------------------------------------
-// State & helpers
-// ---------------------------------------------------------------------------
-
-// Muted botanical palette — kept in sync with app.css :root tokens.
-const TYPE_COLORS = {
-  directory: "#9a9c8f", module: "#5a93c9", class: "#3fa588", function: "#d9a24e",
-  method: "#6faf5a", interface: "#9a90de", enum: "#dd7d6b", struct: "#cd7ba3",
-  trait: "#cf8455", document: "#c8bd8e", code: "#7d7f73",
-};
+// The whole palette, and it is not decorative: one colour per edge type, plus the blue an
+// outgoing call is drawn in. Entity types are told apart by shape and ink, never by a new hue.
 const REL_COLORS = {
-  CALLS: "#6f9fd0", IMPORTS: "#5fae86", INHERITS: "#9a90de",
-  IMPLEMENTS: "#cd7ba3", CONTAINS: "#4c5044",
+  CALLS: "#ff3aa8", IMPORTS: "#8b7bff", INHERITS: "#e6ff3d",
+  IMPLEMENTS: "#e6ff3d", CONTAINS: "rgba(235,232,225,.55)",
 };
-// Graph-canvas ink (matches --ink-2) and on-canvas label/halo tones.
-const CANVAS = { ink: "#0c0e0b", halo: "rgba(12,14,11,0.72)", label: "#a9ac9d", accent: "#c3cf82", ring: "rgba(236,235,224,0.22)" };
-const REL_TYPES = ["CALLS", "IMPORTS", "INHERITS", "IMPLEMENTS", "CONTAINS"];
+const REL_KIND = { C: "CALLS", I: "IMPORTS", N: "INHERITS", M: "IMPLEMENTS", P: "CONTAINS" };
+const KIND_OF = { CALLS: "C", IMPORTS: "I", INHERITS: "N", IMPLEMENTS: "M" };
+const TYPES = ["directory", "module", "document", "class", "interface", "enum", "struct", "trait", "function", "method", "code"];
 const CHIP_TEXT = {
   directory: "dir", module: "mod", class: "cls", function: "fn", method: "mth",
   interface: "if", enum: "enum", struct: "st", trait: "tr", document: "doc", code: "?",
 };
 
-// Display settings for the graph view. Every one of these is presentation only —
-// they change how the graph is laid out, painted and animated, never what is
-// fetched or stored. Persisted per browser so a tuned view survives a reload.
-const GFX_DEFAULTS = {
-  // clustering / physics
-  cluster: 0.7,        // pull toward the centroid of the node's own directory
-  repel: 110,          // base charge; directories repel harder (see applyForces)
-  containsDist: 18,    // CONTAINS is the structural spine: short and stiff
-  crossDist: 240,      // CALLS/IMPORTS across modules: long and slack
-  crossPull: 0.02,
-  collide: true,       // force-graph ships no collision force at all
-  anchors: false,      // deterministic ring slot per directory
-  // paint
-  hulls: true,         // soft blob behind each directory
-  tint: false,         // colour nodes by directory instead of by entity type
-  labels: true,        // file/entity name under every node
-  edgeWidth: 0.5,      // multiplier on the weight-derived edge thickness
-  edgeAlpha: 0.45,     // calls/imports outnumber nodes 5:1 — solid lines drown the graph
-  // replay animation
-  stems: true,         // an edge grows from the parent, then the node blooms
-  glow: true,
-  spring: true,        // overshoot easing instead of plain ease-out
-  camera: "static",    // static | cinematic (follow the group being revealed)
-  order: "structure",  // structure (CONTAINS spine first) | wave (outward ripple)
-};
-const GFX_KEY = "inflorescence.gfx";
+const GFX_KEY = "inflorescence.gfx.specimen";
+const GFX_DEFAULTS = window.Pack ? window.Pack.GFX_DEFAULTS : {};
 
-// Only accept keys we know, with the type we expect: a stale or hand-edited
-// localStorage entry must never be able to break the graph view.
+// Only keys we know, with the type we expect: a stale or hand-edited localStorage entry must
+// never be able to break the view.
 function loadGfx() {
   let saved = {};
   try { saved = JSON.parse(localStorage.getItem(GFX_KEY) || "{}") || {}; } catch { saved = {}; }
@@ -61,43 +35,38 @@ function loadGfx() {
   }
   return gfx;
 }
+function saveGfx() {
+  try { localStorage.setItem(GFX_KEY, JSON.stringify(spec.gfx)); } catch { /* storage off: not fatal */ }
+}
 
 const state = {
   projects: [],
   project: null,
   view: "overview",
   entityId: null,
-  // All relation types are enabled by default, CONTAINS included, so the structural
-  // skeleton shows alongside call/import/type edges from the start.
-  // layout must be a value the #graph-layout select actually offers: "force" (no dag)
-  // or a force-graph dagMode. The old "cose" default was a cytoscape leftover that
-  // applyLayoutMode fed to dagMode() as a bogus DAG mode — with a cyclic CALLS graph
-  // and live re-inits every merge tick this eventually killed the render loop.
-  // level applies to the unrooted views: "modules" is the directory/module skeleton,
-  // "all" is every indexed entity down to functions and methods. depth only means
-  // anything in the rooted (neighborhood) view.
-  graph: { mode: "overview", level: "modules", root: null, rootName: null, depth: 2, rels: new Set(["CALLS", "IMPORTS", "INHERITS", "IMPLEMENTS", "CONTAINS"]), layout: "force", summarizedOnly: true },
-  gfx: loadGfx(),
-  customGraph: null,
   treeCache: new Map(),
-  // Live-index polling: `key` is the last seen nodes:edges:summarized fingerprint,
-  // `indexing` the last seen lease state (for edge detection), `merging` a reentry guard.
-  // `userCam` = the user grabbed the camera (wheel/drag) — live merges stop auto-fitting
-  // until the next full render or an explicit Fit click.
-  live: { indexing: false, key: null, merging: false, graphError: false, userCam: false },
+  // Live-index polling: `key` is the last seen nodes:edges:summarized fingerprint, `indexing`
+  // the last seen lease state (for edge detection), `merging` a reentry guard.
+  live: { indexing: false, key: null, merging: false, lastMerge: 0 },
+  freshness: null, // last on-demand drift check, or "checking" while one is in flight
 };
 
-// force-graph state: one instance reused across renders (keeps WebGL context and zoom)
-let fg = null;
-let fgData = { nodes: [], links: [] };
-let fgNeighbors = new Map(); // node id -> Set of neighbor ids (for hover highlight)
-let fgHoverNode = null;
-let fgSelectedId = null;
-let fgNeedsFit = false;
-let fgLastClick = { id: null, t: 0 };
+// Everything the specimen view owns. `pack` is created once the view is first shown (a canvas
+// in a display:none section has no size) and then kept for the life of the page.
+const spec = {
+  pack: null, G: null, meta: null, loading: false, error: null,
+  level: "all", summarized: false, prefix: null,
+  off: new Set(),                 // edge kinds switched off in the legend
+  route: { a: null, b: null, arm: null },
+  gfx: loadGfx(),
+  wanted: null,                   // an entity to frame as soon as the data is here
+  hits: null, hitLabel: "",
+  replaying: false, recording: false,
+};
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmt = (n) => Number(n || 0).toLocaleString("en-US").replace(/,/g, " ");
 
 async function api(path, opts) {
   const res = await fetch(`/api/projects/${encodeURIComponent(state.project)}${path}`, opts);
@@ -107,10 +76,9 @@ async function api(path, opts) {
 }
 
 function chip(type) {
-  const t = TYPE_COLORS[type] ? type : "code";
+  const t = TYPES.includes(type) ? type : "code";
   return `<span class="chip ${t}" title="${esc(type)}">${CHIP_TEXT[t] || t}</span>`;
 }
-
 function fileRef(e) {
   if (!e.file_path) return "";
   return e.line_start ? `${e.file_path}:${e.line_start}` : e.file_path;
@@ -132,15 +100,12 @@ function parseHash() {
 }
 
 async function route() {
-  stopReplay({ restore: false }); // leaving the canvas: drop the animation
   $("#search-results").classList.add("hidden");
   const parsed = parseHash();
   if (parsed && state.projects.some((p) => p.project === parsed.project)) {
     if (state.project !== parsed.project) {
       state.project = parsed.project;
-      state.treeCache = new Map();
-      $("#tree").innerHTML = "";
-      $("#entity-content").innerHTML = `<div class="dim pad">Select an entity from the tree.</div>`;
+      resetProjectState();
     }
     state.view = parsed.view;
   } else if (state.projects.length) {
@@ -162,99 +127,136 @@ async function route() {
   else if (state.view === "tools") await renderToolsView(params);
 }
 
+function resetProjectState() {
+  state.treeCache = new Map();
+  state.live.key = null;
+  $("#tree").innerHTML = "";
+  $("#entity-content").innerHTML = `<div class="dim pad">Select an entity from the tree.</div>`;
+  clearFreshness();
+  // A specimen belongs to one project; keep nothing of the old one.
+  if (spec.pack) { spec.pack.destroy(); spec.pack = null; }
+  spec.G = null; spec.meta = null; spec.prefix = null; spec.wanted = null;
+  spec.hits = null; spec.route = { a: null, b: null, arm: null };
+  // A load still in flight belongs to the project we just left; let the next one start.
+  spec.loading = false;
+  $("#route-a").value = ""; $("#route-b").value = "";
+  $("#route-out").innerHTML = "";
+  closeRoutePanel();
+  $("#graph-side").classList.add("hidden");
+}
+
 function showView(name) {
   document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
   $(`#view-${name}`)?.classList.remove("hidden");
+  // The canvas has no size while its section is display:none, so it measures itself
+  // the moment the section is shown.
+  if (name === "graph" && spec.pack) spec.pack.resize();
+  if (name !== "graph") stopReplay();
 }
 
-function openEntity(id) {
-  nav("explorer", { id });
-}
+function openEntity(id) { nav("explorer", { id }); }
 
 // ---------------------------------------------------------------------------
-// Overview
+// FIG. 01 — overview
 // ---------------------------------------------------------------------------
+
+function ledgerRow(label, value, opts = {}) {
+  const bar = opts.pct !== undefined
+    ? `<td class="barcell" style="color:${opts.color || "var(--dim)"}"><span class="bar" style="width:${Math.max(1, opts.pct)}%"></span></td>`
+    : `<td class="lead"><i></i></td>`;
+  return `<tr${opts.id ? ` data-id="${esc(opts.id)}"` : ""}${opts.cls ? ` class="${opts.cls}"` : ""}>
+    <td>${label}</td>${bar}<td>${value}</td></tr>`;
+}
 
 async function renderOverview() {
   const el = $("#view-overview");
-  el.innerHTML = `<div class="ov-inner dim">Loading…</div>`;
+  el.innerHTML = `<div class="ov dim">reading the index…</div>`;
   const s = await api("/stats");
   const coverage = s.summarizable ? Math.round((100 * s.summarized) / s.summarizable) : 0;
   const maxType = Math.max(1, ...s.by_type.map((t) => t.count));
   const maxRel = Math.max(1, ...s.by_relation.map((r) => r.count));
   const maxLang = Math.max(1, ...s.languages.map((l) => l.files));
-  const primaryLang = s.languages[0]?.language;
 
-  const rootBanner = s.root_path_exists
-    ? ""
-    : `<div class="rootpath-banner">
-         <span>Source root unknown — code is shown from stored chunks only. Set the absolute path of <b>${esc(s.display_name)}</b>:</span>
-         <input id="rootpath-input" class="mono" placeholder="/absolute/path/to/${esc(s.display_name)}" value="${esc(s.root_path || "")}">
-         <button id="rootpath-save" class="tb-btn accent">Save</button>
-       </div>`;
-
-  const dotLabel = (name, color) =>
-    `<span class="lbl"><span class="lg-dot" style="background:${color}"></span><span>${esc(name)}</span></span>`;
+  const rootBanner = s.root_path_exists ? "" : `
+    <div class="rootpath-banner">
+      <span>Source root unknown — code is shown from stored chunks only. Absolute path of
+      <b>${esc(s.display_name)}</b>:</span>
+      <input id="rootpath-input" class="field" placeholder="/absolute/path/to/${esc(s.display_name)}" value="${esc(s.root_path || "")}">
+      <button id="rootpath-save" class="btn accent">save</button>
+    </div>`;
 
   el.innerHTML = `
-    <div class="ov-inner">
+    <div class="ov">
       <div class="specimen">
-        <div class="eyebrow">${primaryLang ? esc(primaryLang) + " · " : ""}indexed specimen</div>
-        <h1>${esc(s.display_name)}</h1>
-        <div class="classline">
-          <span><b>id</b> ${esc(s.project)}</span>
-          ${s.root_path_exists ? `<span><b>root</b> ${esc(s.root_path)}</span>` : ""}
+        <div>
+          <div class="fig-num"><small>FIG. 01 · INDEXED SPECIMEN</small></div>
+          <h1>${esc(s.display_name)}</h1>
+          <div class="classline">
+            <span><b>id</b>${esc(s.project)}</span>
+            <span><b>root</b>${esc(s.root_path || "—")}${s.root_path_exists ? "" : " (not on disk)"}</span>
+          </div>
         </div>
+        <div class="fig-meta">${esc(s.languages.map((l) => `${l.language} ${l.files}`).join(" · ")) || "no files"}</div>
       </div>
       ${rootBanner}
       <div class="measures">
-        <div class="figure"><span class="v">${s.entities.toLocaleString()}</span><span class="k">entities</span></div>
-        <div class="figure"><span class="v">${s.edges.toLocaleString()}</span><span class="k">relations</span></div>
-        <div class="figure"><span class="v">${s.files.toLocaleString()}</span><span class="k">files</span></div>
-        <div class="figure"><span class="v">${coverage}%</span><span class="k">summarized</span>
-          <span class="sub">${s.summarized.toLocaleString()} / ${s.summarizable.toLocaleString()}</span></div>
-        <div class="figure"><span class="v">${s.chunks.toLocaleString()}</span><span class="k">code chunks</span>
-          <span class="sub">${s.summary_embeddings.toLocaleString()} embeddings</span></div>
+        <div class="figure"><span class="v">${fmt(s.entities)}</span><span class="k">ENTITIES</span></div>
+        <div class="figure"><span class="v">${fmt(s.edges)}</span><span class="k">RELATIONS</span></div>
+        <div class="figure"><span class="v">${fmt(s.files)}</span><span class="k">FILES</span></div>
+        <div class="figure"><span class="v">${coverage}%</span><span class="k">SUMMARIZED</span>
+          <span class="sub">${fmt(s.summarized)} / ${fmt(s.summarizable)}</span></div>
+        <div class="figure"><span class="v">${fmt(s.chunks)}</span><span class="k">CODE CHUNKS</span>
+          <span class="sub">${fmt(s.summary_embeddings)} summary embeddings</span></div>
       </div>
       <div class="ov-grid">
-        <div class="panel"><h2 class="overline">Composition</h2>${s.by_type.map((t) => `
-          <div class="bar-row">
-            <span class="lbl">${chip(t.type)}<span>${esc(t.type)}</span></span>
-            <span class="bar-track"><span class="bar-fill" style="width:${(100 * t.count) / maxType}%;background:${TYPE_COLORS[t.type] || TYPE_COLORS.code}"></span></span>
-            <span class="num">${t.count.toLocaleString()}</span>
-          </div>`).join("") || `<div class="dim">no data</div>`}
+        <div>
+          <div class="sect-head"><b>FIG. 02</b>COMPOSITION<span class="n">${s.by_type.length} types</span></div>
+          <table class="ledger">${s.by_type.map((t) => ledgerRow(
+            `${chip(t.type)} ${esc(t.type)}`, fmt(t.count), { pct: (100 * t.count) / maxType })).join("") ||
+            `<tr><td class="dim">no entities</td></tr>`}</table>
         </div>
-        <div class="panel"><h2 class="overline">Connections</h2>${s.by_relation.map((r) => `
-          <div class="bar-row">
-            ${dotLabel(r.relation.toLowerCase(), REL_COLORS[r.relation] || TYPE_COLORS.code)}
-            <span class="bar-track"><span class="bar-fill" style="width:${(100 * r.count) / maxRel}%;background:${REL_COLORS[r.relation] || TYPE_COLORS.code}"></span></span>
-            <span class="num">${r.count.toLocaleString()}</span>
-          </div>`).join("") || `<div class="dim">no data</div>`}
+        <div>
+          <div class="sect-head"><b>FIG. 03</b>CONNECTIONS<span class="n">${fmt(s.edges)} edges</span></div>
+          <table class="ledger">${s.by_relation.map((r) => ledgerRow(
+            `<span class="rel-tag rel-${esc(r.relation)}">${esc(r.relation)}</span>`, fmt(r.count),
+            { pct: (100 * r.count) / maxRel, color: REL_COLORS[r.relation] || "var(--dim)" })).join("") ||
+            `<tr><td class="dim">no relations</td></tr>`}</table>
+          <p class="fig-cap">CONTAINS is the structural spine and is drawn as nesting on the
+          specimen, not as a line.</p>
         </div>
-        <div class="panel"><h2 class="overline">Languages</h2>${s.languages.map((l) => `
-          <div class="bar-row">
-            ${dotLabel(l.language, "var(--t-class)")}
-            <span class="bar-track"><span class="bar-fill" style="width:${(100 * l.files) / maxLang}%;background:var(--t-class)"></span></span>
-            <span class="num">${l.files.toLocaleString()}</span>
-          </div>`).join("") || `<div class="dim">no data</div>`}
+        <div>
+          <div class="sect-head"><b>FIG. 04</b>LANGUAGES<span class="n">${s.languages.length}</span></div>
+          <table class="ledger">${s.languages.map((l) => ledgerRow(
+            esc(l.language), fmt(l.files), { pct: (100 * l.files) / maxLang })).join("") ||
+            `<tr><td class="dim">no files</td></tr>`}</table>
         </div>
-        <div class="panel"><h2 class="overline">Most called</h2>${s.most_called.map((h) => `
-          <div class="list-row" data-id="${esc(h.id)}">${chip(h.type)}<span class="name">${esc(h.name)}</span>
-            <span class="path">${esc(h.file_path || "")}</span><span class="n">${h.callers}×</span></div>`).join("") || `<div class="dim">no CALLS edges</div>`}
+        <div>
+          <div class="sect-head"><b>FIG. 05</b>MOST CALLED</div>
+          <table class="ledger list">${s.most_called.map((h) => ledgerRow(
+            `${chip(h.type)} ${esc(h.name)}`, `${h.callers}×`, { id: h.id, cls: "click" })).join("") ||
+            `<tr><td class="dim">no CALLS edges</td></tr>`}</table>
         </div>
-        <div class="panel"><h2 class="overline">Most imported</h2>${s.most_imported.map((h) => `
-          <div class="list-row" data-id="${esc(h.id)}">${chip(h.type)}<span class="name">${esc(h.name)}</span>
-            <span class="path">${esc(h.file_path || "")}</span><span class="n">${h.importers}×</span></div>`).join("") || `<div class="dim">no IMPORTS edges</div>`}
+        <div>
+          <div class="sect-head"><b>FIG. 06</b>MOST IMPORTED</div>
+          <table class="ledger list">${s.most_imported.map((h) => ledgerRow(
+            `${chip(h.type)} ${esc(h.name)}`, `${h.importers}×`, { id: h.id, cls: "click" })).join("") ||
+            `<tr><td class="dim">no IMPORTS edges</td></tr>`}</table>
         </div>
-        <div class="panel"><h2 class="overline">Largest files</h2>${s.largest_files.map((f) => `
-          <div class="list-row" ${f.module_id ? `data-id="${esc(f.module_id)}"` : ""}>${chip("module")}
-            <span class="path" style="flex:1">${esc(f.file_path)}</span><span class="n">${f.entities} entities</span></div>`).join("") || `<div class="dim">no data</div>`}
+        <div>
+          <div class="sect-head"><b>FIG. 07</b>LARGEST FILES</div>
+          <table class="ledger list">${s.largest_files.map((f) => ledgerRow(
+            `${chip("module")} ${esc(String(f.file_path).split("/").pop())}`, `${f.entities}`,
+            { id: f.module_id || "", cls: f.module_id ? "click" : "" })).join("") ||
+            `<tr><td class="dim">no files</td></tr>`}</table>
         </div>
       </div>
     </div>`;
 
-  el.querySelectorAll(".list-row[data-id]").forEach((row) =>
-    row.addEventListener("click", () => openEntity(row.dataset.id)));
+  el.querySelectorAll("tr[data-id]").forEach((row) => {
+    if (!row.dataset.id) return;
+    row.style.cursor = "pointer";
+    row.addEventListener("click", () => openEntity(row.dataset.id));
+  });
   $("#rootpath-save")?.addEventListener("click", async () => {
     const path = $("#rootpath-input").value.trim();
     if (!path) return;
@@ -268,11 +270,11 @@ async function renderOverview() {
 }
 
 // ---------------------------------------------------------------------------
-// Tree
+// FIG. 02 — tree
 // ---------------------------------------------------------------------------
 
 async function fetchChildren(parentId) {
-  const key = parentId ?? " root";
+  const key = parentId ?? " root";
   if (!state.treeCache.has(key)) {
     const params = parentId ? `?parent=${encodeURIComponent(parentId)}` : "";
     state.treeCache.set(key, await api(`/tree${params}`));
@@ -330,7 +332,7 @@ async function ensureTreeRoot() {
   if (tree.childElementCount) return;
   const data = await fetchChildren(null);
   if (!data.root) {
-    tree.innerHTML = `<div class="dim" style="padding:12px">Project has no root node.</div>`;
+    tree.innerHTML = `<div class="dim pad">Project has no root node.</div>`;
     return;
   }
   const rootEl = treeNodeEl({ ...data.root, child_count: data.children.length });
@@ -368,8 +370,12 @@ async function renderExplorer(entityId) {
   await ensureTreeRoot();
   if (!entityId) return;
   state.entityId = entityId;
+  // Selecting an entity anywhere aims the specimen at it: if the graph is already
+  // built it flies there now, otherwise it is framed the moment it loads.
+  aimSpecimen(entityId);
   const pane = $("#entity-content");
-  pane.innerHTML = `<div class="dim pad">Loading…</div>`;
+  pane.classList.remove("dim", "pad");
+  pane.innerHTML = `<div class="dim pad">reading…</div>`;
   let data;
   try {
     data = await api(`/entity?id=${encodeURIComponent(entityId)}`);
@@ -382,20 +388,22 @@ async function renderExplorer(entityId) {
 
   const crumbs = data.breadcrumbs.map((c, i) =>
     i === data.breadcrumbs.length - 1
-      ? `<span style="color:var(--text)">${esc(c.name)}</span>`
+      ? `<span style="color:var(--ink)">${esc(c.name)}</span>`
       : `<a href="#" data-id="${esc(c.id)}">${esc(c.name)}</a>`
   ).join(`<span class="sep">/</span>`);
 
   const relGroup = (rels, dir) => {
-    if (!rels.length) return `<div class="dim" style="font-size:12.5px">none</div>`;
+    if (!rels.length) return `<div class="dim">none</div>`;
     const byType = {};
     rels.forEach((r) => (byType[r.relation] = byType[r.relation] || []).push(r));
     return Object.entries(byType).map(([rel, items]) => `
       <div class="rel-group">
-        <span class="rel-tag" style="--rel-c:${REL_COLORS[rel] || "#7d7f73"}">${dir === "in" ? "◂ " : "▸ "}${esc(rel)}</span>
+        <span class="rel-tag rel-${esc(rel)}">${dir === "in" ? "←" + esc(rel) + "─" : "─" + esc(rel) + "→"} ${items.length}</span>
         ${items.map((r) => `
-          <div class="list-row" data-id="${esc(r.id)}" title="${esc(r.summary || "")}">
-            ${chip(r.type)}<span class="name">${esc(r.name)}</span><span class="path">${esc(fileRef(r))}</span>
+          <div class="rel-row" data-rel-id="${esc(r.id)}" title="${esc(r.summary || "")}">
+            ${chip(r.type)}<span class="name" data-id="${esc(r.id)}">${esc(r.name)}</span>
+            <span class="path">${esc(fileRef(r))}</span>
+            <span class="see" data-see="${esc(r.id)}" title="Show on the specimen">◎</span>
           </div>`).join("")}
       </div>`).join("");
   };
@@ -404,33 +412,42 @@ async function renderExplorer(entityId) {
     <div class="entity">
       <div class="crumbs">${crumbs}</div>
       <div class="entity-head">${chip(e.type)}<h1>${esc(e.name)}</h1></div>
-      <div class="entity-meta mono">${esc(fileRef(e))}${e.line_end ? "–" + e.line_end : ""} · <span title="entity id">${esc(e.id)}</span></div>
+      <div class="entity-meta">${esc(fileRef(e))}${e.line_end ? "–" + e.line_end : ""} · ${esc(e.id)}
+        ${data.chunks ? ` · ${data.chunks} chunk${data.chunks === 1 ? "" : "s"}` : ""}</div>
       <div class="entity-actions">
-        <button class="tb-btn accent" id="btn-show-graph">Show in graph</button>
-        <button class="tb-btn" id="btn-copy-id">Copy id</button>
+        <button class="btn accent" id="btn-show-graph">show on specimen</button>
+        <button class="btn" id="btn-route-from">route from here</button>
+        <button class="btn" id="btn-copy-id">copy id</button>
       </div>
-      ${e.summary ? `<div class="sect"><h2>Summary</h2><div class="summary-card">${esc(e.summary)}</div></div>` : ""}
-      ${e.signature ? `<div class="sect"><h2>Signature</h2><div class="sig-block mono">${esc(e.signature)}</div></div>` : ""}
-      ${e.docstring ? `<div class="sect"><h2>Docstring</h2><div class="doc-block">${esc(e.docstring)}</div></div>` : ""}
-      <div class="sect" id="code-sect"><h2>Code</h2><div class="dim">Loading code…</div></div>
+      ${e.summary
+        ? `<div class="sect"><div class="sect-head">SUMMARY · WRITTEN BY THE INDEXER</div><div class="summary-card">${esc(e.summary)}</div></div>`
+        : `<div class="sect"><div class="sect-head">SUMMARY</div><div class="dim">no summary yet — this entity has not been summarized.</div></div>`}
+      ${e.signature ? `<div class="sect"><div class="sect-head">SIGNATURE</div><div class="sig-block">${esc(e.signature)}</div></div>` : ""}
+      ${e.docstring ? `<div class="sect"><div class="sect-head">DOCSTRING</div><div class="doc-block">${esc(e.docstring)}</div></div>` : ""}
+      <div class="sect" id="code-sect"><div class="sect-head">CODE</div><div class="dim">reading…</div></div>
       ${data.children.length ? `
-        <div class="sect"><h2>Contains (${data.children.length})</h2>
+        <div class="sect"><div class="sect-head">CONTAINS<span class="n">${data.children.length}</span></div>
           <div class="kids-grid">${data.children.map((c) => `
-            <span class="kid-chip" data-id="${esc(c.id)}" title="${esc(c.summary || "")}">${chip(c.type)}<span class="nm">${esc(c.name)}</span></span>`).join("")}
+            <span class="kid-chip" data-id="${esc(c.id)}" title="${esc(c.summary || "")}">${chip(c.type)}<span>${esc(c.name)}</span></span>`).join("")}
           </div></div>` : ""}
-      <div class="sect"><h2>Relations</h2>
+      <div class="sect"><div class="sect-head">RELATIONS<span class="n">${data.incoming.length} in · ${data.outgoing.length} out</span></div>
         <div class="rel-grid">
-          <div><h2 style="font-size:10.5px;color:var(--muted);margin:0 0 6px">outgoing</h2>${relGroup(data.outgoing, "out")}</div>
-          <div><h2 style="font-size:10.5px;color:var(--muted);margin:0 0 6px">incoming</h2>${relGroup(data.incoming, "in")}</div>
+          <div>${relGroup(data.outgoing, "out")}</div>
+          <div>${relGroup(data.incoming, "in")}</div>
         </div>
       </div>
     </div>`;
 
   pane.querySelectorAll("[data-id]").forEach((el) =>
     el.addEventListener("click", (ev) => { ev.preventDefault(); openEntity(el.dataset.id); }));
-  $("#btn-show-graph").addEventListener("click", () => {
-    nav("graph", { root: e.id, depth: state.graph.depth });
-  });
+  // Hovering a relation puts a crosshair on that node, so switching to the specimen
+  // lands on something already marked.
+  pane.querySelectorAll("[data-rel-id]").forEach((el) =>
+    el.addEventListener("mouseenter", () => markOnSpecimen(el.dataset.relId)));
+  pane.querySelectorAll("[data-see]").forEach((el) =>
+    el.addEventListener("click", (ev) => { ev.stopPropagation(); nav("graph", { id: el.dataset.see }); }));
+  $("#btn-show-graph").addEventListener("click", () => nav("graph", { id: e.id }));
+  $("#btn-route-from").addEventListener("click", () => nav("graph", { id: e.id, route: "1" }));
   $("#btn-copy-id").addEventListener("click", () => navigator.clipboard.writeText(e.id));
 
   loadEntityCode(e, $("#code-sect"));
@@ -438,14 +455,15 @@ async function renderExplorer(entityId) {
 
 async function loadEntityCode(entity, sect, wholeFile = false) {
   const res = await api(`/code?id=${encodeURIComponent(entity.id)}${wholeFile ? "&whole_file=1" : ""}`, { allowError: true });
+  const head = `<div class="sect-head">CODE</div>`;
   if (!res.content) {
     const reasons = {
-      directory: "Directories have no source of their own — pick a file or entity inside.",
-      no_root_path: "No source on disk and no stored chunks. Set the project root path on the Overview tab to read code from disk.",
+      directory: "Directories have no source of their own — pick a file or an entity inside one.",
+      no_root_path: "No source on disk and no stored chunks. Set the project root path on the overview.",
       no_code: "No stored code for this entity.",
       entity_not_found: "Entity not found.",
     };
-    sect.innerHTML = `<h2>Code</h2><div class="dim">${reasons[res.reason] || "No code available."}</div>`;
+    sect.innerHTML = `${head}<div class="dim">${reasons[res.reason] || "No code available."}</div>`;
     return;
   }
   const lines = res.content.split("\n");
@@ -459,10 +477,10 @@ async function loadEntityCode(entity, sect, wholeFile = false) {
   const isPartial = res.source === "file" && !wholeFile && entity.type !== "module" &&
     res.total_lines && lines.length < res.total_lines;
   sect.innerHTML = `
-    <h2>Code</h2>
+    ${head}
     <div class="code-card">
       <div class="code-head">
-        <span class="mono">${esc(res.file_path || "")} · lines ${res.first_line}–${res.first_line + lines.length - 1}${res.total_lines ? " of " + res.total_lines : ""}</span>
+        <span>${esc(res.file_path || "")} · ${res.first_line}–${res.first_line + lines.length - 1}${res.total_lines ? " of " + res.total_lines : ""}</span>
         <span class="grow"></span>
         ${res.source === "chunks" ? `<span title="Reassembled from stored chunks — may be approximate">from chunks ≈</span>` : ""}
         ${isPartial ? `<button class="ghost-btn" id="btn-whole-file">whole file</button>` : ""}
@@ -478,1376 +496,388 @@ async function loadEntityCode(entity, sect, wholeFile = false) {
 }
 
 // ---------------------------------------------------------------------------
-// Graph
+// FIG. 03 — the specimen
+//
+// One Pack instance for the life of the page. Everything the toolbar, the legend, the route
+// tool and the live poll do goes through it; none of them touch the canvas directly.
 // ---------------------------------------------------------------------------
 
-// Custom d3 forces + hull geometry, loaded from graph-forces.js ahead of this file.
-const GF = globalThis.GraphForces;
-
-// force-graph stops rendering once the layout settles (autoPauseRedraw). A change
-// that only affects paint — hulls, tint, glow — would therefore not show up until
-// something else moved, so nudge the loop awake for a moment.
-let repaintTimer = null;
-function repaintGraph() {
-  if (!fg) return;
-  fg.autoPauseRedraw(false);
-  clearTimeout(repaintTimer);
-  repaintTimer = setTimeout(() => { if (!replay.active) fg.autoPauseRedraw(true); }, 600);
+function aimSpecimen(id) {
+  spec.wanted = id;
+  if (spec.pack && spec.G && spec.G.byId.has(id)) spec.pack.focus(id, { pin: true });
+}
+function markOnSpecimen(id) {
+  if (spec.pack && spec.G) spec.pack.mark = spec.G.byId.get(id) || null;
 }
 
-// The colour a node is actually painted in: by entity type, or by directory when
-// the viewer asked for group tinting.
-function nodeInk(n) {
-  return state.gfx.tint ? GF.groupColor(n.group, { alpha: 1 }) : n.color;
+function specimenURL() {
+  const q = new URLSearchParams();
+  if (spec.level === "modules") q.set("level", "modules");
+  if (spec.summarized) q.set("summarized", "1");
+  if (spec.prefix) q.set("prefix", spec.prefix);
+  const s = q.toString();
+  return `/specimen${s ? "?" + s : ""}`;
 }
 
-// Edges carry the weight in their thickness, so the settings scale that rather
-// than replace it — a 12-call edge still reads heavier than a 1-call edge at any
-// setting. Both are paint-time, so dragging the sliders is instant.
-function linkGirth(l) {
-  return Math.max(0.15, (l.width || 1) * state.gfx.edgeWidth);
-}
-
-function linkInk(l) {
-  return state.gfx.edgeAlpha >= 1 ? l.color : withAlpha(l.color, state.gfx.edgeAlpha);
-}
-
-function groupsOf(nodes) {
-  return [...new Set(nodes.map((n) => n.group))].sort();
-}
-
-// Everything physics-related lives here so the settings panel has exactly one
-// place to re-apply. d3 replaces a force when it is re-registered under the same
-// name, and passing null removes it — that is how the toggles switch off.
-function applyForces() {
-  if (!fg) return;
-  const g = state.gfx;
-  // Directories are the anchors of the whole picture: pushing them apart is what
-  // keeps one cluster from sitting on top of the next.
-  fg.d3Force("charge")
-    .strength((n) => -g.repel * (n.type === "directory" ? 3.5 : 1))
-    .distanceMax(520);
-  // CONTAINS is a short stiff spring (a module belongs to its directory); calls
-  // and imports across modules are long and slack, so they arrange the clusters
-  // instead of tearing them apart.
-  fg.d3Force("link")
-    .distance((l) => (l.relation === "CONTAINS" ? g.containsDist : g.crossDist))
-    .strength((l) => (l.relation === "CONTAINS" ? 1 : Math.min(0.6, g.crossPull * Math.sqrt(l.weight || 1))));
-  fg.d3Force("cluster", g.cluster > 0 ? GF.forceCluster({ strength: g.cluster }) : null);
-  // With collision on, nodes can pack tightly without overlapping, which means
-  // the repulsion no longer has to do that job and clusters can stay dense.
-  fg.d3Force("collide", g.collide ? GF.forceCollide((n) => nodeRadius(n) + 5, { strength: 0.8 }) : null);
-  fg.d3Force("anchors", g.anchors
-    ? GF.forceGroupAnchors(GF.ringAnchors(groupsOf(fgData.nodes)), 0.14)
-    : null);
-}
-
-// Soft blob behind every directory, drawn under the graph. During a replay only
-// the revealed nodes count, so the blobs grow with the animation.
-function drawHulls(ctx, globalScale) {
-  if (!state.gfx.hulls) return;
-  const groups = new Map();
-  for (const n of fgData.nodes) {
-    if (replay.active && n.__shown !== true) continue;
-    if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) continue;
-    if (!groups.has(n.group)) groups.set(n.group, []);
-    groups.get(n.group).push(n);
-  }
-  for (const [group, pts] of groups) {
-    if (pts.length < 2) continue;
-    const hull = GF.padHull(GF.convexHull(pts), 26);
-    GF.traceClosedCurve(ctx, hull, 0.4);
-    ctx.fillStyle = GF.groupColor(group, { sat: 34, light: 56, alpha: 0.055 });
-    ctx.fill();
-    ctx.strokeStyle = GF.groupColor(group, { sat: 34, light: 62, alpha: 0.16 });
-    ctx.lineWidth = 1 / globalScale;
-    ctx.stroke();
-    // Label the blob with the last path segment, but only when it is legible and
-    // the cluster is big enough to be worth naming.
-    if (globalScale > 0.35 && pts.length > 2) {
-      let top = hull[0];
-      for (const p of hull) if (p.y < top.y) top = p;
-      const label = String(group).split("/").filter(Boolean).pop() || group;
-      const size = 12 / globalScale;
-      ctx.font = `500 ${size}px ${"system-ui, -apple-system, sans-serif"}`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "bottom";
-      ctx.fillStyle = GF.groupColor(group, { sat: 30, light: 70, alpha: 0.5 });
-      ctx.fillText(label, top.x, top.y - 4 / globalScale);
+async function loadSpecimen(opt = {}) {
+  if (spec.loading) return;
+  spec.loading = true;
+  const first = !spec.pack;
+  // Which project this payload is for. A project switch mid-flight must not install one
+  // repository's graph under another's name.
+  const forProject = state.project;
+  if (!opt.quiet) $("#graph-loading").classList.remove("hidden");
+  try {
+    const raw = await api(specimenURL());
+    if (forProject !== state.project) return;
+    const G = window.Pack.model(raw);
+    spec.meta = raw;
+    spec.G = G;
+    spec.error = null;
+    if (!spec.pack) {
+      spec.pack = new window.Pack($("#graph-canvas"), G, {
+        reduced: matchMedia("(prefers-reduced-motion: reduce)").matches,
+        gfx: spec.gfx,
+        onSelect: (n) => onSpecimenSelect(n),
+        onHover: () => {},
+      });
+      spec.pack.setGfx(spec.gfx);
+      wireNoteActions();
+    } else {
+      spec.pack.setData(G, { snap: false });
     }
+    for (const k of ["C", "I", "N", "M"]) spec.pack.setShow(k, !spec.off.has(k));
+    if (spec.hits) spec.pack.setHits(spec.hits, spec.hitLabel, first);
+    if (spec.wanted && G.byId.has(spec.wanted)) {
+      spec.pack.focus(spec.wanted, { pin: true });
+      onSpecimenSelect(G.byId.get(spec.wanted));
+      spec.wanted = null;
+    }
+    buildLegend();
+    updateGraphCount();
+    refreshRouteOut();
+  } catch (e) {
+    spec.error = String(e.message || e);
+    $("#graph-count").textContent = "specimen unavailable — retrying…";
+  } finally {
+    spec.loading = false;
+    $("#graph-loading").classList.add("hidden");
   }
 }
 
-// The Display panel. Every row names a key in state.gfx and how far the change
-// has to propagate: "forces" re-runs the layout, "paint" only needs a repaint,
-// "legend" also rebuilds the key, "replay" is read when the next replay starts.
-const GFX_SCHEMA = [
-  {
-    title: "Clustering",
-    items: [
-      { k: "cluster", label: "cluster pull", type: "range", min: 0, max: 1, step: 0.05, apply: "forces",
-        hint: "How hard every node is pulled toward the centre of its own folder. 0 turns clustering off." },
-      { k: "collide", label: "collide", type: "bool", apply: "forces",
-        hint: "Keeps nodes from overlapping, so a cluster can be dense without turning into a blob." },
-      { k: "repel", label: "repulsion", type: "range", min: 40, max: 700, step: 20, apply: "forces",
-        hint: "Base charge. Directories always repel 3.5× harder — that is what keeps clusters apart." },
-      { k: "containsDist", label: "contains len", type: "range", min: 10, max: 90, step: 2, apply: "forces",
-        hint: "Length of the structural CONTAINS spring: shorter = modules hug their directory." },
-      { k: "crossDist", label: "cross len", type: "range", min: 40, max: 320, step: 10, apply: "forces",
-        hint: "Length of calls/imports between modules." },
-      { k: "crossPull", label: "cross pull", type: "range", min: 0, max: 0.2, step: 0.005, apply: "forces",
-        hint: "Strength of those cross-folder edges. High values pull the folders back into one hairball." },
-      { k: "anchors", label: "ring anchors", type: "bool", apply: "forces",
-        hint: "Give every folder a fixed slot on a ring. The layout then comes out the same every run." },
-    ],
-  },
-  {
-    title: "Paint",
-    items: [
-      { k: "labels", label: "node labels", type: "bool", apply: "paint",
-        hint: "The file / entity name under each node. Off is much easier to read on a dense graph." },
-      { k: "edgeWidth", label: "edge width", type: "range", min: 0.2, max: 2, step: 0.1, apply: "paint",
-        hint: "Scales every edge; heavier relations stay proportionally heavier." },
-      { k: "edgeAlpha", label: "edge opacity", type: "range", min: 0.1, max: 1, step: 0.05, apply: "paint" },
-      { k: "hulls", label: "folder blobs", type: "bool", apply: "paint" },
-      { k: "tint", label: "colour by folder", type: "bool", apply: "legend",
-        hint: "Swaps the entity-type palette for one hue per folder." },
-    ],
-  },
-  {
-    title: "Replay animation",
-    items: [
-      { k: "order", label: "reveal", type: "enum", options: ["structure", "wave"], apply: "replay",
-        hint: "structure walks the CONTAINS tree; wave ripples outward from the centre." },
-      { k: "camera", label: "camera", type: "enum", options: ["static", "cinematic"], apply: "replay",
-        hint: "cinematic pushes in on each folder as it is built, then pulls back at the end." },
-      { k: "stems", label: "growing stems", type: "bool", apply: "replay",
-        hint: "An edge grows out of the parent first; the node opens when it arrives." },
-      { k: "glow", label: "glow", type: "bool", apply: "paint" },
-      { k: "spring", label: "spring easing", type: "bool", apply: "paint" },
-    ],
-    note: "Reveal, camera and stems take effect on the next replay.",
-  },
-];
-
-function gfxRow(item, value) {
-  const title = item.hint ? ` title="${esc(item.hint)}"` : "";
-  const key = `<span class="gfx-k">${esc(item.label)}</span>`;
-  if (item.type === "bool") {
-    return `<label class="gfx-row gfx-check"${title}>${key}
-      <input type="checkbox" data-k="${item.k}"${value ? " checked" : ""}></label>`;
-  }
-  if (item.type === "enum") {
-    return `<label class="gfx-row"${title}>${key}
-      <select data-k="${item.k}">${item.options.map((o) =>
-        `<option value="${esc(o)}"${o === value ? " selected" : ""}>${esc(o)}</option>`).join("")}</select></label>`;
-  }
-  return `<label class="gfx-row"${title}>${key}
-    <input type="range" data-k="${item.k}" min="${item.min}" max="${item.max}" step="${item.step}" value="${value}">
-    <output class="gfx-v">${gfxFormat(value)}</output></label>`;
-}
-
-// Trailing zeros read as false precision on a slider readout: 0.7, not 0.70.
-const gfxFormat = (v) => (typeof v === "number" ? String(+v.toFixed(3)) : String(v));
-
-function renderGfxPanel() {
-  const g = state.gfx;
-  $("#gfx-body").innerHTML = GFX_SCHEMA.map((sect) => `
-    <div class="gfx-sect">
-      <h4>${esc(sect.title)}</h4>
-      ${sect.items.map((it) => gfxRow(it, g[it.k])).join("")}
-      ${sect.note ? `<p class="gfx-note">${esc(sect.note)}</p>` : ""}
-    </div>`).join("");
-  const byKey = new Map(GFX_SCHEMA.flatMap((s) => s.items).map((it) => [it.k, it]));
-  $("#gfx-body").querySelectorAll("[data-k]").forEach((el) => {
-    const item = byKey.get(el.dataset.k);
-    el.addEventListener("input", () => {
-      const value = el.type === "checkbox" ? el.checked
-        : el.type === "range" ? +el.value
-        : el.value;
-      state.gfx[item.k] = value;
-      const out = el.parentElement.querySelector(".gfx-v");
-      if (out) out.textContent = gfxFormat(value);
-      saveGfx();
-      applyGfx(item.apply);
-    });
+// The card is a DOM layer over the canvas, so its links are real links.
+function wireNoteActions() {
+  spec.pack.note.addEventListener("click", (ev) => {
+    const act = ev.target.closest("[data-act]");
+    if (act) {
+      ev.preventDefault();
+      const n = spec.pack.pinned;
+      if (!n) return;
+      if (act.dataset.act === "explorer") openEntity(n.id);
+      else if (act.dataset.act === "route") { openRoutePanel(); setRouteEnd("a", n); }
+      else if (act.dataset.act === "scope") scopeTo(n);
+      return;
+    }
+    const hit = ev.target.closest("[data-id]");
+    if (hit) { ev.preventDefault(); spec.pack.focus(hit.dataset.id, { pin: true }); onSpecimenSelect(spec.G.byId.get(hit.dataset.id)); }
   });
 }
 
-function saveGfx() {
-  // A browser with storage disabled must not take the graph down with it.
-  try { localStorage.setItem(GFX_KEY, JSON.stringify(state.gfx)); } catch { /* ignore */ }
+function scopeTo(n) {
+  const path = n.t === "directory" ? n.p : (n.p || "").split("/").slice(0, -1).join("/");
+  spec.prefix = path && path !== "." ? path : null;
+  spec.wanted = n.id;
+  loadSpecimen();
 }
 
-// Dragging a slider fires per pixel; coalesce the work into one frame so the
-// simulation is re-applied once per repaint instead of dozens of times.
-// The kinds are independent, not ranked: flipping tint and then a slider inside
-// one frame has to rebuild the legend AND re-run the layout, so they accumulate.
-let gfxWork = { forces: false, legend: false };
-let gfxQueued = false;
-function applyGfx(kind) {
-  if (kind === "replay" || !fg) return; // read when the next replay starts
-  if (kind === "forces") gfxWork.forces = true;
-  if (kind === "legend") gfxWork.legend = true;
-  if (gfxQueued) return;
-  gfxQueued = true;
-  requestAnimationFrame(() => {
-    const work = gfxWork;
-    gfxWork = { forces: false, legend: false };
-    gfxQueued = false;
-    if (!fg) return;
-    if (work.forces) { applyForces(); fg.d3ReheatSimulation(); }
-    if (work.legend) buildLegend(fgData.nodes, fgData.links);
-    repaintGraph();
-  });
+function updateGraphCount() {
+  const p = spec.pack, m = spec.meta;
+  if (!p || !m) return;
+  const st = p.stats();
+  const of = m.totals ? Object.values(m.totals).reduce((a, b) => a + b, 0) : st.nodes;
+  // Say what is drawn AND what the index holds: a filtered view must not read as the whole one.
+  const nodes = st.nodes < of ? `${fmt(st.nodes)} of ${fmt(of)} nodes` : `${fmt(st.nodes)} nodes`;
+  const scope = m.scope ? ` · scoped to ${m.scope}` : "";  // textContent, not markup
+  $("#graph-count").textContent =
+    `${nodes} · ${fmt(st.edges)} edges${scope} · layout ${st.layoutMs} ms · ${st.frameMs} ms/frame`;
+  $("#graph-scope").innerHTML = m.scope
+    ? `SPECIMEN · <b>${esc(m.scope)}/</b>`
+    : `SPECIMEN · <b>${esc(m.display_name || "")}</b>`;
+  const notes = (m.notes || []).join(" ");
+  $("#graph-hint").textContent = notes ||
+    "drag to pan · wheel to zoom · click to pin · double-click a disc to frame it · esc";
 }
 
-function toggleGfxPanel(on) {
-  const panel = $("#gfx-panel");
-  const show = on === undefined ? panel.classList.contains("hidden") : on;
-  panel.classList.toggle("hidden", !show);
-  $("#graph-gfx").classList.toggle("active", show);
-}
-
-function relCheckboxes() {
-  $("#graph-rels").innerHTML = REL_TYPES.map((r) => `
-    <label><input type="checkbox" data-rel="${r}" ${state.graph.rels.has(r) ? "checked" : ""}>
-      <span style="color:${REL_COLORS[r]}">${r.toLowerCase()}</span></label>`).join("");
-  document.querySelectorAll("#graph-rels input").forEach((cb) =>
-    cb.addEventListener("change", () => {
-      cb.checked ? state.graph.rels.add(cb.dataset.rel) : state.graph.rels.delete(cb.dataset.rel);
-      refreshGraph();
+function buildLegend() {
+  const p = spec.pack;
+  if (!p) return;
+  const rows = [["C", "CALLS"], ["I", "IMPORTS"], ["N", "INHERITS"], ["M", "IMPLEMENTS"]]
+    .filter(([k]) => p.counts[k])
+    .map(([k, name]) => `<span class="lg${spec.off.has(k) ? " off" : ""}" data-kind="${k}"
+      style="color:${REL_COLORS[name]}"><i></i>${name} ${fmt(p.counts[k])}</span>`)
+    .join("");
+  $("#graph-legend").innerHTML = rows +
+    `<div class="marks">○ directory / file / class disc &nbsp;·&nbsp; · function &nbsp;◇ class &nbsp;□ document<br>
+     nesting = CONTAINS ${fmt((spec.meta?.edge_totals || {}).CONTAINS || 0)}</div>`;
+  $("#graph-legend").querySelectorAll(".lg").forEach((el) =>
+    el.addEventListener("click", () => {
+      const k = el.dataset.kind;
+      const off = !spec.off.has(k);
+      if (off) spec.off.add(k); else spec.off.delete(k);
+      el.classList.toggle("off", off);
+      spec.pack.setShow(k, !off);
     }));
 }
 
-async function renderGraph(params) {
-  if (!window.ForceGraph) {
-    $("#graph-canvas-wrap").innerHTML = `<div class="pad dim">force-graph failed to load.</div>`;
-    return;
-  }
-  if (params.get("root")) {
-    state.graph.mode = "neighborhood";
-    state.graph.root = params.get("root");
-    if (params.get("depth")) state.graph.depth = +params.get("depth");
-  } else if (params.get("custom") && state.customGraph) {
-    state.graph.mode = "custom";
-  } else if (!state.graph.root) {
-    state.graph.mode = "overview";
-  }
-  $("#graph-depth").value = String(state.graph.depth);
-  $("#graph-level").value = state.graph.level;
-  $("#graph-summarized").checked = state.graph.summarizedOnly;
-  relCheckboxes();
-  await refreshGraph();
-}
-
-function nodeRadius(n) {
-  const raw = state.graph.mode === "overview" ? (n.size || 0) : (n.degree || 0);
-  return Math.max(5, Math.min(16, 5 + Math.sqrt(raw) * 1.8));
-}
-
-function makeGraphElements(data) {
-  const g = state.graph;
-  const keepContains = g.mode !== "neighborhood"; // overview/custom keep the structural skeleton
-  // "summarized" narrows the view to entities whose summary already exists. During a live
-  // index summaries land batch by batch, so the visible graph grows with them. Custom
-  // (query-result) graphs are exempt — their nodes may legitimately carry no summary field.
-  const visible = (g.summarizedOnly && g.mode !== "custom")
-    ? data.nodes.filter((n) => n.summary)
-    : data.nodes;
-  const nodeIds = new Set(visible.map((n) => n.id));
-  const edges = data.edges.filter((e) =>
-    (g.rels.has(e.relation) || (keepContains && e.relation === "CONTAINS"))
-    && nodeIds.has(e.source) && nodeIds.has(e.target));
-  const nodes = visible.map((n) => {
-    const node = {
-      id: n.id, name: n.name, type: n.type,
-      color: TYPE_COLORS[n.type] || TYPE_COLORS.code,
-      size: n.size, degree: n.degree, summary: n.summary || "", file: fileRef(n),
-    };
-    // Which directory this node belongs to. Everything group-flavoured — the
-    // cluster force, the hulls, the tint, the cinematic camera — reads this.
-    node.group = GF.groupKey(node);
-    return node;
-  });
-  const links = edges.map((e) => ({
-    source: e.source, target: e.target, relation: e.relation,
-    color: REL_COLORS[e.relation] || "#57564f",
-    width: 1 + Math.min(Math.sqrt(e.weight || 1), 4),
-    weight: e.weight || 1,
-  }));
-  return { nodes, links };
-}
-
-function rebuildNeighbors() {
-  fgNeighbors = new Map();
-  const add = (a, b) => {
-    if (!fgNeighbors.has(a)) fgNeighbors.set(a, new Set());
-    fgNeighbors.get(a).add(b);
-  };
-  for (const l of fgData.links) {
-    const s = typeof l.source === "object" ? l.source.id : l.source;
-    const t = typeof l.target === "object" ? l.target.id : l.target;
-    add(s, t);
-    add(t, s);
-  }
-}
-
-function nodeFaded(id) {
-  // During the replay the graph slides under a stationary cursor, so hover
-  // highlighting would randomly dim most of the show. Suppress it.
-  if (!fgHoverNode || replay.active) return false;
-  if (id === fgHoverNode.id) return false;
-  return !(fgNeighbors.get(fgHoverNode.id)?.has(id));
-}
-
-function linkFaded(l) {
-  if (!fgHoverNode || replay.active) return false;
-  const s = typeof l.source === "object" ? l.source.id : l.source;
-  const t = typeof l.target === "object" ? l.target.id : l.target;
-  return s !== fgHoverNode.id && t !== fgHoverNode.id;
-}
-
-const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
-// Overshoots past 1 and settles back — the difference between "appears" and "pops".
-const easeOutBack = (t, s = 1.7) => 1 + (s + 1) * Math.pow(t - 1, 3) + s * Math.pow(t - 1, 2);
-const entranceEase = (t) => (state.gfx.spring ? easeOutBack(t) : easeOutCubic(t));
-
-// Fade a #rrggbb toward transparent — entrance animations and edge opacity.
-function withAlpha(color, a) {
-  const m = /^#([0-9a-f]{6})$/i.exec(String(color));
-  if (!m) return color;
-  const n = parseInt(m[1], 16);
-  return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
-}
-
-function drawNode(node, ctx, globalScale) {
-  // A node waiting for its stem to reach it is simply not there yet.
-  if (node.__bloomAt) {
-    if (performance.now() < node.__bloomAt) return;
-    delete node.__bloomAt;
-  }
-  // Two entrance animations run through here, both self-clearing so steady state
-  // costs nothing:
-  //   addedAt  — a node merged in by the live indexer: 400 ms scale pop.
-  //   revealAt — the replay revealing a node in place: scale + fade + a ripple ring.
-  let scale = 1;
-  let alpha = 1;
-  let ripple = -1;
-  let glow = 0;
-  if (node.addedAt) {
-    const t = (performance.now() - node.addedAt) / 400;
-    if (t < 1) { scale = 0.2 + 0.8 * entranceEase(t); glow = 1 - t; }
-    else delete node.addedAt;
-  }
-  if (node.revealAt) {
-    const dt = performance.now() - node.revealAt;
-    const t = dt / 520;
-    if (t < 1) {
-      scale = 0.25 + 0.75 * entranceEase(t);
-      alpha = Math.min(1, dt / 260);
-      glow = Math.max(glow, 1 - t);
-    }
-    ripple = dt / 900;
-    if (ripple >= 1) delete node.revealAt;
-  }
-  const col = nodeInk(node);
-  const r = nodeRadius(node) * scale;
-  const faded = nodeFaded(node.id);
-  ctx.globalAlpha = faded ? 0.12 : alpha;
-
-  ctx.beginPath();
-  ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
-  ctx.fillStyle = col;
-  // shadowBlur is in device pixels and ignores the canvas transform, so the halo
-  // reads the same at any zoom. Must be reset or it bleeds into everything after.
-  if (glow > 0 && state.gfx.glow && !faded) {
-    ctx.shadowColor = col;
-    ctx.shadowBlur = 26 * glow;
-  }
-  ctx.fill();
-  ctx.shadowBlur = 0;
-  if (node.id === state.graph.root || node.id === fgSelectedId) {
-    ctx.lineWidth = 2 / globalScale;
-    ctx.strokeStyle = node.id === state.graph.root ? CANVAS.accent : CANVAS.label;
-    ctx.stroke();
-  } else {
-    ctx.lineWidth = 0.75 / globalScale;
-    ctx.strokeStyle = CANVAS.ring;
-    ctx.stroke();
-  }
-
-  // Ripple: a ring blooming out of a node the moment the replay reveals it.
-  if (ripple >= 0 && ripple < 1) {
-    ctx.beginPath();
-    ctx.arc(node.x, node.y, r + 30 * ripple, 0, 2 * Math.PI);
-    ctx.strokeStyle = col;
-    ctx.globalAlpha = (faded ? 0.08 : 0.55) * (1 - ripple);
-    ctx.lineWidth = 1.6 / globalScale;
-    ctx.stroke();
-    ctx.globalAlpha = faded ? 0.12 : alpha;
-  }
-
-  // Label: constant on-screen size, with a dark halo for readability
-  if (state.gfx.labels && !faded && globalScale > 0.45) {
-    const label = node.name.length > 26 ? node.name.slice(0, 25) + "…" : node.name;
-    const fontSize = 11 / globalScale;
-    ctx.font = `${fontSize}px system-ui, -apple-system, sans-serif`;
-    const w = ctx.measureText(label).width;
-    const y = node.y + r + 3 / globalScale;
-    ctx.fillStyle = CANVAS.halo;
-    ctx.fillRect(node.x - w / 2 - 2 / globalScale, y, w + 4 / globalScale, fontSize + 2 / globalScale);
-    ctx.textAlign = "center";
-    ctx.textBaseline = "top";
-    ctx.fillStyle = CANVAS.label;
-    ctx.fillText(label, node.x, y + 1 / globalScale);
-  }
-  ctx.globalAlpha = 1;
-}
-
-// An edge caught mid-stem: draw it from the endpoint that was already on screen
-// out to the one budding off it, with a spark riding the tip. `__grow` is set
-// only by the replay and clears itself, so nothing here runs in steady state.
-function drawGrowingLink(link, ctx, globalScale) {
-  if (!link.__grow) return;
-  const from = link.__growFrom === link.target ? link.target : link.source;
-  const to = from === link.source ? link.target : link.source;
-  if (!from || !to || !Number.isFinite(from.x) || !Number.isFinite(to.x)) return;
-  const t = easeOutCubic(Math.min(1, (performance.now() - link.__grow) / (link.__growMs || 520)));
-  const hx = from.x + (to.x - from.x) * t;
-  const hy = from.y + (to.y - from.y) * t;
-  ctx.save();
-  ctx.strokeStyle = linkInk(link);
-  ctx.lineWidth = linkGirth(link) / globalScale;
-  ctx.lineCap = "round";
-  if (link.relation === "CONTAINS") ctx.setLineDash([3 / globalScale, 3 / globalScale]);
-  ctx.beginPath();
-  ctx.moveTo(from.x, from.y);
-  ctx.lineTo(hx, hy);
-  ctx.stroke();
-  if (t < 1) {
-    ctx.setLineDash([]);
-    ctx.beginPath();
-    ctx.arc(hx, hy, 2 / globalScale, 0, 2 * Math.PI);
-    ctx.fillStyle = link.color;
-    ctx.globalAlpha = 1 - t;
-    ctx.fill();
-  }
-  ctx.restore();
-  if (t >= 1) { delete link.__grow; delete link.__growFrom; delete link.__growMs; }
-}
-
-function ensureForceGraph() {
-  if (fg) return fg;
-  const container = $("#graph-canvas");
-  // Real input only — programmatic zoomToFit fires neither of these, so the live
-  // follow-camera keeps working until the user actually grabs the view.
-  container.addEventListener("wheel", () => { state.live.userCam = true; }, { passive: true });
-  container.addEventListener("pointerdown", () => { state.live.userCam = true; });
-  fg = ForceGraph()(container)
-    .backgroundColor(CANVAS.ink)
-    .nodeId("id")
-    .nodeLabel(() => "") // our own labels + card instead of the built-in tooltip
-    .nodeCanvasObject(drawNode)
-    // Visibility is a paint-time filter — hidden nodes still take part in the
-    // physics. That is what lets the replay reveal a graph without re-laying it
-    // out: nothing is inserted, so the simulation is never re-heated.
-    .nodeVisibility((n) => !replay.active || n.__shown === true)
-    .linkVisibility((l) => !replay.active || l.__shown === true)
-    .nodePointerAreaPaint((node, color, ctx) => {
-      ctx.beginPath();
-      ctx.arc(node.x, node.y, nodeRadius(node) + 4, 0, 2 * Math.PI);
-      ctx.fillStyle = color;
-      ctx.fill();
-    })
-    // Edges revealed by the replay fade in and grow from a hairline to their real
-    // width over 520 ms; `revealAt` is only ever set there and clears itself.
-    .linkColor((l) => {
-      if (linkFaded(l)) return "rgba(87,86,79,0.08)";
-      if (l.revealAt) {
-        const t = (performance.now() - l.revealAt) / 520;
-        if (t < 1) return withAlpha(l.color, (0.1 + 0.9 * t) * state.gfx.edgeAlpha);
-      }
-      return linkInk(l);
-    })
-    .linkWidth((l) => {
-      const w = linkGirth(l);
-      if (!l.revealAt) return w;
-      const t = (performance.now() - l.revealAt) / 520;
-      if (t >= 1) { delete l.revealAt; return w; }
-      return 0.2 + w * easeOutCubic(t);
-    })
-    // Stems: while a replayed edge is growing we paint it ourselves, from the
-    // endpoint that was already on screen toward the one budding off it. Outside
-    // that window the library's own (batched, much cheaper) painter does the job.
-    .linkCanvasObjectMode((l) => (l.__grow ? "replace" : "after"))
-    .linkCanvasObject(drawGrowingLink)
-    .linkLineDash((l) => (l.relation === "CONTAINS" ? [3, 3] : null))
-    // Particles are per-frame work on every visible edge — fine for a module
-    // overview, ruinous for the all-entities view, which is thousands of edges.
-    .linkDirectionalParticles((l) =>
-      (l.relation === "CONTAINS" || linkFaded(l) || fgData.nodes.length > 400 ? 0 : 2))
-    .linkDirectionalParticleWidth((l) => linkGirth(l) + 1)
-    .linkDirectionalParticleSpeed(0.0045)
-    .linkDirectionalParticleColor((l) => linkInk(l))
-    .dagLevelDistance(70)
-    .onDagError(() => {}) // cyclic graphs: keep force positions instead of throwing
-    .onNodeHover((node) => {
-      fgHoverNode = node || null;
-      container.style.cursor = node ? "pointer" : "";
-    })
-    .onNodeClick((node) => {
-      const now = Date.now();
-      if (fgLastClick.id === node.id && now - fgLastClick.t < 350) {
-        fgLastClick = { id: null, t: 0 };
-        expandNode(node.id);
-      } else {
-        fgLastClick = { id: node.id, t: now };
-        showNodePanel(node.id);
-      }
-    })
-    .onBackgroundClick(() => hideNodePanel())
-    .onRenderFramePre(drawHulls)
-    .onEngineStop(() => {
-      if (fgNeedsFit) {
-        fgNeedsFit = false;
-        fg.zoomToFit(400, 60);
-      }
-    });
-  applyForces();
-  new ResizeObserver(() => {
-    const rect = container.getBoundingClientRect();
-    if (rect.width && rect.height) fg.width(rect.width).height(rect.height);
-  }).observe(container);
-  return fg;
-}
-
-async function refreshGraph() {
-  const g = state.graph;
-  stopReplay({ restore: false }); // we are about to replace the canvas data anyway
-  hideNodePanel();
-  let data;
-  // A failed fetch (Memgraph busy under heavy index writes) must not leave the view
-  // dark with no force-graph instance — keep what is on canvas, flag the error, and
-  // let pollStatus retry on its next tick.
-  try {
-    if (g.mode === "custom" && state.customGraph) {
-      data = { ...state.customGraph, truncated: false };
-      $("#graph-scope").textContent = "Query result";
-    } else if (g.mode === "neighborhood" && g.root) {
-      data = await api(`/graph?root=${encodeURIComponent(g.root)}&depth=${g.depth}&rels=${[...g.rels].join(",")}`);
-      const rootNode = data.nodes.find((n) => n.id === g.root);
-      g.rootName = rootNode ? rootNode.name : g.root;
-      $("#graph-scope").textContent = `Around: ${g.rootName}`;
-    } else if (g.level === "all") {
-      g.mode = "full";
-      data = await api("/graph?mode=full");
-      $("#graph-scope").textContent = "Whole project · every entity";
-    } else {
-      g.mode = "overview";
-      data = await api("/graph?mode=overview");
-      $("#graph-scope").textContent = "Modules overview";
-    }
-    // depth is a neighborhood-only control; in the unrooted views it does nothing.
-    $("#depth-wrap").classList.toggle("hidden", g.mode !== "neighborhood");
-    state.live.graphError = false;
-    state.live.userCam = false; // fresh render: the follow-camera takes over again
-  } catch (e) {
-    state.live.graphError = true;
-    $("#graph-count").textContent = "graph unavailable — retrying…";
-    return;
-  }
-
-  fgData = makeGraphElements(data);
-  rebuildNeighbors();
-  ensureForceGraph();
-  applyLayoutMode();
-  fgNeedsFit = true;
-  fg.graphData(fgData);
-  applyForces(); // after graphData: the link force recomputes strengths from the new links
-  fg.d3ReheatSimulation();
-  // Interim fit while the simulation is still spreading; the final fit runs on engine stop
-  setTimeout(() => { if (fgNeedsFit) fg.zoomToFit(300, 60); }, 800);
-
-  buildLegend(fgData.nodes, fgData.links);
-  $("#graph-count").textContent =
-    `${fgData.nodes.length} nodes · ${fgData.links.length} edges${data.truncated ? " · truncated" : ""}`;
-  $("#graph-replay").disabled = fgData.nodes.length < 2;
-}
-
-function applyLayoutMode() {
-  if (!fg) return;
-  fg.dagMode(state.graph.layout === "force" ? null : state.graph.layout);
-}
-
-function buildLegend(nodes, links) {
-  buildLegendFrom(new Set(nodes.map((n) => n.type)), new Set(links.map((e) => e.relation)));
-}
-
-function buildLegendFrom(typeSet, relSet) {
-  // With folder tinting on, an entity-type key would be a lie — the dots on the
-  // canvas are folders, so the key lists folders too.
-  const dots = state.gfx.tint
-    ? groupLegendRows()
-    : [...typeSet].filter((t) => TYPE_COLORS[t]).map((t) => ({ label: t, color: TYPE_COLORS[t] }));
-  const rels = [...relSet];
-  $("#graph-legend").innerHTML =
-    dots.map((d) => `<div class="lg-row"><span class="lg-dot" style="background:${d.color}"></span>${esc(d.label)}</div>`).join("") +
-    (rels.length && dots.length ? `<div style="height:4px"></div>` : "") +
-    rels.map((r) => `<div class="lg-row"><span class="lg-line" style="background:${REL_COLORS[r] || "#57564f"}"></span>${r.toLowerCase()}</div>`).join("");
-}
-
-// Folders currently on canvas, biggest first — capped, because a wide repo has
-// more folders than the legend has room for.
-function groupLegendRows() {
-  const count = new Map();
-  for (const n of fgData.nodes) {
-    if (replay.active && n.__shown !== true) continue;
-    count.set(n.group, (count.get(n.group) || 0) + 1);
-  }
-  const top = [...count.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
-  const rows = top.map(([g]) => ({
-    label: String(g).split("/").filter(Boolean).pop() || g,
-    color: GF.groupColor(g),
-  }));
-  if (count.size > top.length) rows.push({ label: `+${count.size - top.length} more`, color: "transparent" });
-  return rows;
-}
-
-function hideNodePanel() {
-  fgSelectedId = null;
-  $("#graph-side").classList.add("hidden");
-}
-
-// Add an entity to the canvas next to `fromId`, optionally with the edge that led to it.
-function addEntityToCanvas(entity, fromId, relation, direction) {
-  if (replay.active) return; // the replay owns the canvas; don't graft onto its staged set
-  if (fgData.nodes.some((n) => n.id === entity.id)) return;
-  const from = fgData.nodes.find((n) => n.id === fromId);
-  const node = {
-    id: entity.id, name: entity.name, type: entity.type,
-    color: TYPE_COLORS[entity.type] || TYPE_COLORS.code,
-    degree: 0, summary: entity.summary || "", file: fileRef(entity),
-    x: (from?.x || 0) + (Math.random() - 0.5) * 40,
-    y: (from?.y || 0) + (Math.random() - 0.5) * 40,
-  };
-  node.group = GF.groupKey(node); // or it lands outside every cluster, hull and tint
-  fgData.nodes.push(node);
-  if (fromId && relation) {
-    // The user explicitly walked this edge — draw it even if its type is filtered out
-    fgData.links.push({
-      source: direction === "in" ? entity.id : fromId,
-      target: direction === "in" ? fromId : entity.id,
-      relation, color: REL_COLORS[relation] || "#57564f",
-      width: 1.5, weight: 1,
-    });
-  }
-  rebuildNeighbors();
-  fg.graphData(fgData);
-  buildLegend(fgData.nodes, fgData.links);
-  $("#graph-count").textContent = `${fgData.nodes.length} nodes · ${fgData.links.length} edges`;
-}
-
-// Show full entity details in the side panel. When the entity was reached by
-// clicking a relation of the previously selected node, {fromId, relation,
-// direction} add it to the canvas so the walk stays visible.
-async function showNodePanel(id, via = null) {
-  fgSelectedId = id;
-  const panel = $("#graph-side");
-  const content = $("#graph-side-content");
-  panel.classList.remove("hidden");
-  content.innerHTML = `<div class="gs-loading">Loading…</div>`;
-
+async function onSpecimenSelect(n) {
+  const side = $("#graph-side");
+  if (!n) { side.classList.add("hidden"); return; }
+  side.classList.remove("hidden");
+  const box = $("#graph-side-content");
+  box.innerHTML = `<div class="gs-loading">reading…</div>`;
   let detail;
   try {
-    detail = await api(`/entity?id=${encodeURIComponent(id)}`);
+    detail = await api(`/entity?id=${encodeURIComponent(n.id)}`);
   } catch {
-    content.innerHTML = `<div class="gs-loading">Failed to load entity.</div>`;
+    box.innerHTML = `<div class="gs-loading">Entity not found.</div>`;
     return;
   }
-  if (fgSelectedId !== id) return; // stale: user already clicked elsewhere
+  if (!spec.pack.pinned || spec.pack.pinned.id !== n.id) return; // stale
   const e = detail.entity;
-
-  if (via) addEntityToCanvas(e, via.fromId, via.relation, via.direction);
-  const node = fgData.nodes.find((n) => n.id === id);
-  if (node && node.x != null && !replay.active) { // the replay owns a still camera
-    fg.centerAt(node.x, node.y, 500);
-    // Newly added nodes drift while the simulation settles — re-center once it has
-    if (via) setTimeout(() => {
-      if (fgSelectedId === id && node.x != null) fg.centerAt(node.x, node.y, 400);
-    }, 800);
-  }
-
-  const inGraph = (nid) => fgData.nodes.some((n) => n.id === nid);
   const relGroup = (rels, dir) => {
     if (!rels.length) return "";
     const byType = {};
     rels.forEach((r) => (byType[r.relation] = byType[r.relation] || []).push(r));
     return Object.entries(byType).map(([rel, items]) => `
       <div class="rel-group">
-        <span class="rel-tag" style="--rel-c:${REL_COLORS[rel] || "#7d7f73"}">${dir === "in" ? "◂ " : "▸ "}${esc(rel)}</span>
+        <span class="rel-tag rel-${esc(rel)}">${dir === "in" ? "←" + esc(rel) + "─" : "─" + esc(rel) + "→"} ${items.length}</span>
         ${items.map((r) => `
-          <div class="gs-rel-item" data-id="${esc(r.id)}" data-rel="${esc(r.relation)}" data-dir="${dir}" title="${esc(r.summary || "")}">
-            ${chip(r.type)}<span class="name">${esc(r.name)}</span><span class="path">${esc(fileRef(r))}</span>
-            ${inGraph(r.id) ? "" : `<span class="plus" title="Not on canvas yet — click to add">＋</span>`}
-          </div>`).join("")}
+          <div class="rel-row"><span class="name" data-id="${esc(r.id)}" title="${esc(r.summary || "")}">${esc(r.name)}</span>
+          <span class="path">${esc(fileRef(r))}</span></div>`).join("")}
       </div>`).join("");
   };
-  const childrenGroup = detail.children.length ? `
-    <div class="rel-group">
-      <span class="rel-tag" style="--rel-c:${REL_COLORS.CONTAINS}">▸ CONTAINS</span>
-      ${detail.children.map((c) => `
-        <div class="gs-rel-item" data-id="${esc(c.id)}" data-rel="CONTAINS" data-dir="out" title="${esc(c.summary || "")}">
-          ${chip(c.type)}<span class="name">${esc(c.name)}</span><span class="path">${esc(fileRef(c))}</span>
-          ${inGraph(c.id) ? "" : `<span class="plus" title="Not on canvas yet — click to add">＋</span>`}
-        </div>`).join("")}
-    </div>` : "";
-  const crumbs = detail.breadcrumbs.map((c) => esc(c.name)).join(" / ");
-
-  content.innerHTML = `
-    <div class="gs-head">
-      ${chip(e.type)}<h3>${esc(e.name)}</h3>
-      <button class="ghost-btn" id="gs-close" title="Close">✕</button>
-    </div>
-    ${crumbs ? `<div class="gs-crumbs">${crumbs}</div>` : ""}
-    <div class="gs-meta mono">${esc(fileRef(e))}${e.line_end ? "–" + e.line_end : ""}</div>
-    <div class="gs-actions">
-      <button class="tb-btn accent" id="gs-open">Open in Explorer</button>
-      <button class="tb-btn" id="gs-expand">Expand</button>
-      <button class="tb-btn" id="gs-focus">Focus</button>
-    </div>
-    ${e.summary ? `<div class="gs-sect"><h4>Summary</h4><div class="gs-summary">${esc(e.summary)}</div></div>` : ""}
-    ${e.signature ? `<div class="gs-sect"><h4>Signature</h4><div class="gs-sig mono">${esc(e.signature)}</div></div>` : ""}
-    <div class="gs-sect gs-code" id="gs-code-sect"></div>
-    ${detail.outgoing.length || detail.children.length ? `<div class="gs-sect"><h4>Outgoing</h4>${relGroup(detail.outgoing, "out")}${childrenGroup}</div>` : ""}
-    ${detail.incoming.length ? `<div class="gs-sect"><h4>Incoming</h4>${relGroup(detail.incoming, "in")}</div>` : ""}
-  `;
-
-  $("#gs-close").addEventListener("click", () => hideNodePanel());
-  $("#gs-open").addEventListener("click", () => openEntity(id));
-  $("#gs-expand").addEventListener("click", () => expandNode(id));
-  $("#gs-focus").addEventListener("click", () => nav("graph", { root: id, depth: state.graph.depth }));
-  content.querySelectorAll(".gs-rel-item").forEach((el) =>
-    el.addEventListener("click", () =>
-      showNodePanel(el.dataset.id, { fromId: id, relation: el.dataset.rel, direction: el.dataset.dir })));
-
-  loadPanelCode(e, $("#gs-code-sect"));
-}
-
-async function loadPanelCode(entity, sect) {
-  if (entity.type === "directory") { sect.remove(); return; }
-  sect.innerHTML = `<h4>Code</h4><div class="dim" style="font-size:12px">Loading…</div>`;
-  const res = await api(`/code?id=${encodeURIComponent(entity.id)}`, { allowError: true });
-  if (fgSelectedId !== entity.id) return;
-  if (!res.content) { sect.remove(); return; }
-  const lines = res.content.split("\n");
-  let highlighted;
-  try {
-    highlighted = res.language
-      ? hljs.highlight(res.content, { language: res.language }).value
-      : hljs.highlightAuto(res.content).value;
-  } catch { highlighted = esc(res.content); }
-  const gutter = lines.map((_, i) => res.first_line + i).join("\n");
-  sect.innerHTML = `
-    <h4>Code</h4>
-    <div class="code-card">
-      <div class="code-head"><span class="mono">lines ${res.first_line}–${res.first_line + lines.length - 1}</span>
-        <span class="grow"></span>${res.source === "chunks" ? `<span title="Reassembled from stored chunks">≈</span>` : ""}</div>
-      <div class="code-scroll"><div class="code-grid">
-        <div class="code-gutter">${gutter}</div>
-        <pre class="code-body"><code class="hljs">${highlighted}</code></pre>
-      </div></div>
+  box.innerHTML = `
+    <div class="gs">
+      <div class="gs-head">${chip(e.type)}<h3>${esc(e.name)}</h3></div>
+      <div class="gs-crumbs">${detail.breadcrumbs.map((c) => esc(c.name)).join(" / ")}</div>
+      <div class="gs-meta">${esc(fileRef(e))}${e.line_end ? "–" + e.line_end : ""}</div>
+      <div class="gs-actions">
+        <button class="btn accent" id="gs-open">open in explorer</button>
+        <button class="btn" id="gs-route">route from here</button>
+        <button class="btn" id="gs-scope">scope here</button>
+      </div>
+      ${e.summary ? `<div class="gs-sect"><h4>SUMMARY</h4><div class="gs-summary">${esc(e.summary)}</div></div>`
+        : `<div class="gs-sect"><h4>SUMMARY</h4><div class="dim">no summary yet</div></div>`}
+      ${e.signature ? `<div class="gs-sect"><h4>SIGNATURE</h4><div class="sig-block">${esc(e.signature)}</div></div>` : ""}
+      ${detail.outgoing.length ? `<div class="gs-sect"><h4>OUTGOING ${detail.outgoing.length}</h4>${relGroup(detail.outgoing, "out")}</div>` : ""}
+      ${detail.incoming.length ? `<div class="gs-sect"><h4>INCOMING ${detail.incoming.length}</h4>${relGroup(detail.incoming, "in")}</div>` : ""}
     </div>`;
+  $("#gs-open").addEventListener("click", () => openEntity(n.id));
+  $("#gs-route").addEventListener("click", () => { openRoutePanel(); setRouteEnd("a", n); });
+  $("#gs-scope").addEventListener("click", () => scopeTo(n));
+  box.querySelectorAll("[data-id]").forEach((el) =>
+    el.addEventListener("click", () => {
+      const target = spec.G.byId.get(el.dataset.id);
+      if (target) { spec.pack.focus(target.id, { pin: true }); onSpecimenSelect(target); }
+      else openEntity(el.dataset.id); // filtered out of this view — the explorer still has it
+    }));
 }
 
-async function expandNode(id) {
-  if (replay.active) return; // read-only during the animation
-  const data = await api(`/graph?root=${encodeURIComponent(id)}&depth=1&rels=${[...state.graph.rels].join(",")}`);
-  const have = new Set(fgData.nodes.map((n) => n.id));
-  const around = fgData.nodes.find((n) => n.id === id);
-  const linkKey = (l) => {
-    const s = typeof l.source === "object" ? l.source.id : l.source;
-    const t = typeof l.target === "object" ? l.target.id : l.target;
-    return `${s}→${t}→${l.relation}`;
-  };
-  const haveLinks = new Set(fgData.links.map(linkKey));
-  let added = 0;
-  for (const n of data.nodes) {
-    if (have.has(n.id)) continue;
-    have.add(n.id);
-    added++;
-    fgData.nodes.push({
-      id: n.id, name: n.name, type: n.type,
-      color: TYPE_COLORS[n.type] || TYPE_COLORS.code,
-      size: n.size, degree: n.degree, summary: n.summary || "", file: fileRef(n),
-      // spawn near the expanded node so new nodes settle in place instead of flying in
-      x: (around?.x || 0) + (Math.random() - 0.5) * 30,
-      y: (around?.y || 0) + (Math.random() - 0.5) * 30,
-    });
-  }
-  for (const e of data.edges) {
-    if (!state.graph.rels.has(e.relation)) continue;
-    if (!have.has(e.source) || !have.has(e.target)) continue;
-    const key = `${e.source}→${e.target}→${e.relation}`;
-    if (haveLinks.has(key)) continue;
-    haveLinks.add(key);
-    added++;
-    fgData.links.push({
-      source: e.source, target: e.target, relation: e.relation,
-      color: REL_COLORS[e.relation] || "#57564f",
-      width: 1 + Math.min(Math.sqrt(e.weight || 1), 4),
-      weight: e.weight || 1,
-    });
-  }
-  if (added) {
-    rebuildNeighbors();
-    fg.graphData(fgData); // existing node objects keep their positions; physics absorbs the rest
-    buildLegend(fgData.nodes, fgData.links);
-    $("#graph-count").textContent = `${fgData.nodes.length} nodes · ${fgData.links.length} edges`;
-    setTimeout(() => fg.zoomToFit(400, 60), 600);
-  }
+// ---- route: the shortest way from A to B over the real edges -----------------------------
+
+function openRoutePanel() { $("#route-panel").classList.remove("hidden"); $("#graph-route").classList.add("on"); }
+function closeRoutePanel() {
+  $("#route-panel").classList.add("hidden");
+  $("#graph-route").classList.remove("on");
+  spec.route.arm = null;
+  document.querySelectorAll(".route-pick").forEach((r) => r.classList.remove("arm"));
 }
 
-// ---------------------------------------------------------------------------
-// Replay: "how this graph grew", Obsidian-style. Strictly read-only eye candy.
-//
-// It reveals the graph that is already on the canvas, in build order, WITHOUT
-// touching the layout: every node keeps the position it settled into, and the
-// reveal runs entirely through the nodeVisibility/linkVisibility paint filters.
-// Nothing is inserted into the simulation, so it is never re-heated — no
-// convulsing, no drift, and the camera can be framed once and left alone.
-// Anything that would replace the canvas data (a refresh, a route change, a
-// live-index merge) stops the replay first, and live merges are deferred while
-// it runs.
-// ---------------------------------------------------------------------------
+function setRouteEnd(which, node) {
+  spec.route[which] = node;
+  $(`#route-${which}`).value = node ? node.id : "";
+  $(`#route-${which}-sugg`).classList.add("hidden");
+  document.querySelectorAll(".route-pick").forEach((r) => r.classList.remove("arm"));
+  spec.route.arm = null;
+  computeRoute();
+}
 
-// Motion is kinematic, never physical: the final layout is already known, so a
-// node simply glides to its own spot. It starts SPROUT_FROM of the way out from
-// the node that introduced it — the whole graph never scales, only the newcomer
-// moves.
-const REPLAY_MOTION = { sproutMs: 900, sproutFrom: 0.3, stemMs: 520 };
+function computeRoute() {
+  const { a, b } = spec.route;
+  const out = $("#route-out");
+  if (!a || !b) {
+    out.innerHTML = `<small>PICK TWO ENTITIES</small><span class="dim">Click <b>pick</b> and then a node on the specimen, or type a name.</span>`;
+    spec.pack?.clearRoute();
+    return;
+  }
+  const R = spec.pack.routeBetween(a, b);
+  if (!R) {
+    out.innerHTML = `<small>NO ROUTE</small><span class="dim">Nothing in this graph connects them — not even through the tree. That is the answer, not a failure.</span>`;
+    spec.pack.clearRoute();
+    return;
+  }
+  spec.pack.setRoute(R, true);
+  out.innerHTML = `<small>${R.steps.length} EDGE${R.steps.length === 1 ? "" : "S"} OF THIS GRAPH · COST ${Math.round(R.cost * 10) / 10}</small>` +
+    R.steps.map((st) => `<div>
+      <span data-id="${esc(st.a.id)}">${esc(spec.pack.shortName(st.a))}</span>
+      <em class="rel-tag rel-${REL_KIND[st.k]}">${st.dir === ">" ? "─" + REL_KIND[st.k] + "→" : "←" + REL_KIND[st.k] + "─"}</em>
+      <span data-id="${esc(st.b.id)}">${esc(spec.pack.shortName(st.b))}</span>
+    </div>`).join("");
+  out.querySelectorAll("[data-id]").forEach((el) =>
+    el.addEventListener("click", () => { spec.pack.focus(el.dataset.id, { pin: true }); onSpecimenSelect(spec.G.byId.get(el.dataset.id)); }));
+}
 
-const replay = {
-  active: false, paused: false, speed: 1,
-  order: [],      // nodes, in reveal order
-  anchorAt: [],   // anchorAt[i] = the node order[i] buds off from (or null)
-  linksAt: [],    // linksAt[i] = links whose both endpoints are visible once order[i] lands
-  i: 0, shownLinks: 0,
-  types: new Set(), rels: new Set(), // legend contents so far
-  raf: null, last: 0, acc: 0, rate: 1, pausedAt: 0,
-  missedUpdate: false, endTimer: null,
-  group: null, centroids: new Map(), baseZoom: 1, // cinematic camera
-  recording: false,                                // this run is being captured to video
-};
+function refreshRouteOut() {
+  // A rebuild replaces every node object; re-resolve the ends by id or drop them.
+  for (const which of ["a", "b"]) {
+    const n = spec.route[which];
+    if (n) spec.route[which] = spec.G.byId.get(n.id) || null;
+  }
+  if (!$("#route-panel").classList.contains("hidden")) computeRoute();
+}
 
-const endId = (v) => (typeof v === "object" ? v.id : v);
+function routeSuggest(which) {
+  const input = $(`#route-${which}`);
+  const box = $(`#route-${which}-sugg`);
+  const q = input.value.trim().toLowerCase();
+  if (!q || !spec.G) { box.classList.add("hidden"); return; }
+  const hits = [];
+  for (const n of spec.G.nodes) {
+    if (n.id.toLowerCase().includes(q) || n.n.toLowerCase().includes(q)) hits.push(n);
+    if (hits.length >= 40) break;
+  }
+  if (!hits.length) { box.innerHTML = `<div class="dim">no entity matches</div>`; box.classList.remove("hidden"); return; }
+  box.innerHTML = hits.map((n) => `<div data-id="${esc(n.id)}">${chip(n.t)} ${esc(n.n)} <span class="dim">${esc(n.p)}</span></div>`).join("");
+  box.classList.remove("hidden");
+  box.querySelectorAll("[data-id]").forEach((el) =>
+    el.addEventListener("click", () => setRouteEnd(which, spec.G.byId.get(el.dataset.id))));
+}
 
-// Plausible build order: the CONTAINS spine first (root dir → subdirs → modules →
-// their entities, breadth-first, directories before files), then anything reachable
-// over CALLS/IMPORTS/… so the graph grows outward instead of jumping between islands.
-function buildReplayOrder(nodes, links) {
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  const kids = new Map();
-  const parent = new Map();
-  const adj = new Map();
-  const push = (map, k, v) => { if (!map.has(k)) map.set(k, []); map.get(k).push(v); };
+// ---- display panel ------------------------------------------------------------------------
 
-  for (const l of links) {
-    const s = endId(l.source), t = endId(l.target);
-    if (!byId.has(s) || !byId.has(t) || s === t) continue;
-    push(adj, s, t);
-    push(adj, t, s);
-    if (l.relation === "CONTAINS" && !parent.has(t)) {
-      parent.set(t, s);
-      push(kids, s, t);
+const GFX_SCHEMA = [
+  { k: "labels", label: "labels", type: "bool", hint: "Names on the specimen, as many as fit without overlapping." },
+  { k: "edgeAlpha", label: "edge ink", type: "range", min: 0, max: 2, step: .05, hint: "Multiplies the zoom-dependent opacity of the bundles. 0 leaves only the discs." },
+  { k: "pulse", label: "idle pulse", type: "bool", hint: "When nothing is selected a random node breathes its links — the index is live, not a picture." },
+  { k: "bloom", label: "bloom on load", type: "bool", hint: "Discs open out of their parents when the specimen is first drawn." },
+  { k: "glitch", label: "row tearing", type: "bool", hint: "Rare, short, on the canvas only — never on a card you have to read." },
+  { k: "grain", label: "scanlines", type: "bool", hint: "The dirt is live, not baked. Off is a clean canvas." },
+  { k: "paper", label: "paper", type: "bool", hint: "The herbarium sheet: the same specimen in ink on grey paper." },
+];
+
+function renderGfxPanel() {
+  const g = spec.gfx;
+  $("#gfx-body").innerHTML = GFX_SCHEMA.map((it) => {
+    const title = it.hint ? ` title="${esc(it.hint)}"` : "";
+    if (it.type === "bool") {
+      return `<label class="gfx-row"${title}><span class="gfx-k">${esc(it.label)}</span>
+        <input type="checkbox" data-k="${it.k}"${g[it.k] ? " checked" : ""}></label>`;
     }
-  }
-
-  const rank = { directory: 0, module: 1, class: 2, interface: 2, struct: 2, enum: 2, trait: 2 };
-  const cmp = (a, b) => {
-    const na = byId.get(a), nb = byId.get(b);
-    return (rank[na.type] ?? 3) - (rank[nb.type] ?? 3)
-      || String(na.file || "").localeCompare(String(nb.file || ""))
-      || String(na.name || "").localeCompare(String(nb.name || ""));
-  };
-
-  const seeds = nodes.filter((n) => !parent.has(n.id)).map((n) => n.id).sort(cmp);
-  const placed = new Set();
-  const order = [];
-  const anchorAt = []; // the already-revealed node each one buds off from (or null)
-  const queue = [];
-  let seedIdx = 0;
-
-  while (order.length < nodes.length) {
-    if (!queue.length) {
-      while (seedIdx < seeds.length && placed.has(seeds[seedIdx])) seedIdx++;
-      let start = seeds[seedIdx];
-      if (start === undefined) {
-        const left = nodes.find((n) => !placed.has(n.id));
-        if (!left) break;
-        start = left.id;
-      }
-      queue.push({ id: start, from: null });
-    }
-    const { id, from } = queue.shift();
-    if (placed.has(id)) continue;
-    placed.add(id);
-    order.push(byId.get(id));
-    anchorAt.push(from ? byId.get(from) : null);
-    // CONTAINS children first (the tree unfolds), then whatever else this node
-    // reaches, so the reveal spreads outward instead of hopping between islands.
-    for (const c of (kids.get(id) || []).filter((c) => !placed.has(c)).sort(cmp))
-      queue.push({ id: c, from: id });
-    for (const o of (adj.get(id) || []).filter((o) => !placed.has(o) && parent.get(o) !== id).sort(cmp))
-      queue.push({ id: o, from: id });
-  }
-
-  return finalizeOrder(order, anchorAt, links);
+    return `<label class="gfx-row"${title}><span class="gfx-k">${esc(it.label)}</span>
+      <input type="range" data-k="${it.k}" min="${it.min}" max="${it.max}" step="${it.step}" value="${g[it.k]}">
+      <output class="gfx-v">${+Number(g[it.k]).toFixed(2)}</output></label>`;
+  }).join("") + `<p class="gfx-note">Display only. Nothing here changes what was fetched or indexed.</p>`;
+  $("#gfx-body").querySelectorAll("[data-k]").forEach((el) =>
+    el.addEventListener("input", () => {
+      const v = el.type === "checkbox" ? el.checked : +el.value;
+      spec.gfx[el.dataset.k] = v;
+      const out = el.parentElement.querySelector(".gfx-v");
+      if (out) out.textContent = String(+Number(v).toFixed(2));
+      saveGfx();
+      spec.pack?.setGfx(spec.gfx);
+    }));
 }
 
-// An edge only exists once both of its ends do, so it lands with the later one.
-function finalizeOrder(order, anchorAt, links) {
-  const idx = new Map(order.map((n, i) => [n.id, i]));
-  const linksAt = order.map(() => []);
-  for (const l of links) {
-    const s = idx.get(endId(l.source));
-    const t = idx.get(endId(l.target));
-    if (s === undefined || t === undefined) continue;
-    linksAt[Math.max(s, t)].push(l);
-  }
-  return { order, anchorAt, linksAt };
-}
-
-// The other reveal order: a ripple outward from the centre of the finished
-// layout. It ignores structure entirely, which is exactly why it reads as one
-// object coming into existence rather than a tree being walked.
-function buildWaveOrder(nodes, links) {
-  const byId = new Map(nodes.map((n) => [n.id, n]));
-  const adj = new Map();
-  for (const l of links) {
-    const s = endId(l.source), t = endId(l.target);
-    if (!byId.has(s) || !byId.has(t) || s === t) continue;
-    if (!adj.has(s)) adj.set(s, []);
-    if (!adj.has(t)) adj.set(t, []);
-    adj.get(s).push(t);
-    adj.get(t).push(s);
-  }
-  let cx = 0, cy = 0;
-  for (const n of nodes) { cx += n.x || 0; cy += n.y || 0; }
-  cx /= nodes.length || 1;
-  cy /= nodes.length || 1;
-  const dist = (n) => Math.hypot((n.x || 0) - cx, (n.y || 0) - cy);
-  const order = [...nodes].sort((a, b) => dist(a) - dist(b) || String(a.id).localeCompare(String(b.id)));
-  // The stem has to come from something already on screen: pick the neighbour
-  // that was revealed most recently before this node, if there is one at all.
-  const rank = new Map(order.map((n, i) => [n.id, i]));
-  const anchorAt = order.map((n, i) => {
-    let best = null, bestRank = -1;
-    for (const id of adj.get(n.id) || []) {
-      const r = rank.get(id);
-      if (r !== undefined && r < i && r > bestRank) { bestRank = r; best = byId.get(id); }
-    }
-    return best;
-  });
-  return finalizeOrder(order, anchorAt, links);
-}
-
-function showReplayBar(on) {
-  $("#replay-bar").classList.toggle("hidden", !on);
-  $("#graph-canvas-wrap").classList.toggle("replaying", on);
-  $("#graph-replay").classList.toggle("active", on);
-  $("#graph-replay").textContent = on ? "■ Stop" : "▶ Replay";
-}
-
-function updateReplayBar() {
-  const total = replay.order.length;
-  $("#replay-label").textContent = `${replay.i} / ${total}`;
-  $("#replay-fill").style.width = `${total ? (100 * replay.i) / total : 0}%`;
-  const cur = replay.order[Math.max(0, replay.i - 1)];
-  // fileRef() carries a :line suffix that is always :1 for whole modules — drop it.
-  $("#replay-now").textContent = cur ? String(cur.file || cur.name || "").replace(/:\d+$/, "") : "";
-}
+// ---- replay: the bloom, scrubbed ----------------------------------------------------------
 
 function startReplay() {
-  if (replay.active || !fg || fgData.nodes.length < 2) return;
-  const { order, anchorAt, linksAt } = state.gfx.order === "wave"
-    ? buildWaveOrder(fgData.nodes, fgData.links)
-    : buildReplayOrder(fgData.nodes, fgData.links);
-  if (order.length < 2) return;
-
-  hideNodePanel();
-  // Freeze the layout and remember where every node belongs. Pinning through
-  // fx/fy makes our positions authoritative whether or not the simulation is
-  // still ticking, so the animation can never be fought by the physics.
-  for (const n of fgData.nodes) {
-    n.__shown = false;
-    delete n.revealAt;
-    delete n.addedAt;
-    n.__tx = n.x;
-    n.__ty = n.y;
-    n.__fx0 = n.fx;
-    n.__fy0 = n.fy;
-    n.fx = n.x;
-    n.fy = n.y;
-  }
-  for (const l of fgData.links) { l.__shown = false; delete l.revealAt; delete l.__grow; }
-  // Reveal rank, so a stem can tell which of its two ends is the older one.
-  order.forEach((n, i) => { n.__ord = i; });
-  // Where each directory ends up, for the camera to visit. Computed from the
-  // final positions, so the camera never chases a moving target.
-  replay.centroids = new Map();
-  const acc = new Map();
-  for (const n of fgData.nodes) {
-    if (!acc.has(n.group)) acc.set(n.group, { x: 0, y: 0, n: 0 });
-    const a = acc.get(n.group);
-    a.x += n.__tx; a.y += n.__ty; a.n++;
-  }
-  for (const [g, a] of acc) replay.centroids.set(g, { x: a.x / a.n, y: a.y / a.n });
-  replay.group = null;
-  replay.active = true;
-  replay.paused = false;
-  replay.missedUpdate = false;
-  replay.order = order;
-  replay.anchorAt = anchorAt;
-  replay.linksAt = linksAt;
-  replay.i = 0;
-  replay.shownLinks = 0;
-  replay.types = new Set();
-  replay.rels = new Set();
-  replay.acc = 0;
-  replay.last = performance.now();
-  replay.endTimer = null;
-  // Aim for a watchable run: ~7 s for a handful of nodes, capped at ~30 s.
-  replay.rate = order.length / Math.min(30, Math.max(7, order.length * 0.07));
-
-  // A settled layout stops the render loop; the reveal is time-based, so it needs
-  // a frame every tick regardless of whether the physics is still running.
-  fg.autoPauseRedraw(false);
-  // Frame the FINAL extent once, before anything is compressed. Nothing ever
-  // grows past it, so a static camera can sit still for the whole show; the
-  // cinematic one uses this as the level it pushes in from and returns to.
-  fg.zoomToFit(600, 70);
-  // zoomToFit animates, so the level it lands on is only readable once it has.
-  replay.baseZoom = fg.zoom();
-  setTimeout(() => { if (replay.active) replay.baseZoom = fg.zoom(); }, 650);
-  buildLegendFrom(replay.types, replay.rels);
-  $("#graph-count").textContent = "0 nodes · 0 edges";
+  if (!spec.pack) return;
+  spec.replaying = true;
+  spec.pack.replayStart(14 / (+$("#replay-speed").value || 1));
+  $("#replay-bar").classList.remove("hidden");
+  $("#graph-replay").classList.add("on");
   $("#replay-toggle").textContent = "❚❚";
-  showReplayBar(true);
-  updateReplayBar();
-  replay.raf = requestAnimationFrame(replayTick);
+  tickReplay();
+}
+function stopReplay() {
+  if (!spec.replaying) return;
+  spec.replaying = false;
+  spec.pack?.replayStop();
+  $("#replay-bar").classList.add("hidden");
+  $("#graph-replay").classList.remove("on");
+  cancelAnimationFrame(spec.replayRaf);
+}
+function tickReplay() {
+  if (!spec.replaying || !spec.pack) return;
+  const p = spec.pack.bloomProgress(performance.now());
+  $("#replay-fill").style.width = `${Math.round(p * 100)}%`;
+  $("#replay-label").textContent = `${Math.round(p * 100)}% of ${fmt(spec.G.nodes.length)} entities`;
+  if (p >= 1 && spec.pack.bloom.playing) { setTimeout(stopReplay, 900); return; }
+  spec.replayRaf = requestAnimationFrame(tickReplay);
 }
 
-function replayTick(now) {
-  if (!replay.active) return;
-  const dt = Math.min(0.25, (now - replay.last) / 1000);
-  replay.last = now;
-  if (!replay.paused) {
-    replay.acc += dt * replay.rate * replay.speed;
-    let added = 0;
-    let legendDirty = false;
-    // Animation lengths follow the speed control, otherwise a 4x run would be a
-    // blur of half-finished stems.
-    const stemMs = REPLAY_MOTION.stemMs / Math.max(0.5, replay.speed);
-    const stems = state.gfx.stems;
-    while (replay.acc >= 1 && replay.i < replay.order.length) {
-      replay.acc -= 1;
-      const node = replay.order[replay.i];
-      const anchor = replay.anchorAt[replay.i];
-      node.__shown = true;
-      if (!replay.types.has(node.type)) { replay.types.add(node.type); legendDirty = true; }
-      if (stems && anchor) {
-        // The stem grows first and the node opens at the end of it: hold the
-        // bloom back by exactly the stem's length.
-        node.__bloomAt = now + stemMs;
-        node.revealAt = now + stemMs;
-        node.x = node.fx = node.__tx;
-        node.y = node.fy = node.__ty;
-      } else {
-        node.revealAt = now;
-        node.__sproutAt = now;
-        node.__anchor = anchor;
-      }
-      for (const l of replay.linksAt[replay.i]) {
-        l.__shown = true;
-        l.revealAt = now;
-        replay.shownLinks++;
-        if (stems) {
-          // Grow from whichever end has been on screen longer.
-          const s = l.source, t = l.target;
-          l.__growFrom = (s.__ord ?? 0) <= (t.__ord ?? 0) ? s : t;
-          l.__grow = now;
-          l.__growMs = stemMs;
-        }
-        if (!replay.rels.has(l.relation)) { replay.rels.add(l.relation); legendDirty = true; }
-      }
-      if (state.gfx.camera === "cinematic") followGroup(node.group);
-      replay.i++;
-      added++;
-    }
-    if (added) {
-      if (legendDirty) buildLegendFrom(replay.types, replay.rels);
-      $("#graph-count").textContent = `${replay.i} nodes · ${replay.shownLinks} edges`;
-      updateReplayBar();
-    }
-    if (replay.i >= replay.order.length && !replay.endTimer) {
-      $("#replay-now").textContent = "done";
-      // The pull-back is the closing shot: let it finish before tearing down.
-      if (state.gfx.camera === "cinematic") fg.zoomToFit(1400, 70);
-      replay.endTimer = setTimeout(() => stopReplay({ restore: true }), 2600);
-    }
-    placeReplayNodes(now);
-  }
-  replay.raf = requestAnimationFrame(replayTick);
-}
-
-// Cinematic camera: push in on each directory as the reveal enters it, and only
-// move when the group actually changes — otherwise every node would restart the
-// transition and the camera would never arrive anywhere.
-function followGroup(group) {
-  if (!fg || group === replay.group) return;
-  replay.group = group;
-  const c = replay.centroids.get(group);
-  if (!c) return;
-  fg.centerAt(c.x, c.y, 900);
-  fg.zoom(Math.min(replay.baseZoom * 2.2, 6), 900);
-}
-
-// Glide the nodes that are still budding in toward their own spot. Reveal times
-// only ever increase, so the ones in flight are the newest few — walk back from
-// the tail and stop at the first one that has already landed. Writes x/y and
-// fx/fy together so the result holds whether or not d3 is ticking.
-function placeReplayNodes(now) {
-  for (let k = replay.i - 1; k >= 0; k--) {
-    const n = replay.order[k];
-    if (!n.__sproutAt) break;
-    const age = (now - n.__sproutAt) / REPLAY_MOTION.sproutMs;
-    // Stamps are dropped only on expiry, and ages grow toward the head, so the
-    // in-flight nodes always stay a contiguous tail — the break above is safe.
-    if (age >= 1) {
-      n.x = n.fx = n.__tx;
-      n.y = n.fy = n.__ty;
-      delete n.__sproutAt;
-      delete n.__anchor;
-      continue;
-    }
-    const a = n.__anchor;
-    if (!a) { // a seed node: nothing to bud off, it simply appears in place
-      n.x = n.fx = n.__tx;
-      n.y = n.fy = n.__ty;
-      continue;
-    }
-    const bx = a.__tx + (n.__tx - a.__tx) * REPLAY_MOTION.sproutFrom;
-    const by = a.__ty + (n.__ty - a.__ty) * REPLAY_MOTION.sproutFrom;
-    const e = easeOutCubic(age);
-    n.x = n.fx = bx + (n.__tx - bx) * e;
-    n.y = n.fy = by + (n.__ty - by) * e;
-  }
-}
-
-// End the show: drop the paint filters and put every node back on the exact spot
-// it held before, unpinned. Nothing was ever added to or removed from the graph,
-// so there is nothing else to undo. `restore: false` is for callers about to
-// replace the graph data themselves (refreshGraph, route changes).
-function stopReplay({ restore = true } = {}) {
-  if (!replay.active) return;
-  replay.active = false;
-  if (replay.raf) cancelAnimationFrame(replay.raf);
-  replay.raf = null;
-  clearTimeout(replay.endTimer);
-  replay.endTimer = null;
-  replay.order = [];
-  replay.anchorAt = [];
-  replay.linksAt = [];
-  showReplayBar(false);
-  if (!fg) return;
-  fg.autoPauseRedraw(true);
-  // Put every node back on its own mark and hand the layout back to d3 — pins
-  // included, in case the viewer had dragged something before the show.
-  for (const n of fgData.nodes) {
-    n.__shown = true;
-    delete n.revealAt;
-    if (n.__tx != null) { n.x = n.__tx; n.y = n.__ty; }
-    n.fx = n.__fx0;
-    n.fy = n.__fy0;
-    n.vx = 0;
-    n.vy = 0;
-    delete n.__tx; delete n.__ty; delete n.__fx0; delete n.__fy0;
-    delete n.__sproutAt; delete n.__anchor; delete n.__bloomAt; delete n.__ord;
-  }
-  for (const l of fgData.links) {
-    l.__shown = true;
-    delete l.revealAt; delete l.__grow; delete l.__growFrom; delete l.__growMs;
-  }
-  // A recording exists to capture the show — when the show ends, so does it.
-  if (replay.recording) {
-    replay.recording = false;
-    GraphRecorder.stop();
-  }
-  if (!restore) return;
-  buildLegend(fgData.nodes, fgData.links);
-  $("#graph-count").textContent = `${fgData.nodes.length} nodes · ${fgData.links.length} edges`;
-  // Counts moved under us while we were animating — pick up the fresh graph.
-  if (replay.missedUpdate) refreshGraph();
-}
-
-function toggleReplayPause() {
-  if (!replay.active) return;
-  replay.paused = !replay.paused;
-  if (replay.paused) {
-    replay.pausedAt = performance.now();
-  } else {
-    // Sprouts are wall-clock based: carry them over the pause so the nodes that
-    // were mid-glide resume instead of snapping to their spot.
-    const held = performance.now() - replay.pausedAt;
-    for (let k = replay.i - 1; k >= 0; k--) {
-      const n = replay.order[k];
-      if (!n.__sproutAt) break;
-      n.__sproutAt += held;
-    }
-  }
-  $("#replay-toggle").textContent = replay.paused ? "▶" : "❚❚";
-}
-
-// ---------------------------------------------------------------------------
-// Recording: capture the replay to a video file, for READMEs and demos
-// ---------------------------------------------------------------------------
-
-let recTimer = null;
-
-function setRecUI(on) {
-  const btn = $("#graph-rec");
-  btn.classList.toggle("recording", on);
-  clearInterval(recTimer);
-  recTimer = null;
-  if (!on) { btn.textContent = "⏺"; return; }
-  const tick = () => {
-    const s = Math.round(GraphRecorder.elapsedMs() / 1000);
-    btn.textContent = `■ ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-  };
-  tick();
-  recTimer = setInterval(tick, 500);
-}
-
-// The button exists to capture the replay, so it starts both at once and the
-// capture ends when the show does. Pressing it again cuts the take short and
-// saves whatever was captured.
 function toggleRecording() {
-  if (GraphRecorder.active()) {
-    replay.recording = false;
-    GraphRecorder.stop();
-    setRecUI(false);
-    return;
-  }
   const canvas = $("#graph-canvas canvas");
-  if (!canvas) return;
-  if (!GraphRecorder.isSupported()) {
-    $("#graph-count").textContent = "video capture is not available in this browser";
+  const btn = $("#graph-rec");
+  if (!window.GraphRecorder || !window.GraphRecorder.isSupported()) {
+    $("#graph-hint").textContent = "This browser cannot record a canvas (no captureStream/MediaRecorder).";
     return;
   }
-  const project = state.projects.find((p) => p.project === state.project);
-  const started = GraphRecorder.start(canvas, {
-    name: `${project ? project.display_name : state.project || "graph"}-replay`,
-    onStop: () => setRecUI(false),
-    onError: (msg) => { setRecUI(false); $("#graph-count").textContent = msg; },
+  if (window.GraphRecorder.active()) {
+    window.GraphRecorder.stop();
+    btn.classList.remove("on");
+    btn.textContent = "rec";
+    return;
+  }
+  const ok = window.GraphRecorder.start(canvas, {
+    name: `${state.project}-specimen`,
+    onStop: (r) => { btn.classList.remove("on"); btn.textContent = "rec"; $("#graph-hint").textContent = `saved ${r.filename} · ${(r.bytes / 1e6).toFixed(1)} MB`; },
+    onError: (msg) => { btn.classList.remove("on"); btn.textContent = "rec"; $("#graph-hint").textContent = msg; },
   });
-  if (!started) return;
-  setRecUI(true);
-  if (!replay.active) startReplay();
-  replay.recording = true;
+  if (ok) { btn.classList.add("on"); btn.textContent = "■ rec"; }
 }
 
+async function renderGraph(params) {
+  if (!window.Pack) {
+    $("#graph-canvas").innerHTML = `<div class="pad dim">pack.js failed to load.</div>`;
+    return;
+  }
+  const id = params.get("id");
+  const prefix = params.get("prefix");
+  if (prefix !== null && prefix !== spec.prefix) { spec.prefix = prefix || null; if (spec.pack) { spec.wanted = id || spec.wanted; await loadSpecimen(); } }
+  if (id) spec.wanted = id;
+  $("#graph-level").value = spec.level;
+  $("#graph-summarized").checked = spec.summarized;
+  if (!spec.pack) await loadSpecimen();
+  else {
+    spec.pack.resize();
+    if (spec.wanted && spec.G.byId.has(spec.wanted)) {
+      spec.pack.focus(spec.wanted, { pin: true });
+      onSpecimenSelect(spec.G.byId.get(spec.wanted));
+      spec.wanted = null;
+    }
+  }
+  if (params.get("route") === "1") { openRoutePanel(); if (spec.pack?.pinned) setRouteEnd("a", spec.pack.pinned); }
+}
+
+
 // ---------------------------------------------------------------------------
-// Live index mode: poll /status, merge fresh nodes into the running simulation
+// Live index: poll /status, and let the specimen grow while the indexer runs
 // ---------------------------------------------------------------------------
 
-// Merge the current view's fresh graph into fgData without a rebuild: new nodes spawn
-// near an already-placed neighbor (expandNode's pattern) and pop in; existing nodes are
-// updated in place. Removals are deliberately NOT applied mid-index — the exact set is
-// restored by the full refreshGraph() that runs when indexing finishes.
-async function liveMergeGraph() {
-  const g = state.graph;
-  if (state.live.merging || g.mode === "custom" || replay.active) return;
+// Nesting depends on every sibling, so a landed entity cannot be grafted onto the layout —
+// the model is rebuilt from a fresh payload instead. That costs a fetch and a few hundred
+// milliseconds of layout, so it is throttled; the camera, the pinned node and the route
+// survive it, and everything that was not there a moment ago opens with a ring.
+const LIVE_MERGE_MS = 5000;
+
+async function liveMergeSpecimen() {
+  if (state.live.merging || !spec.pack || spec.loading) return;
+  if (performance.now() - state.live.lastMerge < LIVE_MERGE_MS) return;
   state.live.merging = true;
+  state.live.lastMerge = performance.now();
   try {
-    if (!fg) {
-      // The initial render never happened (its fetch failed) — recover with a full
-      // refresh instead of silently skipping every merge.
-      await refreshGraph();
-      return;
-    }
-    const data = (g.mode === "neighborhood" && g.root)
-      ? await api(`/graph?root=${encodeURIComponent(g.root)}&depth=${g.depth}&rels=${[...g.rels].join(",")}`)
-      : await api(g.level === "all" ? "/graph?mode=full" : "/graph?mode=overview");
-    const fresh = makeGraphElements(data);
-
-    const wasEmpty = fgData.nodes.length === 0;
-    const byId = new Map(fgData.nodes.map((n) => [n.id, n]));
-    const linkKey = (l) => {
-      const s = typeof l.source === "object" ? l.source.id : l.source;
-      const t = typeof l.target === "object" ? l.target.id : l.target;
-      return `${s}→${t}→${l.relation}`;
-    };
-    const haveLinks = new Set(fgData.links.map(linkKey));
-
-    // Neighbor index over the fresh links, for seeding new nodes next to family.
-    const freshNeighbors = new Map();
-    for (const l of fresh.links) {
-      if (!freshNeighbors.has(l.source)) freshNeighbors.set(l.source, []);
-      if (!freshNeighbors.has(l.target)) freshNeighbors.set(l.target, []);
-      freshNeighbors.get(l.source).push(l.target);
-      freshNeighbors.get(l.target).push(l.source);
-    }
-    let cx = 0, cy = 0;
-    if (fgData.nodes.length) {
-      for (const n of fgData.nodes) { cx += n.x || 0; cy += n.y || 0; }
-      cx /= fgData.nodes.length; cy /= fgData.nodes.length;
-    }
-
-    let added = 0;
-    for (const n of fresh.nodes) {
-      const existing = byId.get(n.id);
-      if (existing) {
-        // Radius and tooltips stay honest as summarization fills in.
-        existing.size = n.size; existing.degree = n.degree; existing.summary = n.summary;
-        continue;
-      }
-      const anchorId = (freshNeighbors.get(n.id) || []).find((id) => byId.has(id));
-      const anchor = anchorId ? byId.get(anchorId) : null;
-      const node = {
-        ...n,
-        x: (anchor ? anchor.x : cx) + (Math.random() - 0.5) * 60,
-        y: (anchor ? anchor.y : cy) + (Math.random() - 0.5) * 60,
-        addedAt: performance.now(),
-      };
-      fgData.nodes.push(node);
-      byId.set(n.id, node);
-      added++;
-    }
-    for (const l of fresh.links) {
-      const key = `${l.source}→${l.target}→${l.relation}`;
-      if (haveLinks.has(key) || !byId.has(l.source) || !byId.has(l.target)) continue;
-      haveLinks.add(key);
-      // Resolve endpoints to node OBJECTS here: force-graph resolves string ids lazily,
-      // and a physics tick landing between our push and that re-init hits the raw string
-      // ("Cannot create property 'vx' on string …") and kills the render loop for good.
-      fgData.links.push({ ...l, source: byId.get(l.source), target: byId.get(l.target) });
-      added++;
-    }
-
-    if (added) {
-      rebuildNeighbors();
-      fg.graphData(fgData);
-      fg.d3ReheatSimulation();
-      buildLegend(fgData.nodes, fgData.links);
-      $("#graph-count").textContent = `${fgData.nodes.length} nodes · ${fgData.links.length} edges`;
-      // Follow the growing graph: every reheat re-energizes the layout, so the cloud
-      // expands and drifts — without a follow-fit it escapes a static viewport within
-      // minutes (black canvas). The camera is only ours until the user grabs it.
-      if (wasEmpty || !state.live.userCam) setTimeout(() => { if (fg) fg.zoomToFit(400, 60); }, 500);
-    }
-  } catch (e) {
-    // transient API error: the next poll tick retries
+    await loadSpecimen({ quiet: true });
   } finally {
     state.live.merging = false;
   }
@@ -1856,14 +886,69 @@ async function liveMergeGraph() {
 function updateLiveBadge(s) {
   const badge = $("#live-badge");
   if (!badge) return;
-  if (!s.indexing) {
-    badge.classList.add("hidden");
-    return;
-  }
+  if (!s.indexing) { badge.classList.add("hidden"); return; }
   badge.classList.remove("hidden");
-  $("#live-badge-text").textContent = `indexing ${s.summarized}/${s.summarizable}`;
+  $("#live-badge-text").textContent = `indexing ${fmt(s.summarized)}/${fmt(s.summarizable)}`;
   const pct = s.summarizable ? Math.round((s.summarized / s.summarizable) * 100) : 0;
   $("#live-fill").style.width = `${pct}%`;
+}
+
+// The badge answers two different questions with one control. Passive: is anything keeping this
+// index current (a live daemon, a registration nobody is running, or nothing at all). On click:
+// how far the index has actually drifted from disk right now — a real scan, too expensive for
+// the 2 s poll, so it is asked for rather than shown by default.
+function updateWatchBadge(s) {
+  const badge = $("#watch-badge");
+  if (!badge) return;
+  const w = (s && s.watch) || null;
+  if (!w) { badge.classList.add("hidden"); return; }
+  badge.classList.remove("hidden", "live", "idle");
+  if (w.live) {
+    badge.classList.add("live");
+    $("#watch-badge-text").textContent = "watched";
+    badge.title = `A watch daemon is following this tree (${w.holder || "unknown holder"}) — `
+      + "saves are re-indexed. Click to verify against disk.";
+  } else if (w.watched) {
+    badge.classList.add("idle");
+    $("#watch-badge-text").textContent = "watch idle";
+    badge.title = "Registered for the watch daemon, but no daemon is running it: this index is "
+      + "as fresh as its last index and no fresher. Start it with `inflorescence watch run`. "
+      + "Click to check drift.";
+  } else {
+    $("#watch-badge-text").textContent = "unwatched";
+    badge.title = "Nothing is keeping this index current — it changes only when something "
+      + "re-indexes it. Follow it with `inflorescence watch add <path>`. Click to check drift.";
+  }
+}
+
+// Freshness is a scan, so its answer ages: drop it whenever the project changes or an index run
+// ends, rather than leaving a reassuring "up to date" next to a graph that just moved.
+function clearFreshness() {
+  state.freshness = null;
+  const el = $("#watch-fresh");
+  if (el) el.textContent = "";
+}
+
+async function checkFreshness() {
+  const el = $("#watch-fresh");
+  if (!el || !state.project || state.freshness === "checking") return;
+  state.freshness = "checking";
+  el.textContent = "· checking…";
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(state.project)}/freshness`);
+    const f = await res.json();
+    if (!f || f.error) { el.textContent = "· check failed"; state.freshness = null; return; }
+    if (!f.available) el.textContent = "· no tree on disk";
+    else if (!f.pending) el.textContent = "· up to date";
+    else {
+      const cost = f.estimated_cost_usd ? ` ≈$${f.estimated_cost_usd.toFixed(2)}` : "";
+      el.textContent = `· ${f.pending} file(s) behind${cost}`;
+    }
+    state.freshness = f;
+  } catch (e) {
+    el.textContent = "· check failed";
+    state.freshness = null;
+  }
 }
 
 async function refreshProjectSelect() {
@@ -1874,66 +959,60 @@ async function refreshProjectSelect() {
     state.projects = projects;
     const sel = $("#project-select");
     sel.innerHTML = projects.map((p) =>
-      `<option value="${esc(p.project)}">${esc(p.display_name)} · ${p.entities}</option>`).join("");
+      `<option value="${esc(p.project)}">${esc(p.display_name)} · ${fmt(p.entities)}</option>`).join("");
     if (state.project) sel.value = state.project;
   } catch (e) { /* next tick retries */ }
 }
 
-// Always-on 2s heartbeat. Cheap when idle (one lock probe + two aggregations, no
-// graph refetch unless the counts fingerprint moved). Raw fetch, not api(): a dead
-// Memgraph must degrade to silence, not error alerts every 2 seconds.
+// Always-on 2 s heartbeat. Cheap when idle (one lock probe + two aggregations, no specimen
+// refetch unless the counts fingerprint moved). Raw fetch, not api(): a dead Memgraph must
+// degrade to silence, not an error alert every two seconds.
 async function pollStatus() {
   if (document.hidden) return;
   if (!state.project) {
-    // A project may appear mid-poll — e.g. a wiped repo being re-indexed right now.
     if (!state.projects.length) {
       await refreshProjectSelect();
       if (state.projects.length) await route();
     }
     return;
   }
-  // The hash may point at a project that appeared after boot (a fresh index of a
-  // wiped or brand-new repo): route() rejected it against the stale project list,
-  // so refresh the list and re-route once it shows up.
+  // The hash may point at a project that appeared after boot (a fresh index of a wiped or
+  // brand-new repo): route() rejected it against the stale list, so refresh and re-route.
   const parsed = parseHash();
   if (parsed && parsed.project !== state.project
       && !state.projects.some((p) => p.project === parsed.project)) {
     await refreshProjectSelect();
-    if (state.projects.some((p) => p.project === parsed.project)) {
-      await route();
-      return;
-    }
+    if (state.projects.some((p) => p.project === parsed.project)) { await route(); return; }
   }
 
   let s;
   try {
     const res = await fetch(`/api/projects/${encodeURIComponent(state.project)}/status`);
     s = await res.json();
-  } catch (e) {
-    return;
-  }
+  } catch (e) { return; }
   if (!s || s.error) return;
 
   updateLiveBadge(s);
+  updateWatchBadge(s);
+  $("#strip-r").textContent = `${fmt(s.nodes)} nodes · ${fmt(s.edges)} edges · ${fmt(s.summarized)}/${fmt(s.summarizable)} summarized`;
+
   const key = `${s.nodes}:${s.edges}:${s.summarized}`;
-  const first = state.live.key === null; // view just booted — it fetched its own data
+  const first = state.live.key === null;
   const changed = !first && key !== state.live.key;
   const finished = !s.indexing && state.live.indexing; // true→false edge
   state.live.key = key;
   state.live.indexing = s.indexing;
 
   if (state.view === "graph") {
-    // The replay owns the canvas while it runs: remember that the graph moved and
-    // pick the fresh one up when it ends, instead of merging into the animation.
-    if (replay.active) { if (changed || finished) replay.missedUpdate = true; }
-    else if (state.live.graphError) await refreshGraph();
-    else if (s.indexing && changed) await liveMergeGraph();
-    // One exact refresh once the run ends (applies removals), or when an entire
-    // run happened between two ticks.
-    else if (finished || (!s.indexing && changed)) await refreshGraph();
+    if (spec.error) await loadSpecimen({ quiet: true });
+    else if (s.indexing && changed) await liveMergeSpecimen();
+    else if (finished || (!s.indexing && changed)) { state.live.lastMerge = 0; await liveMergeSpecimen(); }
   } else if (finished && state.view === "overview") {
     renderOverview();
   }
+  // Expire the drift answer when it stops being about the graph on screen — but never while a
+  // check is in flight, and never merely because an *ongoing* index moved the counts.
+  if (state.freshness !== "checking" && (finished || (changed && !s.indexing))) clearFreshness();
   if (finished) {
     state.treeCache = new Map();
     refreshProjectSelect();
@@ -1941,7 +1020,7 @@ async function pollStatus() {
 }
 
 // ---------------------------------------------------------------------------
-// Query view
+// FIG. 04 — Cypher
 // ---------------------------------------------------------------------------
 
 const QUERY_PRESETS = [
@@ -1981,7 +1060,7 @@ async function runQuery() {
   if (!query) return;
   const status = $("#query-status");
   status.className = "dim";
-  status.textContent = "Running…";
+  status.textContent = "running…";
   $("#query-results").innerHTML = "";
   $("#query-graph-btn-wrap").innerHTML = "";
   const t0 = performance.now();
@@ -1998,14 +1077,16 @@ async function runQuery() {
   status.className = "dim";
   status.textContent = `${res.rows.length} row${res.rows.length === 1 ? "" : "s"}${res.has_more ? " (more available — refine or paginate)" : ""} · ${ms} ms`;
 
+  // Node-bearing rows can be shown on the specimen: the answer, numbered, on the real thing.
   if (res.graph?.nodes?.length) {
     const btn = document.createElement("button");
-    btn.className = "tb-btn";
-    btn.textContent = `Show as graph (${res.graph.nodes.length} nodes, ${res.graph.edges.length} edges)`;
+    btn.className = "btn";
+    btn.textContent = `show ${res.graph.nodes.length} on the specimen`;
     btn.addEventListener("click", () => {
-      state.customGraph = res.graph;
-      state.graph.mode = "custom";
-      nav("graph", { custom: "1" });
+      spec.hits = res.graph.nodes.slice(0, 60).map((n) => ({ id: n.id }));
+      spec.hitLabel = "CYPHER RESULT";
+      if (spec.pack) spec.pack.setHits(spec.hits, spec.hitLabel);
+      nav("graph");
     });
     $("#query-graph-btn-wrap").appendChild(btn);
   }
@@ -2017,10 +1098,10 @@ async function runQuery() {
     if (typeof v === "object" && v.__kind === "node")
       return `<span class="cell-node" data-id="${esc(v.id)}">${chip(v.type)}${esc(v.name ?? v.id)}</span>`;
     if (typeof v === "object" && v.__kind === "relationship")
-      return `<span class="rel-tag" style="--rel-c:${REL_COLORS[v.relation] || "#7d7f73"}">${esc(v.relation)}</span>`;
+      return `<span class="rel-tag rel-${esc(v.relation)}">${esc(v.relation)}</span>`;
     if (typeof v === "object" && v.__kind === "path")
       return v.nodes.map((n) => cell(n)).join(" → ");
-    if (typeof v === "object") return `<span class="cell-json">${esc(JSON.stringify(v, null, 1))}</span>`;
+    if (typeof v === "object") return `<span class="cell-json">${esc(JSON.stringify(v))}</span>`;
     return esc(String(v));
   };
   $("#query-results").innerHTML = `
@@ -2031,6 +1112,7 @@ async function runQuery() {
   $("#query-results").querySelectorAll(".cell-node").forEach((el) =>
     el.addEventListener("click", () => openEntity(el.dataset.id)));
 }
+
 
 // ---------------------------------------------------------------------------
 // MCP tools console
@@ -2534,19 +1616,27 @@ async function renderToolsView(params) {
   refreshRuns();
 }
 
+
 // ---------------------------------------------------------------------------
 // Search
+//
+// A search answers on the specimen as well as in the list: hits are numbered on the graph
+// and a weak one is drawn weakly, because that is what the server said about it.
 // ---------------------------------------------------------------------------
 
 let searchTimer = null;
 let lastSearchQ = "";
+let lastHits = [];
 
-function searchItem(hit, score) {
+function searchItem(hit, n, score) {
   return `<div class="sr-item" data-id="${esc(hit.id)}" title="${esc(hit.summary || "")}">
-    ${chip(hit.type)}<span class="name">${esc(hit.name)}</span>
-    <span class="path">${esc(fileRef(hit))}</span>${score ? `<span class="dim">${hit.score}</span>` : ""}
+    <span class="num">${n}</span>${chip(hit.type)}<span class="name">${esc(hit.name)}</span>
+    <span class="path">${esc(fileRef(hit))}</span>${score && hit.score ? `<span class="sc">${hit.score}</span>` : ""}
   </div>`;
 }
+
+// "weak" is the server's own word for a low-scoring vector match; carry it, don't hide it.
+const WEAK_BELOW = 0.45;
 
 async function doSearch(q, mode = "quick") {
   lastSearchQ = q;
@@ -2555,15 +1645,33 @@ async function doSearch(q, mode = "quick") {
   const res = await api(`/search?q=${encodeURIComponent(q)}&mode=${mode}`, { allowError: true });
   if (lastSearchQ !== q) return; // stale
   let html = "";
-  if (res.name?.length) html += `<div class="sr-section">Name matches</div>` + res.name.map((h) => searchItem(h)).join("");
-  if (res.text?.length) html += `<div class="sr-section">Full-text (BM25)</div>` + res.text.map((h) => searchItem(h, true)).join("");
-  if (res.semantic?.length) html += `<div class="sr-section">Semantic</div>` + res.semantic.map((h) => searchItem(h, true)).join("");
-  if (!html) html = `<div class="sr-note">No matches.</div>`;
+  let n = 0;
+  lastHits = [];
+  const section = (title, items, score) => {
+    if (!items?.length) return "";
+    let out = `<div class="sr-section">${title}</div>`;
+    for (const h of items) {
+      n += 1;
+      lastHits.push({ id: h.id, weak: score && h.score !== undefined && h.score < WEAK_BELOW });
+      out += searchItem(h, n, score);
+    }
+    return out;
+  };
+  html += section("NAME", res.name, false);
+  html += section("FULL TEXT · BM25", res.text, true);
+  html += section("SEMANTIC · EMBEDDINGS", res.semantic, true);
+  if (!html) html = `<div class="sr-note">No matches. The index was asked and answered nothing — that is the answer.</div>`;
   for (const note of res.notes || []) html += `<div class="sr-note">${esc(note)}</div>`;
-  if (mode !== "semantic")
-    html += `<div class="sr-actions"><button class="tb-btn" id="sr-semantic">Semantic search (uses embedding API)</button></div>`;
+  html += `<div class="sr-actions">
+    ${mode !== "semantic" ? `<button class="btn" id="sr-semantic">semantic search (embeds the query)</button>` : ""}
+    ${lastHits.length ? `<button class="btn" id="sr-specimen">show ${lastHits.length} on the specimen</button>` : ""}
+  </div>`;
   box.innerHTML = html;
   box.classList.remove("hidden");
+  // Hits land on the specimen straight away, so switching to it shows the answer in place.
+  spec.hits = lastHits;
+  spec.hitLabel = `${mode === "semantic" ? "search_semantic" : "search"} · ${q}`;
+  if (spec.pack && state.view === "graph") spec.pack.setHits(spec.hits, spec.hitLabel);
   box.querySelectorAll(".sr-item").forEach((el) =>
     el.addEventListener("click", () => {
       box.classList.add("hidden");
@@ -2571,6 +1679,11 @@ async function doSearch(q, mode = "quick") {
       openEntity(el.dataset.id);
     }));
   $("#sr-semantic")?.addEventListener("click", () => doSearch(q, "semantic"));
+  $("#sr-specimen")?.addEventListener("click", () => {
+    box.classList.add("hidden");
+    if (spec.pack) spec.pack.setHits(spec.hits, spec.hitLabel);
+    nav("graph");
+  });
 }
 
 function wireSearch() {
@@ -2584,7 +1697,7 @@ function wireSearch() {
     const box = $("#search-results");
     const items = [...box.querySelectorAll(".sr-item")];
     const sel = box.querySelector(".sr-item.sel");
-    let idx = items.indexOf(sel);
+    const idx = items.indexOf(sel);
     if (ev.key === "Escape") { box.classList.add("hidden"); input.blur(); }
     else if (ev.key === "ArrowDown") { ev.preventDefault(); items[Math.min(idx + 1, items.length - 1)]?.classList.add("sel"); sel?.classList.remove("sel"); }
     else if (ev.key === "ArrowUp") { ev.preventDefault(); if (idx > 0) { items[idx - 1].classList.add("sel"); sel.classList.remove("sel"); } }
@@ -2606,85 +1719,103 @@ function wireSearch() {
 // Boot
 // ---------------------------------------------------------------------------
 
+function wireSpecimenControls() {
+  $("#graph-level").addEventListener("change", (ev) => { spec.level = ev.target.value; loadSpecimen(); });
+  $("#graph-summarized").addEventListener("change", (ev) => { spec.summarized = ev.target.checked; loadSpecimen(); });
+  $("#graph-overview-btn").addEventListener("click", () => {
+    spec.prefix = null;
+    loadSpecimen().then(() => spec.pack?.fit(0.9));
+  });
+  $("#graph-fit").addEventListener("click", () => spec.pack?.fit(0.9));
+  $("#graph-route").addEventListener("click", () => {
+    if ($("#route-panel").classList.contains("hidden")) openRoutePanel(); else closeRoutePanel();
+  });
+  $("#route-close").addEventListener("click", closeRoutePanel);
+  $("#route-clear").addEventListener("click", () => {
+    spec.route = { a: null, b: null, arm: null };
+    $("#route-a").value = ""; $("#route-b").value = "";
+    computeRoute();
+  });
+  for (const which of ["a", "b"]) {
+    $(`#route-${which}`).addEventListener("input", () => routeSuggest(which));
+    $(`#route-${which}`).addEventListener("focus", () => routeSuggest(which));
+  }
+  document.querySelectorAll("[data-pick]").forEach((btn) =>
+    btn.addEventListener("click", () => {
+      const which = btn.dataset.pick;
+      document.querySelectorAll(".route-pick").forEach((r) => r.classList.remove("arm"));
+      $(`#route-${which}-row`).classList.add("arm");
+      spec.route.arm = which;
+      spec.pack?.pickNext((n) => { if (n) setRouteEnd(which, n); });
+    }));
+  // Chrome restores form values across a reload; a stale route end would then read as picked.
+  $("#route-a").value = ""; $("#route-b").value = "";
+  renderGfxPanel();
+  $("#graph-gfx").addEventListener("click", () => {
+    const panel = $("#gfx-panel");
+    const show = panel.classList.contains("hidden");
+    panel.classList.toggle("hidden", !show);
+    $("#graph-gfx").classList.toggle("on", show);
+  });
+  $("#gfx-close").addEventListener("click", () => {
+    $("#gfx-panel").classList.add("hidden");
+    $("#graph-gfx").classList.remove("on");
+  });
+  $("#gfx-reset").addEventListener("click", () => {
+    spec.gfx = { ...GFX_DEFAULTS };
+    saveGfx();
+    renderGfxPanel();
+    spec.pack?.setGfx(spec.gfx);
+  });
+  $("#graph-replay").addEventListener("click", () => { if (spec.replaying) stopReplay(); else startReplay(); });
+  $("#replay-toggle").addEventListener("click", () => {
+    const playing = spec.pack.bloom.playing;
+    spec.pack.replayPause(playing);
+    $("#replay-toggle").textContent = playing ? "▶" : "❚❚";
+  });
+  $("#replay-stop").addEventListener("click", stopReplay);
+  $("#replay-speed").addEventListener("change", (ev) => spec.pack?.replaySpeed(+ev.target.value || 1));
+  $("#graph-rec").addEventListener("click", toggleRecording);
+  $("#graph-png").addEventListener("click", () => {
+    const canvas = $("#graph-canvas canvas");
+    if (!canvas) return;
+    const a = document.createElement("a");
+    a.href = canvas.toDataURL("image/png");
+    a.download = `${state.project}-specimen.png`;
+    a.click();
+  });
+}
+
 async function boot() {
   document.querySelectorAll("#nav a").forEach((a) =>
     a.addEventListener("click", (ev) => { ev.preventDefault(); if (state.project) nav(a.dataset.view); }));
   $("#brand").addEventListener("click", (ev) => { ev.preventDefault(); if (state.project) nav("overview"); });
   $("#project-select").addEventListener("change", (ev) => {
     state.project = ev.target.value;
-    state.treeCache = new Map();
-    $("#tree").innerHTML = "";
+    resetProjectState();
     nav("overview");
   });
-  $("#graph-depth").addEventListener("change", (ev) => { state.graph.depth = +ev.target.value; refreshGraph(); });
-  $("#graph-level").addEventListener("change", (ev) => {
-    state.graph.level = ev.target.value;
-    // Switching the level is a different question about the whole project, so it
-    // leaves any rooted view the same way the "Whole project" button does.
-    const wasRooted = state.graph.root !== null;
-    state.graph.root = null;
-    state.graph.mode = "overview";
-    // nav() only redraws when the hash actually changes, and on an unrooted view
-    // it is already the one we would navigate to.
-    if (wasRooted) nav("graph"); else refreshGraph();
-  });
-  $("#graph-summarized").addEventListener("change", (ev) => {
-    state.graph.summarizedOnly = ev.target.checked;
-    refreshGraph();
-  });
-  $("#graph-layout").addEventListener("change", (ev) => {
-    state.graph.layout = ev.target.value;
-    if (fg) {
-      applyLayoutMode();
-      fgNeedsFit = true;
-      fg.d3ReheatSimulation();
-    }
-  });
-  $("#graph-fit").addEventListener("click", () => {
-    state.live.userCam = false; // explicit Fit re-arms the live follow-camera
-    fg?.zoomToFit(400, 40);
-  });
-  $("#graph-replay").addEventListener("click", () => {
-    if (replay.active) stopReplay({ restore: true });
-    else startReplay();
-  });
-  renderGfxPanel();
-  $("#graph-gfx").addEventListener("click", () => toggleGfxPanel());
-  $("#gfx-close").addEventListener("click", () => toggleGfxPanel(false));
-  $("#gfx-reset").addEventListener("click", () => {
-    state.gfx = { ...GFX_DEFAULTS };
-    saveGfx();
-    renderGfxPanel();
-    applyGfx("forces");
-    buildLegend(fgData.nodes, fgData.links);
-  });
-  $("#graph-rec").addEventListener("click", toggleRecording);
-  $("#replay-toggle").addEventListener("click", toggleReplayPause);
-  $("#replay-stop").addEventListener("click", () => stopReplay({ restore: true }));
-  $("#replay-speed").addEventListener("change", (ev) => { replay.speed = +ev.target.value || 1; });
-  document.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Escape") return;
-    // Esc peels one layer at a time: the panel first, then the replay.
-    if (!$("#gfx-panel").classList.contains("hidden")) { toggleGfxPanel(false); return; }
-    if (replay.active) stopReplay({ restore: true });
-  });
-  $("#graph-png").addEventListener("click", () => {
-    const canvas = $("#graph-canvas canvas");
-    if (!canvas) return;
-    const a = document.createElement("a");
-    a.href = canvas.toDataURL("image/png");
-    a.download = `${state.project}-graph.png`;
-    a.click();
-  });
-  $("#graph-overview-btn").addEventListener("click", () => {
-    state.graph.mode = "overview"; state.graph.root = null;
-    nav("graph");
-  });
+  $("#watch-badge").addEventListener("click", () => checkFreshness());
   $("#tree-collapse").addEventListener("click", () => {
     document.querySelectorAll("#tree .tkids").forEach((k, i) => { if (i > 0) k.classList.add("hidden"); });
     document.querySelectorAll("#tree .trow .twisty").forEach((t, i) => { if (i > 0 && t.textContent === "▾") t.textContent = "▸"; });
   });
+  wireSpecimenControls();
   wireSearch();
+
+  // Esc peels one layer at a time: a panel, then the replay, then the pin.
+  document.addEventListener("keydown", (ev) => {
+    if (state.view !== "graph") return;
+    if (ev.key === "Escape") {
+      if (!$("#gfx-panel").classList.contains("hidden")) { $("#gfx-panel").classList.add("hidden"); $("#graph-gfx").classList.remove("on"); return; }
+      if (spec.replaying) { stopReplay(); return; }
+      if (spec.pack && spec.pack.unpin()) { $("#graph-side").classList.add("hidden"); return; }
+      if (!$("#route-panel").classList.contains("hidden")) closeRoutePanel();
+      return;
+    }
+    if (ev.target instanceof HTMLInputElement || ev.target instanceof HTMLTextAreaElement) return;
+    if (ev.key === "f" || ev.key === "F") spec.pack?.fit(0.9);
+  });
 
   let projects = [];
   try {
@@ -2694,12 +1825,14 @@ async function boot() {
     $("#empty-status").textContent = "Cannot reach the API — is Memgraph running? (docker compose up -d)";
   }
   state.projects = projects;
-  const sel = $("#project-select");
-  sel.innerHTML = projects.map((p) =>
-    `<option value="${esc(p.project)}">${esc(p.display_name)} · ${p.entities}</option>`).join("");
+  $("#project-select").innerHTML = projects.map((p) =>
+    `<option value="${esc(p.project)}">${esc(p.display_name)} · ${fmt(p.entities)}</option>`).join("");
   window.addEventListener("hashchange", route);
   await route();
   setInterval(pollStatus, 2000);
+  // The toolbar's frame time is a live measurement, so it has to keep measuring.
+  setInterval(() => { if (state.view === "graph" && spec.pack && !spec.loading) updateGraphCount(); }, 1500);
+  pollStatus();
 }
 
 boot();

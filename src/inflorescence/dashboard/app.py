@@ -9,13 +9,15 @@ import webbrowser
 from pathlib import Path
 
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from inflorescence.config import Settings
-from inflorescence.dashboard.service import DashboardService
+from inflorescence.dashboard.service import _MAX_SPECIMEN_NODES, DashboardService
 from inflorescence.dashboard.tools_console import ToolsConsole, confirmation_required
 from inflorescence.db.connection import MemgraphConnection
 
@@ -24,6 +26,15 @@ logger = logging.getLogger(__name__)
 _STATIC_DIR = Path(__file__).parent / "static"
 
 DEFAULT_PORT = 8321
+
+
+class _NoCacheStatic(StaticFiles):
+    """StaticFiles that asks the browser to revalidate instead of guessing freshness."""
+
+    def file_response(self, *args, **kwargs) -> Response:  # noqa: ANN002, ANN003
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
 
 def is_cross_origin(request: Request) -> bool:
@@ -79,6 +90,9 @@ def create_app(settings: Settings | None = None) -> Starlette:
     async def status(request: Request):
         return await service.project_status(request.path_params["project"])
 
+    async def freshness(request: Request):
+        return await service.project_freshness(request.path_params["project"])
+
     async def tree(request: Request):
         return await service.tree_children(
             request.path_params["project"], request.query_params.get("parent")
@@ -114,6 +128,25 @@ def create_app(settings: Settings | None = None) -> Starlette:
             depth=int(params.get("depth", "2")),
             relations=relations or None,
             cap=int(params.get("cap", "300")),
+        )
+
+    async def specimen(request: Request):
+        """The whole project in one payload, shaped for static/pack.js.
+
+        Query parameters, all optional: ``prefix`` (path prefix to scope to),
+        ``level`` (``all`` | ``modules`` — files and directories only),
+        ``summarized`` (``1`` keeps only entities that already have a summary),
+        ``cap`` (node ceiling). See DashboardService.graph_specimen for the payload.
+        """
+        project = request.path_params["project"]
+        params = request.query_params
+        cap_param = params.get("cap")
+        return await service.graph_specimen(
+            project,
+            prefix=(params.get("prefix") or "").strip() or None,
+            level="modules" if params.get("level") == "modules" else "all",
+            summarized_only=params.get("summarized") == "1",
+            cap=int(cap_param) if cap_param and cap_param.isdigit() else _MAX_SPECIMEN_NODES,
         )
 
     async def search(request: Request):
@@ -172,7 +205,7 @@ def create_app(settings: Settings | None = None) -> Starlette:
         return {"cancelled": console.cancel(request.path_params["run_id"])}
 
     async def index(request: Request) -> Response:
-        return FileResponse(_STATIC_DIR / "index.html")
+        return FileResponse(_STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
     @contextlib.asynccontextmanager
     async def lifespan(app: Starlette):
@@ -191,10 +224,12 @@ def create_app(settings: Settings | None = None) -> Starlette:
             Route("/api/projects", api(projects)),
             Route("/api/projects/{project}/stats", api(stats)),
             Route("/api/projects/{project}/status", api(status)),
+            Route("/api/projects/{project}/freshness", api(freshness)),
             Route("/api/projects/{project}/tree", api(tree)),
             Route("/api/projects/{project}/entity", api(entity)),
             Route("/api/projects/{project}/code", api(code)),
             Route("/api/projects/{project}/graph", api(graph)),
+            Route("/api/projects/{project}/specimen", api(specimen)),
             Route("/api/projects/{project}/search", api(search)),
             Route("/api/projects/{project}/query", api(query), methods=["POST"]),
             Route("/api/projects/{project}/root", api(set_root), methods=["POST"]),
@@ -203,8 +238,14 @@ def create_app(settings: Settings | None = None) -> Starlette:
             Route("/api/tools/runs", api(tools_runs)),
             Route("/api/tools/runs/{run_id}", api(tools_run)),
             Route("/api/tools/runs/{run_id}/cancel", api(tools_cancel), methods=["POST"]),
-            Mount("/static", StaticFiles(directory=_STATIC_DIR), name="static"),
+            # no-cache = revalidate, not "never store": an upgraded dashboard must not keep
+            # serving last week's app.js out of the browser's heuristic cache.
+            Mount("/static", _NoCacheStatic(directory=_STATIC_DIR), name="static"),
         ],
+        # The specimen payload is the whole index in one response — megabytes of
+        # JSON for a large repository. gzip turns that into a fraction of it for
+        # free, and every other endpoint benefits too.
+        middleware=[Middleware(GZipMiddleware, minimum_size=2048)],
         lifespan=lifespan,
     )
 

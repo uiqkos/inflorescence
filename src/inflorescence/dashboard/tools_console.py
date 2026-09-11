@@ -52,8 +52,9 @@ TOOL_CATEGORY: dict[str, str] = {
     "graph_schema": "cypher",
     "cypher_query": "cypher",
     "index_directory": "indexing",
+    "send_feedback": "feedback",
 }
-CATEGORY_ORDER = ("search", "graph", "cypher", "indexing", "other")
+CATEGORY_ORDER = ("search", "graph", "cypher", "indexing", "feedback", "other")
 
 # What a call costs beyond a Memgraph read. Money is spent consciously: the UI
 # labels these, and a spending call is refused unless it was explicitly confirmed.

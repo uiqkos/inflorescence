@@ -5,24 +5,37 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Inflorescence</title>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>✿</text></svg>">
+<!-- Two fonts, as on the plates: IBM Plex Mono for everything, Instrument Serif italic for the
+     one word. Both have full local fallback stacks in app.css — the dashboard runs on localhost
+     and must look right with no network at all. -->
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..600;1,9..144,300..500&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=Instrument+Serif:ital@0;1&display=swap">
 <link rel="stylesheet" href="/static/app.css">
 <script src="https://cdn.jsdelivr.net/npm/@highlightjs/cdn-assets@11.11.1/highlight.min.js"></script>
-<script src="/static/vendor/force-graph.min.js"></script>
-<script src="/static/graph-forces.js"></script>
+<script src="/static/pack.js"></script>
 <script src="/static/graph-record.js"></script>
 </head>
 <body>
+
+<!-- the palette is the set of edge types; the counts on the right come from the index -->
+<div id="strip">
+  <span style="color:#ff3aa8">#FF3AA8 CALLS</span>
+  <span style="color:#8b7bff">#8B7BFF IMPORTS</span>
+  <span style="color:#e6ff3d">#E6FF3D INHERITS</span>
+  <span class="fill">#EBE8E1 CONTAINS</span>
+  <span style="color:#4d86ff">#4D86FF OUTGOING</span>
+  <span class="r" id="strip-r"></span>
+</div>
+
 <header id="topbar">
   <a class="brand" href="#" id="brand"><span class="mark">✿</span>inflorescence</a>
   <nav id="nav">
-    <a data-view="overview" href="#">Overview</a>
-    <a data-view="explorer" href="#">Explorer</a>
-    <a data-view="graph" href="#">Graph</a>
-    <a data-view="query" href="#">Query</a>
-    <a data-view="tools" href="#">Tools</a>
+    <a data-view="overview" href="#"><b>01</b>OVERVIEW</a>
+    <a data-view="explorer" href="#"><b>02</b>EXPLORER</a>
+    <a data-view="graph" href="#"><b>03</b>SPECIMEN</a>
+    <a data-view="query" href="#"><b>04</b>CYPHER</a>
+    <a data-view="tools" href="#"><b>05</b>TOOLS</a>
   </nav>
   <select id="project-select" title="Switch project"></select>
   <span id="live-badge" class="hidden" title="Indexing in progress">
@@ -30,8 +43,13 @@
     <span id="live-badge-text">indexing</span>
     <span class="live-track"><span id="live-fill"></span></span>
   </span>
+  <button id="watch-badge" class="hidden" type="button">
+    <span id="watch-dot"></span>
+    <span id="watch-badge-text">watch</span>
+    <span id="watch-fresh"></span>
+  </button>
   <div id="search-wrap">
-    <input id="search-input" type="text" placeholder="Search entities   /" autocomplete="off" spellcheck="false">
+    <input id="search-input" type="text" placeholder="search entities   /" autocomplete="off" spellcheck="false">
     <div id="search-results" class="hidden"></div>
   </div>
 </header>
@@ -39,10 +57,9 @@
 <main id="main">
   <section id="view-empty" class="view hidden">
     <div class="hero">
-      <div class="hero-mark">✿</div>
-      <h1>No indexed projects yet</h1>
-      <p>Index a repository first, then come back:</p>
-      <pre class="hero-code">inflorescence index /path/to/repo</pre>
+      <h1>nothing indexed yet</h1>
+      <p class="dim">Index a repository first, then come back:</p>
+      <pre>inflorescence index /path/to/repo</pre>
       <p class="dim" id="empty-status"></p>
     </div>
   </section>
@@ -52,8 +69,9 @@
   <section id="view-explorer" class="view hidden">
     <aside id="tree-pane">
       <div id="tree-header">
-        <span>Structure</span>
-        <button id="tree-collapse" class="ghost-btn" title="Collapse all">⊟</button>
+        <span>STRUCTURE · CONTAINS</span>
+        <span class="grow"></span>
+        <button id="tree-collapse" class="ghost-btn" title="Collapse all">collapse</button>
       </div>
       <div id="tree"></div>
     </aside>
@@ -64,59 +82,67 @@
 
   <section id="view-graph" class="view hidden">
     <div id="graph-toolbar">
-      <span class="tb-label" id="graph-scope">Modules overview</span>
+      <span id="graph-scope">SPECIMEN</span>
       <span class="tb-sep"></span>
-      <label class="tb-label">level
+      <label class="tb">level
         <select id="graph-level">
-          <option value="modules">modules</option>
           <option value="all">all entities</option>
+          <option value="modules">files only</option>
         </select>
       </label>
-      <label class="tb-label" id="depth-wrap">depth
-        <select id="graph-depth"><option>1</option><option selected>2</option><option>3</option></select>
+      <label class="tb" title="Only entities that already have a summary — while an index runs the specimen grows batch by batch">
+        <input type="checkbox" id="graph-summarized"> summarized
       </label>
       <span class="tb-sep"></span>
-      <span id="graph-rels"></span>
+      <button id="graph-route" class="btn" title="Shortest route between two entities over the real edges">route</button>
+      <button id="graph-overview-btn" class="btn" title="Drop any scope and show the whole project">whole project</button>
+      <button id="graph-fit" class="btn" title="Frame the whole specimen (F)">fit</button>
       <span class="tb-sep"></span>
-      <label class="tb-label" title="Show only entities that already have a summary — during indexing the graph grows batch by batch">
-        <input type="checkbox" id="graph-summarized" checked> summarized
-      </label>
-      <span class="tb-sep"></span>
-      <label class="tb-label">layout
-        <select id="graph-layout">
-          <option value="force">force</option>
-          <option value="td">tree</option>
-          <option value="radialout">radial</option>
-        </select>
-      </label>
-      <button id="graph-overview-btn" class="tb-btn">Whole project</button>
-      <button id="graph-fit" class="tb-btn">Fit</button>
-      <button id="graph-gfx" class="tb-btn" title="Display settings — clustering, colours, animation">⚙</button>
-      <button id="graph-replay" class="tb-btn" title="Replay how this graph grew — animation only, nothing is re-read or re-indexed">▶ Replay</button>
-      <button id="graph-rec" class="tb-btn" title="Record the replay to a video file">⏺</button>
-      <button id="graph-png" class="tb-btn">PNG</button>
-      <span id="graph-count" class="tb-label dim"></span>
+      <button id="graph-gfx" class="btn" title="Display: labels, edge ink, dirt, paper">gfx</button>
+      <button id="graph-replay" class="btn" title="Replay the bloom — animation only, nothing is re-read or re-indexed">replay</button>
+      <button id="graph-rec" class="btn" title="Record the canvas to a video file">rec</button>
+      <button id="graph-png" class="btn" title="Save the specimen as a PNG">png</button>
+      <span id="graph-count"></span>
     </div>
     <div id="graph-body">
       <div id="graph-canvas-wrap">
         <div id="graph-canvas"></div>
         <div id="graph-legend"></div>
-        <div id="gfx-panel" class="hidden">
-          <div class="gfx-head">
-            <span class="gfx-title">Display</span>
-            <span class="grow"></span>
-            <button id="gfx-reset" class="ghost-btn" title="Restore defaults">reset</button>
-            <button id="gfx-close" class="ghost-btn" title="Close">✕</button>
+        <div id="graph-hint">drag to pan · wheel to zoom · click to pin · double-click a disc to frame it · esc</div>
+        <div id="graph-loading" class="hidden">READING THE INDEX…</div>
+        <div id="route-panel" class="overpanel hidden">
+          <div class="head"><span>ROUTE</span><span class="grow"></span>
+            <button id="route-clear" class="ghost-btn">clear</button>
+            <button id="route-close" class="ghost-btn">✕</button>
           </div>
-          <div id="gfx-body"></div>
+          <div class="body">
+            <div class="route-pick" id="route-a-row">
+              <span class="lb">A</span>
+              <input class="field" id="route-a" placeholder="name or path" autocomplete="off" spellcheck="false">
+              <button class="btn" data-pick="a" title="Pick A on the specimen">pick</button>
+            </div>
+            <div class="route-sugg hidden" id="route-a-sugg"></div>
+            <div class="route-pick" id="route-b-row">
+              <span class="lb">B</span>
+              <input class="field" id="route-b" placeholder="name or path" autocomplete="off" spellcheck="false">
+              <button class="btn" data-pick="b" title="Pick B on the specimen">pick</button>
+            </div>
+            <div class="route-sugg hidden" id="route-b-sugg"></div>
+            <div class="route-out" id="route-out"></div>
+          </div>
         </div>
-        <div id="graph-hint" class="dim">Tip: click a node for details · double-click to expand its neighbors</div>
+        <div id="gfx-panel" class="overpanel hidden">
+          <div class="head"><span>DISPLAY</span><span class="grow"></span>
+            <button id="gfx-reset" class="ghost-btn">reset</button>
+            <button id="gfx-close" class="ghost-btn">✕</button>
+          </div>
+          <div class="body" id="gfx-body"></div>
+        </div>
         <div id="replay-bar" class="hidden">
           <button id="replay-toggle" class="ghost-btn" title="Pause / resume">❚❚</button>
           <span class="replay-track"><span id="replay-fill"></span></span>
-          <span id="replay-label" class="mono"></span>
-          <span id="replay-now" class="mono"></span>
-          <label class="tb-label">speed
+          <span id="replay-label"></span>
+          <label class="tb">speed
             <select id="replay-speed">
               <option value="0.5">0.5×</option>
               <option value="1" selected>1×</option>
@@ -124,7 +150,7 @@
               <option value="4">4×</option>
             </select>
           </label>
-          <button id="replay-stop" class="ghost-btn" title="Stop and restore the graph (Esc)">✕</button>
+          <button id="replay-stop" class="ghost-btn" title="Stop (Esc)">✕</button>
         </div>
       </div>
       <aside id="graph-side" class="hidden">
@@ -135,16 +161,19 @@
 
   <section id="view-query" class="view hidden">
     <div id="query-pane">
+      <div class="fig-head">
+        <div class="fig-num"><small>FIG. 04</small>CYPHER</div>
+        <div class="fig-meta">read-only · every MATCH must be scoped with <code>{project: $project}</code><br>LIMIT is added for you · $project is bound to the selected project</div>
+      </div>
       <div id="query-controls">
         <select id="query-presets"></select>
-        <button id="query-run" class="tb-btn accent">Run ⌘⏎</button>
-        <span class="dim tb-label">read-only · every MATCH must be scoped with <code>{project: $project}</code> · LIMIT is added automatically</span>
+        <button id="query-run" class="btn accent">run ⌘⏎</button>
+        <span id="query-graph-btn-wrap"></span>
       </div>
       <textarea id="query-input" rows="6" spellcheck="false">MATCH (n:Code {project: $project})
 RETURN n.name AS name, labels(n) AS labels, n.file_path AS file
 ORDER BY file</textarea>
-      <div id="query-status" class="dim"></div>
-      <div id="query-graph-btn-wrap"></div>
+      <div id="query-status"></div>
       <div id="query-results"></div>
     </div>
   </section>
@@ -152,11 +181,12 @@ ORDER BY file</textarea>
   <section id="view-tools" class="view hidden">
     <aside id="tools-pane">
       <div id="tools-header">
-        <span>MCP tools</span>
-        <span id="tools-count" class="dim"></span>
+        <span>MCP TOOLS</span>
+        <span class="grow"></span>
+        <span id="tools-count"></span>
       </div>
       <div id="tools-list"></div>
-      <div id="tools-runs-header">Recent calls</div>
+      <div id="tools-runs-header">RECENT CALLS</div>
       <div id="tools-runs"></div>
     </aside>
     <div id="tool-pane">

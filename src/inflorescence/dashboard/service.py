@@ -65,11 +65,49 @@ _MAX_HOP_EDGES = 3000
 _MAX_FULL_NODES = 4000
 _MAX_FULL_EDGES = 20000
 
+# ---- the specimen view (static/pack.js) ------------------------------------
+# The whole index at once, as nested discs: CONTAINS is drawn as nesting, so the
+# payload has to carry the *entire* tree, not a neighborhood. That is affordable
+# only because it is deliberately compact: one-letter keys, edges addressed by
+# node index instead of by id, file paths omitted when they can be derived from
+# the id, and summaries clipped — the entity endpoint still serves the full text
+# on demand, so nothing here is the only copy of anything.
+_SPECIMEN_SUMMARY_CHARS = 300
+_SPECIMEN_SIGNATURE_CHARS = 160
+# 17k-node projects exist (and pack.js lays them out in well under a second); the
+# ceiling is about the browser's memory, not the layout. Past it the payload says
+# truncated=True and names what it dropped rather than quietly showing less.
+_MAX_SPECIMEN_NODES = 30000
+_MAX_SPECIMEN_EDGES = 80000
+_SPECIMEN_EDGE_KIND = {"CALLS": "C", "IMPORTS": "I", "INHERITS": "N", "IMPLEMENTS": "M"}
+_ROOT_ID = "dir:."
+
+
+# Documents the indexer routes by exact name (config.DEFAULT_DOCUMENT_FILENAMES): they have
+# no suffix to highlight by, and they are now ordinary entities a reader opens in the viewer.
+_LANGUAGE_BY_NAME = {
+    "Makefile": "makefile",
+    "makefile": "makefile",
+    "GNUmakefile": "makefile",
+    "Dockerfile": "dockerfile",
+    "Containerfile": "dockerfile",
+    "Justfile": "makefile",
+    "justfile": "makefile",
+    "Procfile": "yaml",
+    "Rakefile": "ruby",
+    "Brewfile": "ruby",
+    ".env.example": "bash",
+    ".env.sample": "bash",
+    ".env.template": "bash",
+    ".env.dist": "bash",
+}
+
 
 def language_for_path(file_path: str | None) -> str | None:
     if not file_path:
         return None
-    return _LANGUAGE_BY_EXT.get(Path(file_path).suffix.lower())
+    path = Path(file_path)
+    return _LANGUAGE_BY_NAME.get(path.name) or _LANGUAGE_BY_EXT.get(path.suffix.lower())
 
 
 def verify_root_path(project: str, path: str) -> str | None:
@@ -111,6 +149,24 @@ def stitch_chunks(chunks: list[dict[str, Any]]) -> tuple[str, int] | None:
         lines.extend(chunk_lines[skip:])
         covered_until = max(covered_until, start + len(chunk_lines) - 1)
     return "\n".join(lines), first_line
+
+
+def derived_path(node_id: str) -> str:
+    """The file path a node id already encodes.
+
+    Ids are ``dir:<path>`` for directories and ``<path>`` / ``<path>::<Symbol>``
+    for everything else, so the path is almost always redundant with the id. The
+    specimen payload omits ``p`` whenever this reproduces it and pack.js applies
+    the same rule in reverse; a node whose stored path disagrees keeps its own.
+    """
+    if node_id.startswith("dir:"):
+        return node_id[4:]
+    return node_id.split("::", 1)[0]
+
+
+def _under_prefix(path: str, prefix: str) -> bool:
+    """True when *path* is *prefix* itself or lives under it (directory boundary)."""
+    return path == prefix or path.startswith(prefix.rstrip("/") + "/")
 
 
 def _score(value: Any) -> float:
@@ -262,14 +318,68 @@ class DashboardService:
             {"project": project},
         )
         c = counts[0] if counts else {}
+        # Whether anything keeps this graph matching the code. `indexing` above is about a run
+        # happening *right now*; this is about the rest of the time, which is most of it — and
+        # a dashboard that shows a beautiful graph without it invites reading a week-old index
+        # as the state of the repository.
+        watch = await self._repo.get_watch_state(project)
         return {
             "project": project,
             "indexing": indexing,
+            "watch": watch,
             "nodes": int(c.get("nodes") or 0),
             "edges": int((edge_rows[0].get("edges") if edge_rows else 0) or 0),
             "summarized": int(c.get("summarized") or 0),
             "summarizable": int(c.get("summarizable") or 0),
         }
+
+    async def project_freshness(self, project: str) -> dict[str, Any]:
+        """Re-hash the project's tree and report what an incremental re-index would touch.
+
+        Deliberately **not** part of the 2-second status poll: this walks the directory and
+        MD5s every file it admits, which is seconds per thousand files. It is the authoritative
+        answer to "is what I am looking at still true", so the dashboard asks for it on demand
+        and shows the result until something moves.
+
+        ``pending`` counts files whose content differs from the index — changed *and* never
+        indexed, which is why a project last indexed before the extension set widened can
+        report hundreds of them without anyone having touched the code. Deletions are not
+        counted: removing a node costs nothing and is not what the estimate is for.
+        """
+        from inflorescence.code_indexer.graph_builder import GraphBuilder
+        from inflorescence.code_indexer.models import IndexerConfig
+        from inflorescence.cost import estimate_index_cost
+
+        root = await self.resolved_root_path(project)
+        if root is None:
+            return {
+                "project": project,
+                "available": False,
+                "reason": "no root path on disk for this project — nothing to compare against",
+            }
+        include, exclude = await self._repo.get_project_scope(project)
+        # llm=None: nothing here summarizes or embeds, it only scans and hashes.
+        builder = GraphBuilder(
+            repo=self._repo,
+            llm=None,
+            settings=self._settings,
+            config=IndexerConfig.from_settings(self._settings),
+        )
+        changed = await builder.pending_change_paths(
+            project, root, include or None, exclude or None
+        )
+        payload: dict[str, Any] = {
+            "project": project,
+            "available": True,
+            "root_path": str(root),
+            "pending": len(changed),
+            "sample": sorted(changed)[:20],
+            "checked_at": int(time.time() * 1000),
+        }
+        if changed:
+            preview = await asyncio.to_thread(builder.estimate_paths, root, changed)
+            payload["estimated_cost_usd"] = float(estimate_index_cost(preview, self._settings)["usd"])
+        return payload
 
     async def project_stats(self, project: str) -> dict[str, Any]:
         by_type_records = await self._conn.execute_query(
@@ -803,6 +913,194 @@ class DashboardService:
             "nodes": list(nodes.values()),
             "edges": list(edges.values()),
             "truncated": truncated,
+        }
+
+    # ------------------------------------------------------------------
+    # Specimen: the whole index as nested discs (static/pack.js)
+    # ------------------------------------------------------------------
+
+    async def graph_specimen(
+        self,
+        project: str,
+        prefix: str | None = None,
+        level: str = "all",
+        summarized_only: bool = False,
+        cap: int = _MAX_SPECIMEN_NODES,
+    ) -> dict[str, Any]:
+        """The whole project in the shape pack.js lays out: a tree plus typed edges.
+
+        Unlike :meth:`graph_neighborhood` this is not a walk from a root — the
+        specimen draws CONTAINS as *nesting*, so it needs every node and its
+        parent at once. The payload is index-addressed and abbreviated:
+
+        ``nodes``  ``[{i: id, t: node_type, n: name, pa: parent index or -1,
+        p: file_path (only when it differs from what the id encodes),
+        l: [line_start, line_end], s: summary (≤300 chars), g: signature (≤160)}]``
+
+        ``edges``  ``[[source index, target index, "C"|"I"|"N"|"M", resolution]]``
+        — CALLS / IMPORTS / INHERITS / IMPLEMENTS. CONTAINS is not in this list:
+        it is the ``pa`` column, drawn as nesting.
+
+        ``totals`` / ``edge_totals`` / ``chunks`` / ``external`` describe the whole
+        project even when the view is scoped, so a scoped view can say what share
+        of the index it is showing rather than implying it is all of it.
+
+        Parameters:
+        ``prefix`` keeps only entities under that path (plus the directories
+        needed to nest them); ``level="modules"`` keeps only directories, files and
+        documents — the map you navigate a 17k-entity repository by; ``summarized_only``
+        keeps only entities that already have a summary, which is how the view grows
+        batch by batch while an index runs.
+
+        Anything dropped is reported: ``truncated`` plus a sentence in ``notes``
+        (INV-7 — a smaller graph must never be indistinguishable from a small one).
+        """
+        cap = min(max(cap, 100), _MAX_SPECIMEN_NODES)
+        notes: list[str] = []
+
+        node_rows = await self._conn.execute_query(
+            """
+            MATCH (n:Code {project: $project})
+            RETURN n.id AS id, n.node_type AS t, n.name AS name, n.file_path AS path,
+                   n.parent_id AS parent, n.line_start AS ls, n.line_end AS le,
+                   n.summary AS summary, n.signature AS sig
+            """,
+            {"project": project},
+        )
+        edge_rows = await self._conn.execute_query(
+            f"""
+            MATCH (a:Code {{project: $project}})-[r]->(b:Code {{project: $project}})
+            WHERE type(r) IN ['CALLS', 'IMPORTS', 'INHERITS', 'IMPLEMENTS']
+            RETURN a.id AS src, b.id AS dst, type(r) AS kind, r.resolution AS res
+            LIMIT {_MAX_SPECIMEN_EDGES}
+            """,
+            {"project": project},
+        )
+        chunk_rows = await self._conn.execute_query(
+            "MATCH (c:CodeChunk {project: $project}) RETURN count(c) AS chunks",
+            {"project": project},
+        )
+        external_rows = await self._conn.execute_query(
+            """
+            MATCH (:Code {project: $project})-[:IMPORTS]->(e:External {project: $project})
+            RETURN e.root AS root, count(*) AS n ORDER BY n DESC LIMIT 40
+            """,
+            {"project": project},
+        )
+
+        # Totals describe the index, so they are counted before any filtering.
+        totals = Counter(str(r["t"] or "code") for r in node_rows)
+        edge_totals = Counter(str(r["kind"]) for r in edge_rows)
+        # CONTAINS never appears in the edge list — it is the `pa` column, drawn as nesting —
+        # but the legend still has to be able to say how many of them the index holds.
+        edge_totals["CONTAINS"] = sum(1 for r in node_rows if r["parent"])
+        truncated = len(edge_rows) >= _MAX_SPECIMEN_EDGES
+        if truncated:
+            notes.append(
+                f"Edge list hit its {_MAX_SPECIMEN_EDGES} ceiling — some relations are not drawn."
+            )
+
+        by_id = {str(r["id"]): r for r in node_rows}
+        structural = {"directory", "module", "document"}
+
+        def wanted(row: Any) -> bool:
+            node_type = str(row["t"] or "")
+            path = str(row["path"] or "")
+            if prefix and not _under_prefix(path, prefix):
+                return False
+            if level == "modules" and node_type not in structural:
+                return False
+            return not (
+                summarized_only and node_type != "directory" and not (row["summary"] or "").strip()
+            )
+
+        keep: dict[str, Any] = {nid: row for nid, row in by_id.items() if wanted(row)}
+        dropped_filter = len(by_id) - len(keep)
+
+        # Nesting is the whole point of this view, so every kept node keeps the chain
+        # of directories that positions it — otherwise a scoped view would spill its
+        # files into the root disc.
+        for nid in list(keep):
+            parent = str(by_id[nid]["parent"] or "")
+            while parent and parent not in keep and parent in by_id:
+                keep[parent] = by_id[parent]
+                parent = str(by_id[parent]["parent"] or "")
+        if _ROOT_ID in by_id:
+            keep.setdefault(_ROOT_ID, by_id[_ROOT_ID])
+
+        if len(keep) > cap:
+            # Over the ceiling, keep the map: directories and files first, then the
+            # entities with the most relations, so what survives is what talks most.
+            degree: Counter[str] = Counter()
+            for row in edge_rows:
+                degree[str(row["src"])] += 1
+                degree[str(row["dst"])] += 1
+            rank = {"directory": 0, "module": 1, "document": 1}
+
+            def keep_key(item: tuple[str, Any]) -> tuple[int, int]:
+                nid, row = item
+                return (rank.get(str(row["t"] or ""), 2), -degree[nid])
+
+            kept_pairs = sorted(keep.items(), key=keep_key)[:cap]
+            notes.append(f"Showing the {cap} best-connected entities of {len(keep)}.")
+            keep = dict(kept_pairs)
+            truncated = True
+
+        order = sorted(keep)
+        index = {nid: i for i, nid in enumerate(order)}
+        nodes: list[dict[str, Any]] = []
+        for nid in order:
+            row = keep[nid]
+            path = str(row["path"] or "")
+            node: dict[str, Any] = {
+                "i": nid,
+                "t": str(row["t"] or "code"),
+                "n": row["name"] or nid,
+                "pa": index.get(str(row["parent"] or ""), -1),
+            }
+            if path != derived_path(nid):
+                node["p"] = path
+            line_start, line_end = row["ls"], row["le"]
+            if line_start:
+                node["l"] = [int(line_start), int(line_end or line_start)]
+            summary = (row["summary"] or "").strip()
+            if summary:
+                node["s"] = _trim(summary, _SPECIMEN_SUMMARY_CHARS)
+            signature = (row["sig"] or "").strip()
+            if signature:
+                node["g"] = _trim(signature, _SPECIMEN_SIGNATURE_CHARS)
+            nodes.append(node)
+
+        edges = [
+            [index[src], index[dst], _SPECIMEN_EDGE_KIND[str(row["kind"])], row["res"] or ""]
+            for row in edge_rows
+            for src, dst in [(str(row["src"]), str(row["dst"]))]
+            if src in index and dst in index and src != dst
+        ]
+        if dropped_filter and (prefix or level == "modules" or summarized_only):
+            shown_of = f"{len(nodes)} of {len(by_id)} indexed entities"
+            reason = (
+                f"scoped to {prefix}" if prefix
+                else "files and directories only" if level == "modules"
+                else "entities with a summary only"
+            )
+            notes.append(f"{reason} — {shown_of}.")
+
+        return {
+            "mode": "specimen",
+            "project": project,
+            "display_name": project.rsplit("_", 1)[0],
+            "root": _ROOT_ID if _ROOT_ID in index else (order[0] if order else None),
+            "scope": prefix or None,
+            "level": level,
+            "nodes": nodes,
+            "edges": edges,
+            "totals": dict(totals),
+            "edge_totals": dict(edge_totals),
+            "chunks": int(chunk_rows[0]["chunks"] or 0) if chunk_rows else 0,
+            "external": [[r["root"], int(r["n"])] for r in external_rows if r["root"]],
+            "truncated": truncated,
+            "notes": notes,
         }
 
     # ------------------------------------------------------------------
