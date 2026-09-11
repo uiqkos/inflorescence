@@ -6,10 +6,11 @@ import asyncio
 import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from time import monotonic
+from time import monotonic, time
+from typing import Any
 
 from inflorescence.code_indexer.models import CodeNode, Edge, ExternalRef, NodeType
-from inflorescence.db import queries
+from inflorescence.db import lease, queries
 from inflorescence.db.connection import MemgraphConnection
 
 logger = logging.getLogger(__name__)
@@ -930,6 +931,66 @@ class GraphRepository:
             {"project": project, "root_path": root_path},
         )
 
+    async def get_watch_state(self, project: str) -> dict[str, Any]:
+        """Is anything keeping this project's index current? ``{watched, live, holder, daemon_live}``.
+
+        ``live`` is about *this project*: a daemon holds its claim and re-indexes its saves.
+        ``daemon_live`` is about the machine: a watch daemon is running at all. They are not the
+        same question and conflating them produced advice that contradicted itself — "no daemon
+        is running, start one" printed by a machine whose daemon was running fine and had simply
+        not reached this project yet (it re-reads the registry every ``WATCH_REFRESH_SECONDS``),
+        or had deliberately skipped it. With both, a caller can tell "nothing is running" from
+        "running, but not following this one", and only the first is fixed by starting a daemon.
+
+        Liveness on either is the claim's heartbeat, not the mere existence of a lease node: a
+        daemon killed with SIGKILL leaves its claims behind to expire.
+
+        Never raises. A caller is typically annotating an answer it has already computed, and
+        an unreadable lock node is not a reason to fail their search.
+        """
+        blank = {"watched": False, "live": False, "holder": None, "daemon_live": False}
+        try:
+            records = await self._conn.execute_query(
+                queries.GET_WATCH_STATE,
+                {
+                    "project": project,
+                    "claim_key": lease.watch_claim_key(project),
+                    "daemon_key": lease.daemon_claim_key(),
+                },
+            )
+        except Exception:  # noqa: BLE001 — a status read must never break the caller's answer
+            logger.debug("Could not read watch state for project=%s", project, exc_info=True)
+            return blank
+        if not records:
+            return blank
+        row = records[0]
+        now_ms = int(time() * 1000)
+        holder = row.get("holder")
+        daemon_holder = row.get("daemon_holder")
+        return {
+            "watched": bool(row.get("watched")),
+            "live": bool(holder) and int(row.get("expires_at") or 0) > now_ms,
+            "holder": str(holder) if holder else None,
+            "daemon_live": bool(daemon_holder)
+            and int(row.get("daemon_expires_at") or 0) > now_ms,
+        }
+
+    async def set_project_watched(self, project: str, watched: bool) -> bool:
+        """Add or remove a project from the watch registry; returns whether a project matched.
+
+        The registry is what ``inflorescence watch`` reads to decide which trees to follow, so
+        the write lands on the project root node — a node that exists only for an *indexed*
+        project. That is the intended gate rather than an accident: the daemon updates an
+        existing graph and is not allowed to conjure one (a first index costs real money and
+        must stay an explicit, previewed act), so a path with no index cannot be watched, and
+        ``False`` here is exactly that refusal, reported to the caller instead of silently
+        registering a project nothing will ever update.
+        """
+        records = await self._conn.execute_write_query(
+            queries.SET_PROJECT_WATCHED, {"project": project, "watched": bool(watched)}
+        )
+        return bool(records and int(records[0]["matched"] or 0))
+
     async def set_project_scope(
         self, project: str, include: Sequence[str], exclude: Sequence[str]
     ) -> None:
@@ -994,15 +1055,17 @@ class GraphRepository:
             return None
         return {"worktree_of": str(worktree_of), "main_root_path": str(main_root_path)}
 
-    async def list_projects(self) -> list[dict[str, str | None]]:
-        """Return one row per indexed project: ``project``, ``root_path``, and its worktree marker.
+    async def list_projects(self) -> list[dict[str, Any]]:
+        """Return one row per indexed project: identity, root path, worktree marker, watch flag.
 
         ``worktree_of`` / ``main_root_path`` are ``None`` for an ordinary project — the marker
-        is written only for a directory proved to be a linked worktree. Read from the project
-        root nodes, so the cost is one row per project rather than a graph scan.
+        is written only for a directory proved to be a linked worktree. ``watched`` is the
+        watch-daemon registry flag (:meth:`set_project_watched`), ``False`` for every project
+        never registered. Read from the project root nodes, so the cost is one row per project
+        rather than a graph scan.
         """
         records = await self._conn.execute_query(queries.LIST_PROJECTS, {})
-        projects: list[dict[str, str | None]] = []
+        projects: list[dict[str, Any]] = []
         for r in records:
             project = r.get("project")
             if not project:
@@ -1013,6 +1076,7 @@ class GraphRepository:
                     "root_path": str(r.get("root_path") or ""),
                     "worktree_of": str(r["worktree_of"]) if r.get("worktree_of") else None,
                     "main_root_path": str(r["main_root_path"]) if r.get("main_root_path") else None,
+                    "watched": bool(r.get("watched")),
                 }
             )
         return projects

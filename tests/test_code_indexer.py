@@ -1823,3 +1823,54 @@ async def test_full_build_writes_every_node_and_edge_even_when_the_store_agrees(
     assert {n.id for n in repo.upserted_nodes} == {n.id for n in result.nodes}
     assert len(repo.upserted_edges) == len(result.edges)
     assert repo.call_fact_queries == []  # not even asked: a build has nothing to narrow
+
+
+async def test_scanning_for_changes_does_not_hold_the_event_loop(tmp_path: Path) -> None:
+    """The scan is cheap in money and expensive in wall-clock, so it must not run inline.
+
+    A directory walk plus an MD5 per file is seconds on a few thousand files. Run on the event
+    loop it stops everything else in the process for that whole time: the dashboard served
+    `/api/health` in 21 seconds while one of these ran (measured), and a watch daemon cannot
+    process a single file-save flush while it reconciles a project. Both symptoms read as "it
+    hung", and neither shows up in a CLI, where nothing else needed the loop.
+
+    The check is behavioural rather than structural: a concurrent ticker must keep getting
+    scheduled while the scan runs. An implementation that goes back to scanning inline fails
+    here no matter how it is spelled.
+    """
+    import asyncio
+    import time
+
+    (tmp_path / "a.py").write_text("def a(): ...\n", encoding="utf-8")
+
+    builder = GraphBuilder(
+        repo=RebuildRepository(checksums={}),
+        llm=None,
+        config=IndexerConfig(use_llm_summaries=False, use_llm_fallback_parser=False),
+    )
+
+    # Stand in for a big tree: blocking wall-clock inside the scan, without needing one.
+    real_scan = builder._scan_files
+
+    def slow_scan(*args, **kwargs):
+        time.sleep(0.4)
+        return real_scan(*args, **kwargs)
+
+    builder._scan_files = slow_scan  # type: ignore[method-assign]
+
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.02)
+            ticks += 1
+
+    beat = asyncio.create_task(ticker())
+    try:
+        await builder.has_pending_changes("fixture", tmp_path)
+    finally:
+        beat.cancel()
+
+    # Inline, the ticker would be starved for the whole 0.4s and land at ~0 ticks.
+    assert ticks >= 5

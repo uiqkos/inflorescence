@@ -50,7 +50,14 @@ async def test_existing_indexes_normalises_list_valued_property() -> None:
     assert await schema.schema_present(_Conn()) is True
 
 
-def _stub_db(monkeypatch, *, healthy: bool, schema_ok: bool = True) -> None:
+def _stub_db(
+    monkeypatch,
+    *,
+    healthy: bool,
+    schema_ok: bool = True,
+    projects: list[dict] | None = None,
+    watch_state: dict | None = None,
+) -> None:
     async def fake_health(self) -> bool:
         return healthy
 
@@ -60,9 +67,29 @@ def _stub_db(monkeypatch, *, healthy: bool, schema_ok: bool = True) -> None:
     async def fake_schema(conn) -> bool:
         return schema_ok
 
+    # The watch-daemon check reads the project registry. Unstubbed it would query the
+    # developer's own Memgraph, and the verdict would depend on which projects that machine
+    # happens to have registered — a test that passes or fails by accident of the host.
+    async def fake_list_projects(self) -> list[dict]:
+        return [dict(row) for row in (projects or [])]
+
+    async def fake_watch_state(self, project: str) -> dict:
+        return dict(watch_state or {"watched": False, "live": False, "holder": None})
+
+    monkeypatch.setattr(
+        "inflorescence.db.repository.GraphRepository.list_projects", fake_list_projects
+    )
+    monkeypatch.setattr(
+        "inflorescence.db.repository.GraphRepository.get_watch_state", fake_watch_state
+    )
+
     monkeypatch.setattr("inflorescence.db.connection.MemgraphConnection.health_check", fake_health)
     monkeypatch.setattr("inflorescence.db.connection.MemgraphConnection.close", fake_close)
     monkeypatch.setattr("inflorescence.db.schema.schema_present", fake_schema)
+    # `doctor` counts the containers over the database volume, which on a developer's own
+    # machine is a real and occasionally messy number. Pin it to the clean case; the test
+    # that cares about duplicates supplies its own.
+    monkeypatch.setattr("inflorescence.docker_env.containers_on_volume", lambda *a, **k: [])
 
 
 def _stub_scip(monkeypatch, runner: str, *, images_local: bool = True) -> None:
@@ -134,6 +161,98 @@ async def test_doctor_all_green(monkeypatch, tmp_path) -> None:
 
     results = await _doctor_checks(Settings())
     assert all(r.ok for r in results)
+
+
+async def test_doctor_reports_registered_projects_that_nothing_is_following(monkeypatch, tmp_path) -> None:
+    """The state after a reboot: the registry says followed, and nothing is following.
+
+    It fails no other check — config, key, database and schema are all fine — and every tool
+    keeps answering from an index that stopped moving. Non-critical, because the machine still
+    works; reported, because nothing else here would say it.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    _stub_db(
+        monkeypatch,
+        healthy=True,
+        schema_ok=True,
+        projects=[{"project": "p_1", "root_path": "/repo", "watched": True}],
+        watch_state={"watched": True, "live": False, "holder": None},
+    )
+    _stub_scip(monkeypatch, "docker")
+
+    from inflorescence.__main__ import _doctor_checks
+    from inflorescence.config import Settings
+
+    results = {r.name: r for r in await _doctor_checks(Settings())}
+
+    assert results["Watch daemon"].ok is False
+    assert results["Watch daemon"].critical is False
+    assert "0 of 1" in results["Watch daemon"].detail
+    assert "watch run" in (results["Watch daemon"].hint or "")
+
+
+async def test_doctor_is_green_when_a_daemon_follows_every_registered_project(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    _stub_db(
+        monkeypatch,
+        healthy=True,
+        schema_ok=True,
+        projects=[{"project": "p_1", "root_path": "/repo", "watched": True}],
+        watch_state={"watched": True, "live": True, "holder": "host:1:x"},
+    )
+    _stub_scip(monkeypatch, "docker")
+
+    from inflorescence.__main__ import _doctor_checks
+    from inflorescence.config import Settings
+
+    results = {r.name: r for r in await _doctor_checks(Settings())}
+
+    assert results["Watch daemon"].ok is True
+    assert "1 of 1" in results["Watch daemon"].detail
+
+
+async def test_doctor_reports_a_second_container_over_the_database_volume(monkeypatch, tmp_path) -> None:
+    """The fault that reads as "the MCP server just stopped connecting" and survives every
+    restart: two containers over one Memgraph volume. Nothing is wrong until one of them
+    claims the published port, after which the other runs on unreachably — so `doctor` must
+    name it while the database still answers, not once it no longer does."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    _stub_db(monkeypatch, healthy=True, schema_ok=True)
+    _stub_scip(monkeypatch, "docker")
+    monkeypatch.setattr(
+        "inflorescence.docker_env.containers_on_volume",
+        lambda *a, **k: [("inflorescence-memgraph", "running"), ("inflorescence-memgraph-1", "exited")],
+    )
+
+    from inflorescence.__main__ import _doctor_checks
+    from inflorescence.config import Settings
+
+    results = {r.name: r for r in await _doctor_checks(Settings())}
+    duplicate = results["Single Memgraph container"]
+    assert duplicate.ok is False
+    assert "inflorescence-memgraph-1" in duplicate.detail
+    assert "docker stop inflorescence-memgraph-1" in duplicate.hint
+    # Not critical: the machine works right now, and exiting 1 would fail a suite over a
+    # database that answers. The printed verdict is what has to stop saying "OK".
+    assert duplicate.critical is False
+
+
+async def test_doctor_is_silent_about_containers_on_a_clean_machine(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "k")
+    _stub_db(monkeypatch, healthy=True, schema_ok=True)
+    _stub_scip(monkeypatch, "docker")
+
+    from inflorescence.__main__ import _doctor_checks
+    from inflorescence.config import Settings
+
+    results = {r.name for r in await _doctor_checks(Settings())}
+    assert "Single Memgraph container" not in results
 
 
 async def test_doctor_stays_green_without_any_scip_indexer(monkeypatch, tmp_path) -> None:
@@ -381,6 +500,7 @@ def _stub_docker_env(
     *,
     port_already_open: bool = False,
     ensured: bool = True,
+    containers: list[tuple[str, str]] | None = None,
 ) -> list[str]:
     """Pin every docker_env probe `_bootstrap_memgraph` makes; returns the event log."""
     import inflorescence.docker_env as de
@@ -388,6 +508,9 @@ def _stub_docker_env(
     events: list[str] = []
     monkeypatch.setattr(de, "port_open", lambda *a, **k: port_already_open)
     monkeypatch.setattr(de, "ensure_memgraph", lambda url, **k: events.append("ensure_memgraph") or ensured)
+    # Unpinned this shells out to the *host's* docker, so a developer laptop with a
+    # container left over from real use would steer the test down a different branch.
+    monkeypatch.setattr(de, "containers_on_volume", lambda *a, **k: list(containers or []))
     return events
 
 
@@ -439,6 +562,25 @@ def test_bootstrap_memgraph_prefers_compose_inside_a_checkout(monkeypatch, tmp_p
     m._bootstrap_memgraph(tmp_path)
     assert ["docker", "compose", "up", "-d", "memgraph"] in calls
     assert events == []
+
+
+def test_bootstrap_memgraph_leaves_an_existing_container_to_the_direct_path(monkeypatch, tmp_path) -> None:
+    """Compose refuses to adopt a container it did not create, so on a machine that already
+    has one it would only print a name conflict. Worse, before the container name was pinned
+    it did not conflict at all — it built a second Memgraph over the same volume, and the two
+    then fought for the bolt port until one was left running yet attached to no network."""
+    from inflorescence import __main__ as m
+
+    (tmp_path / "docker-compose.yml").write_text("services: {}\n")
+    events = _stub_docker_env(monkeypatch, containers=[("inflorescence-memgraph", "exited")])
+    monkeypatch.setattr(m, "_ensure_docker_interactive", lambda: True)
+    monkeypatch.setattr(m.shutil, "which", lambda name: f"/usr/bin/{name}")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(m.subprocess, "run", lambda cmd, *a, **k: calls.append(cmd))
+
+    m._bootstrap_memgraph(tmp_path)
+    assert calls == []
+    assert events == ["ensure_memgraph"]
 
 
 def test_ensure_docker_interactive_is_silent_when_docker_already_works(monkeypatch, capsys) -> None:

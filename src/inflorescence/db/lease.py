@@ -30,6 +30,7 @@ import os
 import socket
 import time
 import uuid
+from typing import Any
 
 import neo4j.exceptions
 
@@ -72,6 +73,12 @@ SET l.expires_at = $expires
 RETURN count(l) AS renewed
 """
 
+# Read a lease without touching it. Used to name the holder in a refusal message.
+_READ_LEASE = """
+MATCH (l:IndexLock {project: $project})
+RETURN l.holder AS holder, l.expires_at AS expires_at
+"""
+
 # Release only if we still hold it; a lease taken over after expiry is left untouched.
 _RELEASE = """
 MATCH (l:IndexLock {project: $project})
@@ -79,6 +86,59 @@ WHERE l.holder = $token
 SET l.holder = NULL, l.expires_at = 0
 RETURN count(l) AS released
 """
+
+
+# Namespace for the watch daemon's per-project claim. A claim answers "somebody is already
+# following this tree" and is held for the daemon's whole lifetime — which is exactly why it
+# must NOT be the project's index lock: holding that for hours would block every index and
+# every flush. Same node label and the same compare-and-set machinery (so the TTL, the
+# heartbeat and the takeover-after-crash behaviour are the tested ones), a different key.
+WATCH_CLAIM_PREFIX = "watch:"
+
+
+def watch_claim_key(project: str) -> str:
+    """The lease key under which a watch daemon claims *project*."""
+    return f"{WATCH_CLAIM_PREFIX}{project}"
+
+
+def daemon_claim_key(host: str | None = None) -> str:
+    """The lease key that makes the watch daemon a singleton — per *machine*, not per database.
+
+    Per-project claims already make a second daemon harmless: it finds every project taken and
+    follows none. Harmless is not the same as wanted, though — it still boots, pays for a
+    dependency pre-flight, holds a connection, sweeps worktrees on its own schedule and logs a
+    warning per project, forever, for nothing. The common way to end up with one is not exotic
+    either: `watch install` puts a daemon under launchd, and then `watch run` gets typed in a
+    terminal.
+
+    Keyed by hostname on purpose. Memgraph can be shared (``MEMGRAPH_URL`` points anywhere), and
+    a machine-wide singleton must not become a database-wide one: the second laptop would be
+    unable to run a daemon at all, for files the first one cannot even see.
+    """
+    return f"{WATCH_CLAIM_PREFIX}daemon@{host or socket.gethostname()}"
+
+
+async def read_lease(conn: MemgraphConnection, key: str) -> dict[str, Any] | None:
+    """Who holds a lease and until when — ``{holder, expires_at, live}``, or ``None`` if unheld.
+
+    Read-only and safe from a process holding nothing, which is the point: a refusal to start
+    has to be able to *name* the process that already owns the job, or "already running" is
+    just another opaque failure.
+    """
+    try:
+        rows = await conn.execute_query(_READ_LEASE, {"project": key})
+    except Exception:  # noqa: BLE001 — a diagnostic read must not raise into the caller
+        logger.debug("Could not read lease for key=%s", key, exc_info=True)
+        return None
+    if not rows:
+        return None
+    holder = rows[0].get("holder")
+    expires_at = int(rows[0].get("expires_at") or 0)
+    return {
+        "holder": str(holder) if holder else None,
+        "expires_at": expires_at,
+        "live": bool(holder) and expires_at > _now_ms(),
+    }
 
 
 class ProjectLockTimeoutError(RuntimeError):

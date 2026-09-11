@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import logging
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -104,6 +104,17 @@ class ProjectManager:
         # Under both, a duplicate mutation degrades to a cheap checksum no-op, never a race.
         self._project_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
+    async def preflight_dependencies(self) -> None:
+        """Public entry to the dependency pre-flight, for callers that need it up front.
+
+        Indexing calls :meth:`_preflight` itself, so nothing here is required for correctness.
+        The watch daemon uses it at startup for a different reason: it is a background process
+        with no user watching stderr, and a daemon that cannot summarize must fail at boot with
+        one clear message rather than come up "live", claim every project, and log an identical
+        failure on every file anybody saves.
+        """
+        await self._preflight()
+
     async def _preflight(self) -> None:
         """Fail closed before any graph mutation: verify every dependency the run needs.
 
@@ -171,7 +182,48 @@ class ProjectManager:
                 "%d changed path(s) — refusing to auto-spend; re-index explicitly to raise the cap",
                 root_path, estimate["usd"], limit, len(changed_files),
             )
-            raise IndexCostExceededError(estimate["usd"], limit)
+            raise IndexCostExceededError(estimate["usd"], limit, changed_files=len(changed_files))
+
+    async def _gate_reindex_cost(
+        self,
+        project: str,
+        root: Path,
+        include_patterns: list[str] | None,
+        exclude_patterns: list[str] | None,
+        limit: float | None,
+    ) -> None:
+        """Abort an incremental re-index whose changed set would exceed the cost cap.
+
+        The gate on the first-time branch prices the whole tree; that is the wrong question
+        here, where almost every node is already paid for and reused by content hash — it
+        would reject every routine re-index of a large repo. What this run pays for is the
+        files whose checksum moved, so those are what gets priced (same shape as
+        :meth:`_gate_update_cost`).
+
+        Without this, INV-10 held only for a project's *first* index. Widening what the
+        indexer admits (a new entry in ``DOCUMENT_EXTENSIONS``) makes thousands of files
+        newly billable on the next ordinary re-index of an already-indexed project — a
+        tree-sized bill behind a call that reads like a cheap refresh. Measured on a real
+        repo: adding data formats turned a re-index into an ungated ~$57 run.
+
+        Costs one directory walk + MD5 pass that the build below repeats. That is the same
+        price the watcher path already pays, and it buys the only number worth gating on.
+        """
+        if limit is None:
+            return
+        changed = await self._builder.pending_change_paths(
+            project, root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
+        )
+        if not changed:
+            return
+        preview = self._builder.estimate_paths(root, changed)
+        estimate = estimate_index_cost(preview, self._settings)
+        logger.info(
+            "Estimated re-index cost for project=%s: $%.4f (limit $%.2f) over %d changed file(s)",
+            project, estimate["usd"], limit, len(changed),
+        )
+        if estimate["usd"] > limit:
+            raise IndexCostExceededError(estimate["usd"], limit, changed_files=len(changed))
 
     # ------------------------------------------------------------------
     # Git worktrees: index as a separate project, pay only for what differs
@@ -546,6 +598,75 @@ class ProjectManager:
             )
         return project, None
 
+    async def prune_out_of_scope(
+        self,
+        path: str,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, object]:
+        """Drop what an indexed project holds for files a narrowed scope no longer covers.
+
+        Indexing never does this on its own: an excluded file is still on disk, so a
+        re-index cannot tell "the operator narrowed the scope" from "the scan failed", and
+        must not turn destructive on a guess (INV-1/INV-3 — a failure may leave data stale,
+        never delete it). Narrowing is therefore its own explicit, free operation: no walk,
+        no parse, no LLM, no embedding — pure path matching against the stored node index.
+
+        The new excludes are **merged** into the project's persisted scan scope rather than
+        replacing it, so a background watcher update stops re-admitting the pruned paths and
+        the narrowing survives the next explicit index of the same scope. It does not survive
+        an explicit index that passes a different scope — that call defines the scope, as it
+        always has.
+
+        With *dry_run* nothing is written and the same counts are returned, so the caller can
+        show what would go before it goes.
+        """
+        root = Path(path).resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Directory not found: {path}")
+        project = self.get_project(path)
+
+        async with self._project_locks[project], project_lease(self._conn, project):
+            if not await self._repo.project_is_indexed(project):
+                raise ValueError(f"Project is not indexed: {path}")
+
+            stored_include, stored_exclude = await self._repo.get_project_scope(project)
+            merged_exclude = list(dict.fromkeys([*stored_exclude, *(exclude_patterns or [])]))
+            effective_include = include_patterns if include_patterns is not None else (
+                stored_include or None
+            )
+
+            plan = await self._builder.plan_scope_prune(
+                project,
+                include_patterns=effective_include,
+                exclude_patterns=merged_exclude or None,
+            )
+            stats: dict[str, object] = {
+                "project": project,
+                "directory": str(root),
+                "dry_run": dry_run,
+                "files": len(plan.files),
+                "nodes": len(plan.node_ids),
+                "directories": len(plan.directory_ids),
+                "chunks": len(plan.chunk_ids),
+                "sample": sorted(plan.files)[:10],
+                "scope": {"include": effective_include or [], "exclude": merged_exclude},
+            }
+            if dry_run or not plan.node_ids:
+                logger.info("Scope prune plan for project=%s: %s", project, stats)
+                return stats
+
+            await self._repo.delete_nodes_by_ids(project, sorted(plan.node_ids))
+            if plan.chunk_ids:
+                await self._repo.delete_chunks_by_ids(project, sorted(plan.chunk_ids))
+            # Persist last: if a delete failed, the scope is not yet narrowed and re-running
+            # the command re-plans against the same store rather than a half-applied one.
+            await self._repo.set_project_scope(project, effective_include or [], merged_exclude)
+            stats["db"] = await self._repo.get_project_stats(project)
+            logger.info("Scope prune applied for project=%s: %s", project, stats)
+            return stats
+
     async def index_directory(
         self,
         path: str,
@@ -557,10 +678,12 @@ class ProjectManager:
     ) -> dict[str, object]:
         """Index a directory: full build or incremental update.
 
-        A first-time (full) index is gated by a cost cap: ``max_cost_usd`` (per call) or
+        Every run that would spend is gated by a cost cap: ``max_cost_usd`` (per call) or
         ``Settings.max_index_cost_usd``. If the pre-flight estimate exceeds it, raises
-        :class:`IndexCostExceededError` before spending anything. Incremental re-indexes reuse
-        unchanged summaries and are not gated.
+        :class:`IndexCostExceededError` before spending anything. A first-time index is priced
+        over the whole tree; an incremental re-index reuses unchanged summaries by content hash
+        and is priced over just the files whose checksum moved — which is also what catches an
+        indexer change that newly admits thousands of files into an existing project.
 
         ``force_rebuild`` re-parses, re-resolves and reconciles the whole project even when
         no file content changed. The incremental path short-circuits on content checksums,
@@ -610,6 +733,15 @@ class ProjectManager:
             seeded_summaries = 0
             stored_chunk_embeddings: dict[str, list[float]] = {}
             if existing_stats["nodes"] > 0:
+                # INV-10 covers re-indexes too, not only a project's first one: price the
+                # files whose content moved before any of them is summarized or embedded.
+                await self._gate_reindex_cost(
+                    project,
+                    root,
+                    include_patterns,
+                    exclude_patterns,
+                    max_cost_usd if max_cost_usd is not None else self._settings.max_index_cost_usd,
+                )
                 if force_rebuild:
                     logger.info("Force rebuild requested for project=%s", project)
                     # Same project, so the stored vectors stay where they are: only the
@@ -898,6 +1030,24 @@ class ProjectManager:
             "estimated_cost_usd": estimate["usd"],
             **preview,
         }
+
+    async def scan_uncovered(
+        self,
+        directory: str,
+        indexed_paths: Iterable[str],
+        scope: Sequence[str] | None = None,
+    ) -> dict[str, object]:
+        """Which files under *directory* the index does not hold — see
+        :meth:`GraphBuilder.scan_uncovered`.
+
+        Read tools call this when their answer is empty, to keep "nothing matched" apart from
+        "that file was never indexed". Off the event loop, because it is `scandir` I/O and
+        this process also serves a dashboard whose health endpoint must keep answering
+        (the same reason ``_scan_for_changes`` threads its walk).
+        """
+        return await asyncio.to_thread(
+            self._builder.scan_uncovered, Path(directory), indexed_paths, scope
+        )
 
     async def update_project(self, project: str, changed_files: list[str]) -> dict[str, object]:
         """Update a project after receiving changed-file notifications."""

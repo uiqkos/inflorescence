@@ -6,10 +6,12 @@ import asyncio
 import fnmatch
 import logging
 import os
+import posixpath
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import pathspec
@@ -100,6 +102,58 @@ class _ReconcilePlan:
     stored_edge_keys: set[tuple[str, str, str]]
 
 
+@dataclass
+class ScopePrunePlan:
+    """What an indexed project holds that a given include/exclude scope no longer covers.
+
+    Computed from the stored node index and pure path matching — no directory walk, no
+    parse, nothing billable — so it doubles as the dry run. ``files`` is what a human should
+    be shown; ``node_ids`` and ``chunk_ids`` are what a prune would delete.
+    """
+
+    files: set[str]
+    node_ids: set[str]
+    chunk_ids: set[str]
+    directory_ids: set[str]
+
+
+# Bounds for :meth:`GraphBuilder.scan_uncovered`, which runs on the miss path of ordinary
+# read tools (an empty page) and must therefore cost far less than the search that produced
+# it. 1500 directories of `scandir` is tens of milliseconds on a warm cache and covers the
+# whole of most monorepos; the wall-clock budget is what saves a cold NFS mount from turning
+# an empty search into a five-second one. Both are reported when they bite, never silently.
+COVERAGE_MAX_DIRS = 1500
+COVERAGE_TIME_BUDGET_S = 1.5
+COVERAGE_MAX_EXAMPLES = 5
+
+
+def _literal_prefix(pattern: str) -> str:
+    """The glob-free head of a path pattern: ``src/api/**`` -> ``src/api``, ``*.py`` -> ``""``.
+
+    Path filters reach this module as the expanded globs the tool echoed back to its caller;
+    only their literal head can narrow a directory list, and a pattern that begins with a
+    metacharacter narrows nothing at all.
+    """
+    head: list[str] = []
+    for segment in pattern.replace("\\", "/").strip("/").split("/"):
+        if any(char in segment for char in ("*", "?", "[")):
+            break
+        head.append(segment)
+    return "/".join(head)
+
+
+def _within(directory: str, prefix: str) -> bool:
+    """True when *directory* is *prefix*, sits under it, or is one of its ancestors.
+
+    Ancestors count — the project root included — because a filter of ``src/api/**`` is
+    answered partly by the files sitting directly in ``src``: the scope names where the
+    caller was looking, not a subtree the check may not step outside of.
+    """
+    if not prefix or not directory or directory == prefix:
+        return True
+    return directory.startswith(f"{prefix}/") or prefix.startswith(f"{directory}/")
+
+
 def _build_default_registry(config: IndexerConfig | None = None) -> ParserRegistry:
     """Create a registry with all available parsers."""
     config = config or IndexerConfig()
@@ -110,7 +164,7 @@ def _build_default_registry(config: IndexerConfig | None = None) -> ParserRegist
         # the watcher's extension filter, the cost preview, and the reconcile's
         # "is this file's parser still available?" check — keys off the registry, so
         # documents are covered by all of it without a parallel code path.
-        registry.register(DocumentParser(config.document_extensions))
+        registry.register(DocumentParser(config.document_extensions, config.document_filenames))
     try:
         from inflorescence.code_indexer.parser.javascript_parser import JavaScriptParser
 
@@ -252,6 +306,20 @@ class GraphBuilder:
     def extensions(self) -> set[str]:
         """File extensions the registered parsers can index (e.g. for watcher filtering)."""
         return set(self._registry.get_all_extensions())
+
+    @property
+    def indexable_filenames(self) -> set[str]:
+        """Exact filenames indexable regardless of extension (Makefile, Dockerfile, …).
+
+        Travels with :attr:`extensions` everywhere the latter is used as a pre-filter — a
+        watcher that only knows the suffix set drops every save of a Makefile before the
+        builder ever hears about it.
+        """
+        return set(self._registry.get_all_filenames())
+
+    def indexes(self, file_path: Path | str) -> bool:
+        """True when this builder's scan would admit *file_path* (by name or by suffix)."""
+        return self._registry.supports(file_path)
 
     async def preflight(self) -> None:
         """Verify the LLM chat model answers before any graph mutation (INV-2, finding 6).
@@ -548,8 +616,12 @@ class GraphBuilder:
         failure dropped from the scan are left entirely untouched — every parser emits at
         least a module node for a file it reads, so "scanned but produced nothing" means
         failure, not an empty file. ``reconcilable_files`` scopes chunk pruning the same way.
+
+        Narrowing the scan scope deliberately does NOT delete here: an excluded file is still
+        on disk, so nothing confirms it gone, and an ordinary re-index must never turn
+        destructive because a pattern moved. Dropping what a narrowed scope no longer covers
+        is its own explicit operation — see :meth:`plan_scope_prune` and ``inflorescence prune``.
         """
-        supported_ext = self.extensions
         produced_files = {n.file_path for n in all_nodes if n.node_type != NodeType.DIRECTORY}
 
         stored = await self._repo.get_stored_node_index(project)
@@ -562,9 +634,9 @@ class GraphBuilder:
         missing_from_scan = indexed_files - current_paths
         confirmed_deleted = {
             fp for fp in missing_from_scan
-            if Path(fp).suffix in supported_ext and _confirmed_absent(root / fp)
+            if self.indexes(fp) and _confirmed_absent(root / fp)
         }
-        orphaned_language = {fp for fp in missing_from_scan if Path(fp).suffix not in supported_ext}
+        orphaned_language = {fp for fp in missing_from_scan if not self.indexes(fp)}
         if orphaned_language:
             logger.warning(
                 "Reconcile kept %d indexed file(s) whose language parser is unavailable "
@@ -636,11 +708,49 @@ class GraphBuilder:
         it must not land in this set. That costs the watcher path an MD5 pass over the tree,
         which the caller (an update that is about to read and parse every one of those files
         anyway) can afford and ``has_pending_changes`` — which must stay cheap — does not pay.
+
+        Cheap in money, not in wall-clock: a directory walk plus an MD5 per file is seconds on
+        a few thousand files, and it is *blocking* work. Run inline it holds the event loop for
+        that whole time, which is invisible in a CLI and very visible everywhere else — the
+        dashboard stopped answering ``/api/health`` for 21 seconds while one of these ran, and a
+        watch daemon cannot process a single flush while it reconciles. Both phases therefore
+        run in a worker thread. ``_scan_files`` is documented as keeping no instance state for
+        exactly this reason, and the diff below only reads locals.
         """
-        files, _ = self._scan_files(root, include_patterns=include_patterns, exclude_patterns=exclude_patterns)
+        files, _ = await asyncio.to_thread(
+            self._scan_files,
+            root,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+        )
         current_paths = {str(f.relative_to(root)) for f in files}
         stored_checksums = await self._repo.get_checksums(project)
 
+        return await asyncio.to_thread(
+            self._diff_checksums,
+            root,
+            files,
+            current_paths,
+            stored_checksums,
+            changed_files,
+            full_checksums,
+        )
+
+    def _diff_checksums(
+        self,
+        root: Path,
+        files: list[Path],
+        current_paths: set[str],
+        stored_checksums: dict[str, str],
+        changed_files: list[str] | None,
+        full_checksums: bool,
+    ) -> tuple[list[Path], list[str], set[str]]:
+        """The blocking half of :meth:`_scan_for_changes`: hash files, classify against the index.
+
+        Split out so it can run off the event loop. Pure with respect to the builder — it reads
+        only its arguments and the filesystem — so a concurrent scan on a shared builder cannot
+        interfere with it.
+        """
         changed: list[Path] = []
         deleted: list[str] = []
         unchanged: set[str] = set()
@@ -710,6 +820,93 @@ class GraphBuilder:
             include_patterns=include_patterns, exclude_patterns=exclude_patterns,
         )
         return bool(changed or deleted)
+
+    async def pending_change_paths(
+        self,
+        project: str,
+        root_path: Path,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+    ) -> list[str]:
+        """The root-relative files an incremental re-index would actually pay for.
+
+        Same scan + MD5 pass as :meth:`has_pending_changes`, but it names the files instead
+        of answering yes/no, so a cost gate can price them (INV-10). Nothing billable runs
+        here. Deletions are left out on purpose: removing a node costs no LLM call and no
+        embedding, so pricing them would reject a cleanup.
+
+        The set is defined by checksum, which is what makes it the right gate input after an
+        *indexer* change: a file the previous run never scanned has no stored checksum, so
+        widening the extension set lands its whole newly-admitted bulk in here — priced —
+        rather than slipping through as "nothing changed in git".
+        """
+        root = root_path.resolve()
+        changed, _deleted, _unchanged = await self._scan_for_changes(
+            project, root, None,
+            include_patterns=include_patterns, exclude_patterns=exclude_patterns,
+        )
+        return [str(f.relative_to(root)) for f in changed]
+
+    async def plan_scope_prune(
+        self,
+        project: str,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+    ) -> ScopePrunePlan:
+        """List what the store holds for files the given scope refuses.
+
+        A re-index deliberately never deletes these (see :meth:`_plan_reconcile`): the files
+        are still on disk, so an ordinary refresh has no business dropping them. Narrowing
+        the scope is instead an explicit operation, and this is its plan — the answer to
+        "what would ``inflorescence prune`` remove?", produced without touching the disk or
+        spending anything, so the same call serves the dry run and the real thing.
+
+        Directory nodes are included only when no surviving file remains beneath them, which
+        keeps a pruned tree from leaving empty scaffolding behind.
+        """
+        includes = _normalize_patterns(
+            include_patterns if include_patterns is not None else self._config.include_patterns
+        )
+        excludes = _normalize_patterns([*self._config.exclude_patterns, *(exclude_patterns or [])])
+
+        stored = await self._repo.get_stored_node_index(project)
+        refused_files = {
+            fp for _nid, fp, ntype in stored
+            if fp and ntype != NodeType.DIRECTORY.value and _refused_by_scope(fp, includes, excludes)
+        }
+        if not refused_files:
+            return ScopePrunePlan(files=set(), node_ids=set(), chunk_ids=set(), directory_ids=set())
+
+        node_ids = {
+            nid for nid, fp, ntype in stored
+            if ntype != NodeType.DIRECTORY.value and fp in refused_files
+        }
+
+        # Directories survive as long as one indexed file still lives under them.
+        indexed_files = {fp for _nid, fp, ntype in stored if fp and ntype != NodeType.DIRECTORY.value}
+        needed_dirs = {""}
+        for fp in indexed_files - refused_files:
+            parts = fp.split("/")
+            for i in range(1, len(parts)):
+                needed_dirs.add("/".join(parts[:i]))
+        directory_ids = set()
+        for nid, fp, ntype in stored:
+            if ntype != NodeType.DIRECTORY.value:
+                continue
+            dp = nid[len("dir:"):] if nid.startswith("dir:") else fp
+            if (dp if dp != "." else "") not in needed_dirs:
+                directory_ids.add(nid)
+
+        chunk_ids = {
+            cid for cid, fp in (await self._repo.get_chunk_index(project)).items()
+            if fp in refused_files
+        }
+        return ScopePrunePlan(
+            files=refused_files,
+            node_ids=node_ids | directory_ids,
+            chunk_ids=chunk_ids,
+            directory_ids=directory_ids,
+        )
 
     async def update(
         self,
@@ -920,6 +1117,8 @@ class GraphBuilder:
         stored on the instance so concurrent scans on a shared builder can't clobber it.
         """
         extensions = set(self._registry.get_all_extensions())
+        # Not ``filenames``: os.walk binds that name below to the directory's file list.
+        indexable_names = set(self._registry.get_all_filenames())
         includes = _normalize_patterns(include_patterns if include_patterns is not None else self._config.include_patterns)
         excludes = _normalize_patterns([*self._config.exclude_patterns, *(exclude_patterns or [])])
         gitignore = _load_ignore_specs(root, self._config.respect_gitignore)
@@ -946,7 +1145,7 @@ class GraphBuilder:
 
             for filename in filenames:
                 f = current_path / filename
-                if f.suffix not in extensions:
+                if f.suffix not in extensions and filename not in indexable_names:
                     continue
                 if filename in LOCKFILE_NAMES:
                     # By name, unconditionally — before includes, so not even an explicit
@@ -1008,7 +1207,7 @@ class GraphBuilder:
             total_lines += data.count(b"\n") + 1
             rel = f.relative_to(root).as_posix()
             sizes.append((rel, size))
-            entry = languages.setdefault(_language_for_suffix(f.suffix), {"files": 0, "bytes": 0})
+            entry = languages.setdefault(_language_for_file(f), {"files": 0, "bytes": 0})
             entry["files"] += 1
             entry["bytes"] += size
 
@@ -1051,6 +1250,120 @@ class GraphBuilder:
                 checksums[ck.file_path] = ck.md5
         return checksums
 
+    def scan_uncovered(
+        self,
+        root_path: Path,
+        indexed_paths: Iterable[str],
+        scope: Sequence[str] | None = None,
+        max_dirs: int = COVERAGE_MAX_DIRS,
+        max_examples: int = COVERAGE_MAX_EXAMPLES,
+        time_budget_seconds: float = COVERAGE_TIME_BUDGET_S,
+    ) -> dict[str, object]:
+        """List files this scan *would* index that the index does not contain.
+
+        The gap this closes is the one an empty answer cannot see. Staleness is defined
+        against nodes — a file that was indexed and then changed — so a file that never
+        entered the index has nothing to flag, and every freshness signal reads clean while
+        the file sits on disk unqueryable. A field report (10.09.2026) has the shape exactly:
+        ``search_entities(query="wave_queue")`` returned zero items, zero stale, zero missing and
+        a cheerful "a live watch daemon is following this tree", over a project that had a
+        174-line ``scripts/wave_queue.py`` in it the whole time. The agent read that as
+        "no such file" and was one step from writing the file that already existed.
+
+        Bounded on purpose, because it runs on the miss path of ordinary read tools:
+
+        * only directories the index already knows are opened (their parents, from the
+          project's stored checksums), so an unindexed ``node_modules`` is never walked —
+          the price is that a brand-new *directory* is invisible to this check, which
+          :mod:`inflorescence.tools.coverage` states in the meta block rather than hiding;
+        * *scope* (the query's own path filters, literal prefixes) narrows those directories
+          further;
+        * ``max_dirs`` and ``time_budget_seconds`` stop the scan, and stopping is reported
+          (``capped``) instead of being passed off as a complete answer;
+        * a file the indexer would not admit anyway — wrong extension, lock file, ignored,
+          generated, oversized — is not "missing from the index", so none of them are listed.
+
+        Nothing is hashed and no indexed file is read: one ``scandir`` per directory, plus a
+        2 KB head read of each *candidate gap* to recognize a generated file — a handful of
+        reads on the rare path where something is actually missing.
+        """
+        root = root_path.resolve()
+        indexed = {str(p).replace("\\", "/") for p in indexed_paths}
+        directories = sorted(
+            # The project root is always known — the project node itself names it — so it is
+            # checked even when the index holds no files under it yet, which is exactly the
+            # state (a half-built or scope-narrowed index) where the gap is widest.
+            {""} | {posixpath.dirname(p) for p in indexed},
+            # Shallowest first: the cap has to fall somewhere, and a breadth-first order keeps
+            # what it covers spread across the tree instead of stuck in one alphabetical corner.
+            key=lambda d: (d.count("/"), d),
+        )
+        if scope:
+            prefixes = [_literal_prefix(pattern) for pattern in scope]
+            prefixes = [prefix for prefix in prefixes if prefix]
+            if prefixes:
+                directories = [d for d in directories if any(_within(d, prefix) for prefix in prefixes)]
+
+        excludes = _normalize_patterns(self._config.exclude_patterns)
+        # Not _load_ignore_specs: that rglob's the whole tree for ignore files, which would
+        # make this check walk exactly the directories (node_modules, dist) it exists to
+        # avoid opening. Only a directory's own ignore file and its ancestors' can affect it.
+        gitignore = _ancestor_ignore_specs(root, directories, self._config.respect_gitignore)
+        max_size = self._config.max_file_size_bytes
+        deadline = monotonic() + time_budget_seconds
+
+        uncovered: list[str] = []
+        checked_dirs = 0
+        on_disk = 0
+        capped = False
+        for directory in directories:
+            if checked_dirs >= max_dirs or monotonic() > deadline:
+                capped = True
+                break
+            checked_dirs += 1
+            try:
+                entries = list(os.scandir(root / directory if directory else root))
+            except OSError:  # unreadable or raced away: not evidence of anything
+                continue
+            for entry in entries:
+                try:
+                    if not entry.is_file():
+                        continue
+                except OSError:
+                    continue
+                name = entry.name
+                rel = f"{directory}/{name}" if directory else name
+                if not self.indexes(name) or name in LOCKFILE_NAMES:
+                    continue
+                if _matches_patterns(rel, name, excludes):
+                    continue
+                if gitignore and _gitignored(rel, gitignore):
+                    continue
+                on_disk += 1
+                if rel in indexed:
+                    continue
+                try:
+                    if entry.stat().st_size > max_size:
+                        continue  # skipped at index time by policy, not by accident
+                except OSError:
+                    continue
+                if self._config.skip_generated and _is_generated_file(
+                    Path(entry.path), name, self._config.generated_patterns
+                ):
+                    continue
+                uncovered.append(rel)
+
+        uncovered.sort()
+        return {
+            "files_indexed": len(indexed),
+            "dirs_checked": checked_dirs,
+            "dirs_total": len(directories),
+            "files_on_disk": on_disk,
+            "not_indexed": uncovered[:max_examples],
+            "not_indexed_total": len(uncovered),
+            "capped": capped,
+        }
+
     def estimate_paths(self, root_path: Path, paths: list[str]) -> dict[str, object]:
         """Preview-style token/node stats for a specific set of changed paths.
 
@@ -1061,7 +1374,6 @@ class GraphBuilder:
         token/node proxy so :func:`estimate_index_cost` reads the result the same way.
         """
         root = root_path.resolve()
-        extensions = self.extensions
         total_bytes = 0
         total_lines = 0
         seen: set[str] = set()
@@ -1072,7 +1384,7 @@ class GraphBuilder:
                 rel = str(f.relative_to(root))
             except ValueError:
                 continue
-            if rel in seen or f.suffix not in extensions or f.name in LOCKFILE_NAMES:
+            if rel in seen or not self.indexes(f) or f.name in LOCKFILE_NAMES:
                 continue
             seen.add(rel)
             try:
@@ -1120,7 +1432,42 @@ _PREVIEW_LANGUAGES: dict[str, str] = {
     ".ini": "ini",
     ".cfg": "ini",
     ".conf": "ini",
+    # Shell and operator scripts group as one "shell" line: .sh/.bash/.zsh answer the same
+    # question and a preview that splits them reads as three unrelated file types.
+    ".sh": "shell",
+    ".bash": "shell",
+    ".zsh": "shell",
+    ".fish": "shell",
+    ".ps1": "powershell",
 }
+
+# Name-routed documents (see config.DEFAULT_DOCUMENT_FILENAMES). Without an entry here a
+# Makefile would be priced under "other", which reads as "something unrecognized slipped
+# into the scan" in the one output whose job is to make the bill legible before it is paid.
+_PREVIEW_LANGUAGES_BY_NAME: dict[str, str] = {
+    "Makefile": "make",
+    "makefile": "make",
+    "GNUmakefile": "make",
+    "Dockerfile": "docker",
+    "Containerfile": "docker",
+    "Justfile": "just",
+    "justfile": "just",
+    "Procfile": "procfile",
+    "Rakefile": "ruby",
+    "Brewfile": "ruby",
+    ".env.example": "dotenv",
+    ".env.sample": "dotenv",
+    ".env.template": "dotenv",
+    ".env.dist": "dotenv",
+}
+
+
+def _language_for_file(path: Path) -> str:
+    """The preview's language bucket for one file: by exact name first, then by suffix."""
+    by_name = _PREVIEW_LANGUAGES_BY_NAME.get(path.name)
+    if by_name:
+        return by_name
+    return _language_for_suffix(path.suffix)
 
 
 def _language_for_suffix(suffix: str) -> str:
@@ -1144,6 +1491,36 @@ def _load_ignore_specs(root: Path, respect_gitignore: bool) -> dict[str, pathspe
                 continue
             rel_dir = f.parent.relative_to(root).as_posix()
             per_dir["" if rel_dir == "." else rel_dir].extend(lines)
+    return {k: pathspec.PathSpec.from_lines("gitwildmatch", v) for k, v in per_dir.items()}
+
+
+def _ancestor_ignore_specs(
+    root: Path, directories: Sequence[str], respect_gitignore: bool
+) -> dict[str, pathspec.PathSpec]:
+    """The ignore specs that can govern *directories*: their own, and every ancestor's.
+
+    :func:`_load_ignore_specs` compiles the whole tree, which is right for a scan that is
+    about to walk the whole tree and wrong for a bounded check — the rglob alone would visit
+    every ignored directory the check is careful not to open. A ``.gitignore`` can only
+    affect files at or below its own directory, so reading the chain from the root down to
+    each checked directory is the same answer at a fraction of the cost.
+    """
+    names = [".inflorescenceignore"] + ([".gitignore"] if respect_gitignore else [])
+    per_dir: dict[str, list[str]] = defaultdict(list)
+    seen: set[str] = set()
+    for directory in directories:
+        segments = directory.split("/") if directory else []
+        for depth in range(len(segments) + 1):
+            base = "/".join(segments[:depth])
+            if base in seen:
+                continue
+            seen.add(base)
+            for name in names:
+                try:
+                    lines = (root / base / name).read_text(encoding="utf-8", errors="ignore").splitlines()
+                except OSError:
+                    continue
+                per_dir[base].extend(lines)
     return {k: pathspec.PathSpec.from_lines("gitwildmatch", v) for k, v in per_dir.items()}
 
 
@@ -1207,6 +1584,20 @@ def _normalize_path_pattern(pattern: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized
+
+
+def _refused_by_scope(rel_path: str, includes: list[str], excludes: list[str]) -> bool:
+    """True when an explicit include/exclude scope would keep this file out of the scan.
+
+    Mirrors the two scope tests in :meth:`GraphBuilder._scan_files` — an exclude match on the
+    file or any directory above it, or an include list that does not cover it. Nothing else
+    the scan filters on (.gitignore, size, generated) is consulted: see
+    :meth:`GraphBuilder._plan_reconcile` for why only the operator's own patterns may delete.
+    """
+    name = rel_path.rsplit("/", 1)[-1]
+    if excludes and _matches_patterns(rel_path, name, excludes):
+        return True
+    return bool(includes) and not _matches_patterns(rel_path, name, includes)
 
 
 def _matches_patterns(rel_path: str, name: str, patterns: list[str]) -> bool:

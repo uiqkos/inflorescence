@@ -24,6 +24,17 @@ def user_env_file() -> Path:
     """The dotenv file ``init`` writes, readable from any working directory."""
     return user_config_dir() / ".env"
 
+
+def feedback_file() -> Path:
+    """Where ``send_feedback`` appends agent-written notes about using this server.
+
+    Next to the user's ``.env`` rather than inside any repository: feedback is about the
+    server, not about the project that happened to be open, and every session — whatever
+    directory its client started the process in — must append to the same log. Overridable
+    with ``FEEDBACK_PATH``.
+    """
+    return user_config_dir() / "feedback.jsonl"
+
 DEFAULT_EXCLUDE_PATTERNS: list[str] = [
     "__pycache__",
     ".git",
@@ -95,6 +106,46 @@ DEFAULT_DOCUMENT_EXTENSIONS: list[str] = [
     ".ini",
     ".cfg",
     ".conf",
+    # shell and operator scripts — the runbook layer. A field report (10.09.2026) traced a
+    # whole failed research task to their absence: the task was "explain how a batch run
+    # is launched", and the exact invocation, every flag, and the reason for each deviation
+    # from the default recipe lived in a 38-line `scripts/nightly_run.sh` — including the
+    # mandatory-flag warning, which was a bash *comment*. The graph held 105 Python modules
+    # from that directory and not one of its nine shell scripts, so no query could reach
+    # them: not ranked low, absent. Teams put operational truth in these files precisely
+    # because they are executable; that makes them documentation, not noise.
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".fish",
+    ".ps1",
+]
+
+# Documents admitted by **exact filename** rather than by extension: the build and runbook
+# files that carry no suffix at all (``Makefile``, ``Dockerfile``) or whose suffix says
+# nothing useful (``.env.example`` → ``.example``). Same treatment as any other document —
+# one node, chunked body, no parsing.
+#
+# Exact names only, and never a bare ``.env``: a template committed for humans to copy
+# (``.env.example`` and its siblings) documents which variables exist, while ``.env`` itself
+# holds the filled-in secrets. Prefix matching would erase that distinction, so a variant
+# this list does not name (``Dockerfile.prod``, ``.env.local``) stays out until someone adds
+# it deliberately — via DOCUMENT_FILENAMES, which replaces this list wholesale.
+DEFAULT_DOCUMENT_FILENAMES: list[str] = [
+    "Makefile",
+    "makefile",
+    "GNUmakefile",
+    "Dockerfile",
+    "Containerfile",
+    "Justfile",
+    "justfile",
+    "Procfile",
+    "Rakefile",
+    "Brewfile",
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+    ".env.dist",
 ]
 
 # Dependency lock files, dropped from every scan **by name**, whatever the extension set or
@@ -206,23 +257,30 @@ class Settings(BaseSettings):
     max_file_size_bytes: int = 262144
     skip_generated: bool = True
     use_llm_summaries: bool = True
-    # Index non-code files (README and docs/**.md, but also stylesheets, HTML and
-    # JSON/YAML/TOML/INI configuration) alongside code. They are the part of a repository
-    # that says *why* and *with what settings*, which no amount of AST parsing recovers —
-    # but they are also summarized and embedded like code, so this is an off switch for a
-    # repo where they are huge, generated, or not worth the spend. Narrow
-    # DOCUMENT_EXTENSIONS instead of turning this off to keep only some of them.
+    # Index non-code files (README and docs/**.md, but also stylesheets, HTML,
+    # JSON/YAML/TOML/INI configuration, shell scripts and Makefile/Dockerfile) alongside
+    # code. They are the part of a repository that says *why*, *with what settings* and
+    # *how it is actually run*, which no amount of AST parsing recovers — but they are also
+    # summarized and embedded like code, so this is an off switch for a repo where they are
+    # huge, generated, or not worth the spend. Narrow DOCUMENT_EXTENSIONS /
+    # DOCUMENT_FILENAMES instead of turning this off to keep only some of them.
     index_documents: bool = True
     document_extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_DOCUMENT_EXTENSIONS))
+    # Documents matched by exact filename (see DEFAULT_DOCUMENT_FILENAMES). Setting this
+    # replaces the default list rather than adding to it, same as DOCUMENT_EXTENSIONS.
+    document_filenames: list[str] = Field(default_factory=lambda: list(DEFAULT_DOCUMENT_FILENAMES))
     # Rows per UNWIND write to Memgraph (nodes/edges/chunks/summaries/checksums).
     db_write_batch_size: int = 500
 
     # Summarization
     summary_max_source_chars: int = 12000
 
-    # Cost guard (indexing). A first-time index AND every background watcher update are
-    # gated by this cap (INV-10: money is spent consciously, and background must not silently
-    # outspend an explicit index). Default $10 clears normal and even large repos (a full index
+    # Cost guard (indexing). Every run that would spend is gated by this cap (INV-10: money is
+    # spent consciously, and background must not silently outspend an explicit index): a
+    # first-time index priced over the whole tree, and both a re-index and a background watcher
+    # update priced over just the files whose content moved. Re-indexes are gated because an
+    # indexer change — one new DOCUMENT_EXTENSIONS entry — can make thousands of files newly
+    # billable behind a call that reads like a cheap refresh. Default $10 clears normal and even large repos (a full index
     # of a ~200-file Go service measured well under $1) while stopping a runaway monorepo, or a
     # thousand-file `git checkout` flush, cold. Raise it (env MAX_INDEX_COST_USD / --max-cost / max_cost_usd),
     # or set to null to disable the cap entirely. Prices default to the v0.1 default models
@@ -281,6 +339,23 @@ class Settings(BaseSettings):
 
     # Watcher
     watcher_debounce_seconds: float = 5.0
+    # How often the watch daemon re-reads the registry (`inflorescence watch add/rm` writes it
+    # from another process, so this is the delay before a newly added project is followed) and
+    # re-checks that every root it watches is still on disk. Cheap: one row per indexed project.
+    watch_refresh_seconds: float = 30.0
+    # Whether the daemon reconciles a project against disk when it adopts it. This is what
+    # makes "the watcher was down all night" recoverable rather than permanent: without it the
+    # index keeps whatever staleness it accumulated while nothing was watching, and only files
+    # touched *after* the daemon started are ever repaired. The catch-up is an ordinary
+    # incremental re-index, so MAX_INDEX_COST_USD gates it exactly like a manual one.
+    watch_catch_up: bool = True
+
+    # Feedback. Where the send_feedback MCP tool appends what consuming agents report about
+    # using this server (JSONL, append-only, read back with `inflorescence feedback`).
+    # Unset means the per-user default, config.feedback_file() — deliberately a plain file
+    # and not a Memgraph node: the reports worth having most are the ones written while the
+    # database is unreachable.
+    feedback_path: str | None = None
 
     # Logging
     log_level: str = "INFO"

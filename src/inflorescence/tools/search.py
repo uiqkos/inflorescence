@@ -12,6 +12,7 @@ from inflorescence.config import Settings
 from inflorescence.db.repository import GraphRepository
 from inflorescence.project_manager import ProjectManager
 from inflorescence.rag.embeddings import EmbeddingClient
+from inflorescence.tools.coverage import note_coverage
 from inflorescence.tools.freshness import build_checker, describe_origin, unchecked_empty_page
 from inflorescence.tools.gates import ensure_indexed, normalize_node_types
 from inflorescence.tools.path_filters import PathFilterConfig, filter_records_by_path, is_test_path
@@ -254,7 +255,18 @@ def register_search_tools(
         A hit whose *path* looks like test code (``tests/``, ``spec/``, ``test_*.py``,
         ``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``"is_test": true``. That
         is a heuristic over the path only — it never reads the file — so treat it as a hint,
-        not a verdict. ``include_tests=false`` drops those hits before pagination.
+        not a verdict.
+
+        RECOMMENDED: pass ``include_tests=false`` whenever you are looking for an
+        implementation. A test's summary restates the vocabulary of the code it exercises
+        ("Verifies that retrying a failed upload reuses the original storage key"), so
+        tests out-rank that code on exactly the "what does X do" queries used to find it —
+        a field report measured 11 of 15 hits from
+        ``tests/`` while the runner named in the query never reached page 1. Example:
+        ``search_semantic(directory="/repo", query="job runner start stop",
+        include_tests=false)``. For a layout the heuristic does not catch, name the
+        directories instead: ``exclude_paths=["tests/**", "fixtures/**"]``. Keep the default
+        when the test IS what you want — a usage example, an expected behaviour, a repro.
 
         A vector search always returns its nearest neighbours, so low scores still look like
         results: a hit below the weak-similarity threshold carries ``"weak": true``, and
@@ -273,6 +285,18 @@ def register_search_tools(
         worktrees of this checkout are NOT in this index — their branch state is elsewhere;
         ask with ``directory`` set to the worktree itself, which indexes it almost for free
         (no LLM spend).
+
+        An EMPTY first page carries one more block, ``meta.index_coverage``: the index's file
+        count plus a bounded re-check of the directories it knows against the filesystem. It
+        either names files that are on disk and NOT in this index — an empty page over one of
+        those is a coverage gap, not absence: read them directly and ``index_directory`` to
+        make them queryable — or says nothing under that scope is missing, which is what
+        licenses the conclusion "this really does not exist here". Coverage is not freshness:
+        a file created since the last index run has no node to flag, so ``index_freshness``
+        stays clean and the ``watcher`` line stays reassuring while the file sits unqueryable.
+        ``meta.nested_checkouts`` appears when the files on the page live in an independent
+        git checkout inside this tree (a submodule or vendored repo on its own branch) —
+        that checkout's HEAD, not ``answered_from``, is the code you are reading.
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -294,7 +318,7 @@ def register_search_tools(
         truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types, include_tests)
         rows = _drop_test_rows(_filter_node_types(filter_records_by_path(raw_rows, filters), node_types), include_tests)
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(_flag_weak(_page_hits(
+        return await note_coverage(checker.stamp(_flag_weak(_page_hits(
             _code_hits(rows, min_score),
             bounded_limit,
             bounded_offset,
@@ -306,7 +330,7 @@ def register_search_tools(
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
-        ), settings.semantic_weak_threshold))
+        ), settings.semantic_weak_threshold)), manager, directory, checker)
 
     @mcp.tool()
     async def search_semantic(
@@ -345,7 +369,18 @@ def register_search_tools(
         A hit whose *path* looks like test code (``tests/``, ``spec/``, ``test_*.py``,
         ``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``"is_test": true``. That
         is a heuristic over the path only — it never reads the file — so treat it as a hint,
-        not a verdict. ``include_tests=false`` drops those hits before pagination.
+        not a verdict.
+
+        RECOMMENDED: pass ``include_tests=false`` whenever you are looking for an
+        implementation. A test's summary restates the vocabulary of the code it exercises
+        ("Verifies that retrying a failed upload reuses the original storage key"), so
+        tests out-rank that code on exactly the "what does X do" queries used to find it —
+        a field report measured 11 of 15 hits from
+        ``tests/`` while the runner named in the query never reached page 1. Example:
+        ``search_semantic(directory="/repo", query="job runner start stop",
+        include_tests=false)``. For a layout the heuristic does not catch, name the
+        directories instead: ``exclude_paths=["tests/**", "fixtures/**"]``. Keep the default
+        when the test IS what you want — a usage example, an expected behaviour, a repro.
 
         A vector search always returns its nearest neighbours, so low scores still look like
         results: a hit below the weak-similarity threshold carries ``"weak": true``, and
@@ -364,6 +399,18 @@ def register_search_tools(
         worktrees of this checkout are NOT in this index — their branch state is elsewhere;
         ask with ``directory`` set to the worktree itself, which indexes it almost for free
         (no LLM spend).
+
+        An EMPTY first page carries one more block, ``meta.index_coverage``: the index's file
+        count plus a bounded re-check of the directories it knows against the filesystem. It
+        either names files that are on disk and NOT in this index — an empty page over one of
+        those is a coverage gap, not absence: read them directly and ``index_directory`` to
+        make them queryable — or says nothing under that scope is missing, which is what
+        licenses the conclusion "this really does not exist here". Coverage is not freshness:
+        a file created since the last index run has no node to flag, so ``index_freshness``
+        stays clean and the ``watcher`` line stays reassuring while the file sits unqueryable.
+        ``meta.nested_checkouts`` appears when the files on the page live in an independent
+        git checkout inside this tree (a submodule or vendored repo on its own branch) —
+        that checkout's HEAD, not ``answered_from``, is the code you are reading.
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -385,7 +432,7 @@ def register_search_tools(
         truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types, include_tests)
         rows = _drop_test_rows(_filter_node_types(filter_records_by_path(raw_rows, filters), node_types), include_tests)
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(_flag_weak(_page_hits(
+        return await note_coverage(checker.stamp(_flag_weak(_page_hits(
             _summary_hits(rows, min_score),
             bounded_limit,
             bounded_offset,
@@ -397,7 +444,7 @@ def register_search_tools(
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
-        ), settings.semantic_weak_threshold))
+        ), settings.semantic_weak_threshold)), manager, directory, checker)
 
     @mcp.tool()
     async def search_hybrid(
@@ -437,7 +484,18 @@ def register_search_tools(
         A hit whose *path* looks like test code (``tests/``, ``spec/``, ``test_*.py``,
         ``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``"is_test": true``. That
         is a heuristic over the path only — it never reads the file — so treat it as a hint,
-        not a verdict. ``include_tests=false`` drops those hits before pagination.
+        not a verdict.
+
+        RECOMMENDED: pass ``include_tests=false`` whenever you are looking for an
+        implementation. A test's summary restates the vocabulary of the code it exercises
+        ("Verifies that retrying a failed upload reuses the original storage key"), so
+        tests out-rank that code on exactly the "what does X do" queries used to find it —
+        a field report measured 11 of 15 hits from
+        ``tests/`` while the runner named in the query never reached page 1. Example:
+        ``search_semantic(directory="/repo", query="job runner start stop",
+        include_tests=false)``. For a layout the heuristic does not catch, name the
+        directories instead: ``exclude_paths=["tests/**", "fixtures/**"]``. Keep the default
+        when the test IS what you want — a usage example, an expected behaviour, a repro.
 
         A vector search always returns its nearest neighbours, so low scores still look like
         results: a hit below the weak-similarity threshold carries ``"weak": true``, and
@@ -456,6 +514,18 @@ def register_search_tools(
         worktrees of this checkout are NOT in this index — their branch state is elsewhere;
         ask with ``directory`` set to the worktree itself, which indexes it almost for free
         (no LLM spend).
+
+        An EMPTY first page carries one more block, ``meta.index_coverage``: the index's file
+        count plus a bounded re-check of the directories it knows against the filesystem. It
+        either names files that are on disk and NOT in this index — an empty page over one of
+        those is a coverage gap, not absence: read them directly and ``index_directory`` to
+        make them queryable — or says nothing under that scope is missing, which is what
+        licenses the conclusion "this really does not exist here". Coverage is not freshness:
+        a file created since the last index run has no node to flag, so ``index_freshness``
+        stays clean and the ``watcher`` line stays reassuring while the file sits unqueryable.
+        ``meta.nested_checkouts`` appears when the files on the page live in an independent
+        git checkout inside this tree (a submodule or vendored repo on its own branch) —
+        that checkout's HEAD, not ``answered_from``, is the code you are reading.
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -505,7 +575,7 @@ def register_search_tools(
             if hit["source_type"] != "hybrid" and hit["matches"]:
                 hit["source_type"] = "hybrid"
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(_flag_weak(_page_hits(
+        return await note_coverage(checker.stamp(_flag_weak(_page_hits(
             _cap_matches(hits),
             bounded_limit,
             bounded_offset,
@@ -517,7 +587,7 @@ def register_search_tools(
                 "path_filters": filters.meta(),
             },
             truncated=truncated,
-        ), settings.semantic_weak_threshold))
+        ), settings.semantic_weak_threshold)), manager, directory, checker)
 
     @mcp.tool()
     async def search_text(
@@ -565,7 +635,18 @@ def register_search_tools(
         A hit whose *path* looks like test code (``tests/``, ``spec/``, ``test_*.py``,
         ``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``"is_test": true``. That
         is a heuristic over the path only — it never reads the file — so treat it as a hint,
-        not a verdict. ``include_tests=false`` drops those hits before pagination.
+        not a verdict.
+
+        RECOMMENDED: pass ``include_tests=false`` whenever you are looking for an
+        implementation. A test's summary restates the vocabulary of the code it exercises
+        ("Verifies that retrying a failed upload reuses the original storage key"), so
+        tests out-rank that code on exactly the "what does X do" queries used to find it —
+        a field report measured 11 of 15 hits from
+        ``tests/`` while the runner named in the query never reached page 1. Example:
+        ``search_semantic(directory="/repo", query="job runner start stop",
+        include_tests=false)``. For a layout the heuristic does not catch, name the
+        directories instead: ``exclude_paths=["tests/**", "fixtures/**"]``. Keep the default
+        when the test IS what you want — a usage example, an expected behaviour, a repro.
 
         ``meta.answered_from`` names the tree this answer came from: path, branch @ short
         commit, and — for a git worktree — the checkout it belongs to.
@@ -578,6 +659,18 @@ def register_search_tools(
         worktrees of this checkout are NOT in this index — their branch state is elsewhere;
         ask with ``directory`` set to the worktree itself, which indexes it almost for free
         (no LLM spend).
+
+        An EMPTY first page carries one more block, ``meta.index_coverage``: the index's file
+        count plus a bounded re-check of the directories it knows against the filesystem. It
+        either names files that are on disk and NOT in this index — an empty page over one of
+        those is a coverage gap, not absence: read them directly and ``index_directory`` to
+        make them queryable — or says nothing under that scope is missing, which is what
+        licenses the conclusion "this really does not exist here". Coverage is not freshness:
+        a file created since the last index run has no node to flag, so ``index_freshness``
+        stays clean and the ``watcher`` line stays reassuring while the file sits unqueryable.
+        ``meta.nested_checkouts`` appears when the files on the page live in an independent
+        git checkout inside this tree (a submodule or vendored repo on its own branch) —
+        that checkout's HEAD, not ``answered_from``, is the code you are reading.
         """
         # Argument validation first: rejecting a typo'd node type must not trigger the
         # manager's inline (donor-seeded) index of a fresh worktree.
@@ -603,7 +696,9 @@ def register_search_tools(
             # Nothing to search, so nothing to hash — but the blocks still ship, since a
             # caller may only read the item flags as "fresh" if they are always present.
             meta["answered_from"] = describe_origin(Path(directory).resolve())
-            meta["index_freshness"] = unchecked_empty_page(directory)
+            meta["index_freshness"] = unchecked_empty_page(
+                directory, await repo.get_watch_state(project)
+            )
             return _page_hits([], bounded_limit, bounded_offset, meta)
         try:
             summary_rows = await repo.search_summary_text(project, text_query, top_k)
@@ -629,10 +724,10 @@ def register_search_tools(
         code_rows = _drop_test_rows(_filter_node_types(filter_records_by_path(code_rows, filters), node_types), include_tests)
 
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(_page_hits(
+        return await note_coverage(checker.stamp(_page_hits(
             _cap_matches(_merge_text_hits(summary_rows, symbol_rows, code_rows, min_score)),
             bounded_limit,
             bounded_offset,
             meta,
             truncated=truncated,
-        ))
+        )), manager, directory, checker)

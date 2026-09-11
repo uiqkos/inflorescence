@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 
 from inflorescence.config import (
     DEFAULT_DOCUMENT_EXTENSIONS,
+    DEFAULT_DOCUMENT_FILENAMES,
     DEFAULT_EXCLUDE_PATTERNS,
     GENERATED_FILE_PATTERNS,
     Settings,
@@ -248,12 +249,14 @@ class IndexerConfig(BaseModel):
     generated_patterns: list[str] = Field(default_factory=lambda: list(GENERATED_FILE_PATTERNS))
     use_llm_summaries: bool = True
     use_llm_fallback_parser: bool = True
-    # Documents — prose (.md/.txt/...), styles (.css/.scss/...), markup (.html) and config
-    # (.json/.yaml/.toml/.ini/...) — are scanned, stored as one node per file, and chunked
-    # with overlap. Turning this off removes their extensions from the scan entirely, so
-    # nothing about them is read, summarized, or embedded.
+    # Documents — prose (.md/.txt/...), styles (.css/.scss/...), markup (.html), config
+    # (.json/.yaml/.toml/.ini/...), shell scripts (.sh/.bash/...) and the build files named
+    # rather than suffixed (Makefile, Dockerfile, .env.example) — are scanned, stored as one
+    # node per file, and chunked with overlap. Turning this off removes their extensions and
+    # filenames from the scan entirely, so nothing about them is read, summarized, or embedded.
     index_documents: bool = True
     document_extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_DOCUMENT_EXTENSIONS))
+    document_filenames: list[str] = Field(default_factory=lambda: list(DEFAULT_DOCUMENT_FILENAMES))
     enabled_languages: list[str] = Field(
         default_factory=lambda: ["python", "javascript", "typescript", "go", "rust"]
     )
@@ -286,6 +289,7 @@ class IndexerConfig(BaseModel):
             use_llm_summaries=settings.use_llm_summaries,
             index_documents=settings.index_documents,
             document_extensions=settings.document_extensions,
+            document_filenames=settings.document_filenames,
             use_scip_semantic=settings.use_scip_semantic,
             scip_timeout_seconds=settings.scip_timeout_seconds,
             scip_runner=settings.scip_runner,

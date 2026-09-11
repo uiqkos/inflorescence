@@ -29,7 +29,12 @@ import pytest
 from inflorescence.code_indexer.graph_builder import GraphBuilder
 from inflorescence.code_indexer.models import CodeNode, EdgeType, IndexerConfig, NodeType
 from inflorescence.code_indexer.parser.document_parser import DocumentParser
-from inflorescence.config import DEFAULT_DOCUMENT_EXTENSIONS, LOCKFILE_NAMES, Settings
+from inflorescence.config import (
+    DEFAULT_DOCUMENT_EXTENSIONS,
+    DEFAULT_DOCUMENT_FILENAMES,
+    LOCKFILE_NAMES,
+    Settings,
+)
 from inflorescence.db.repository import _NODE_TYPE_LABEL_BY_VALUE
 from inflorescence.rag.chunker import Chunker
 from inflorescence.rag.config import RAGConfig
@@ -346,6 +351,16 @@ TSCONFIG_JSON = """{
 }
 """
 
+# A runbook script of the shape that motivated admitting .sh: the operative knowledge is the
+# flag list and the comment above it, neither of which exists anywhere else in the repo.
+RUN_SH = """#!/usr/bin/env bash
+set -euo pipefail
+PY=${PY:-python3}
+# --persist-batch 50 is MANDATORY: without it results are lost on a disconnect.
+QUEUE_STATE_FILE=out/nightly/state.json PYTHONPATH=. "$PY" \\
+  -m scripts.runner start --run-id nightly --persist-batch 50
+"""
+
 COMPOSE_YAML = """services:
   memgraph:
     image: memgraph/memgraph-mage:latest
@@ -370,6 +385,20 @@ _NEW_DOCUMENT_FILES: dict[str, tuple[str, str]] = {
     ".ini": ("pytest.ini", "[pytest]\nasyncio_mode = auto\n"),
     ".cfg": ("setup.cfg", "[flake8]\nmax-line-length = 100\n"),
     ".conf": ("nginx.conf", "server {\n  listen 80;\n}\n"),
+    ".sh": ("scripts/nightly_run.sh", RUN_SH),
+    ".bash": ("scripts/lib.bash", "set -euo pipefail\nlog() { echo \"$@\" >&2; }\n"),
+    ".zsh": ("scripts/dev.zsh", "autoload -Uz compinit\ncompinit\n"),
+    ".fish": ("scripts/dev.fish", "set -x PYTHONPATH .\n"),
+    ".ps1": ("scripts/dev.ps1", "$env:PYTHONPATH = '.'\n"),
+}
+
+# The same idea for the files a suffix cannot identify at all.
+_NAMED_DOCUMENT_FILES: dict[str, tuple[str, str]] = {
+    "Makefile": ("Makefile", "index:\n\tpython -m scripts.runner start\n"),
+    "Dockerfile": ("Dockerfile", "FROM python:3.12-slim\nCMD [\"python\", \"-m\", \"app\"]\n"),
+    "Justfile": ("Justfile", "run:\n    python -m app\n"),
+    "Procfile": ("Procfile", "web: python -m app\n"),
+    ".env.example": (".env.example", "OPENROUTER_API_KEY=\nLLM_MODEL=gemini-2.5-flash-lite\n"),
 }
 
 
@@ -386,6 +415,73 @@ def test_styles_markup_and_config_are_document_extensions(extension: str) -> Non
     assert extension in GraphBuilder(repo=None, llm=None, config=_NO_LLM).extensions
 
 
+@pytest.mark.parametrize("name", sorted(_NAMED_DOCUMENT_FILES))
+def test_build_and_runbook_files_are_admitted_by_exact_name(name: str) -> None:
+    """``Makefile`` and ``Dockerfile`` have no suffix, so the suffix route can never see them.
+
+    Every stage keys off the registry, and until it could route by name these files were as
+    absent as .sh once was — the walk never opened them.
+    """
+    assert name in DEFAULT_DOCUMENT_FILENAMES
+    assert name in DocumentParser().get_supported_filenames()
+    builder = GraphBuilder(repo=None, llm=None, config=_NO_LLM)
+    assert name in builder.indexable_filenames
+    assert builder.indexes(f"scripts/{name}") is True
+
+
+def test_a_shell_runbook_is_scanned_summarized_and_chunked(tmp_path: Path) -> None:
+    """The file the field report was about: flags and a comment that exist nowhere else.
+
+    A task to explain "how is a batch run launched" failed against a graph holding 105
+    Python modules from ``scripts/`` and none of its nine shell scripts. What the answer
+    needed — the exact invocation and a bash comment marking a mandatory flag — is text, and
+    text is precisely what a document node makes searchable.
+    """
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "nightly_run.sh").write_text(RUN_SH, encoding="utf-8")
+
+    builder = GraphBuilder(repo=None, llm=None, config=_NO_LLM)
+    scanned, _ = builder._scan_files(tmp_path)
+    nodes, edges = DocumentParser().parse_file(tmp_path / "scripts" / "nightly_run.sh", tmp_path)
+    chunks = Chunker().chunk_repository(tmp_path, nodes)
+
+    assert [f.name for f in scanned] == ["nightly_run.sh"]
+    assert [(n.node_type, n.id) for n in nodes] == [(NodeType.DOCUMENT, "scripts/nightly_run.sh")]
+    assert edges == []
+    assert {c.language for c in chunks} == {"shell"}
+    assert any("--persist-batch 50 is MANDATORY" in c.content for c in chunks)
+    assert any("QUEUE_STATE_FILE" in c.content for c in chunks)
+
+
+def test_a_named_build_file_is_scanned_and_chunked_under_its_own_language(tmp_path: Path) -> None:
+    """Name-routed files reach the chunker too, labelled by what they are, not by "text"."""
+    (tmp_path / "Makefile").write_text("index:\n\tpython -m scripts.runner start\n", encoding="utf-8")
+
+    builder = GraphBuilder(repo=None, llm=None, config=_NO_LLM)
+    scanned, _ = builder._scan_files(tmp_path)
+    nodes, _ = DocumentParser().parse_file(tmp_path / "Makefile", tmp_path)
+    chunks = Chunker().chunk_repository(tmp_path, nodes)
+
+    assert [f.name for f in scanned] == ["Makefile"]
+    assert {c.language for c in chunks} == {"make"}
+    assert any("scripts.runner" in c.content for c in chunks)
+
+
+def test_a_dotenv_template_is_indexed_but_a_real_dotenv_is_not(tmp_path: Path) -> None:
+    """``.env.example`` documents which variables exist; ``.env`` holds their filled-in secrets.
+
+    Exact-name matching is what keeps these apart — a ``.env*`` prefix rule would index the
+    secrets, and the two files sit side by side in every repo that has either.
+    """
+    (tmp_path / ".env.example").write_text("OPENROUTER_API_KEY=\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("OPENROUTER_API_KEY=not-a-real-secret\n", encoding="utf-8")
+    (tmp_path / ".env.local").write_text("OPENROUTER_API_KEY=also-not-a-real-secret\n", encoding="utf-8")
+
+    scanned, _ = GraphBuilder(repo=None, llm=None, config=_NO_LLM)._scan_files(tmp_path)
+
+    assert [f.name for f in scanned] == [".env.example"]
+
+
 @pytest.mark.parametrize("extension", [".xml", ".vue", ".svelte", ".csv", ".env", ".lock", ".svg"])
 def test_deliberately_excluded_extensions_stay_out(extension: str) -> None:
     """Pinned decisions, so widening one of them is a conscious edit rather than a drift.
@@ -394,7 +490,8 @@ def test_deliberately_excluded_extensions_stay_out(extension: str) -> None:
     generated resources) whose tag soup chunks and embeds badly, and its hand-written uses
     belong to toolchains with no parser here. ``.vue``/``.svelte`` are *code* with no parser
     — indexing them as prose would claim coverage the graph does not have. ``.csv`` is data
-    with no prose at all, ``.env`` holds secrets, ``.lock``/``.svg`` are generated bulk.
+    with no prose at all, ``.env`` holds secrets (only its committed *template* is indexed,
+    by exact name), ``.lock``/``.svg`` are generated bulk.
     """
     assert extension not in DEFAULT_DOCUMENT_EXTENSIONS
 

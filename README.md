@@ -1,355 +1,249 @@
-<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/specimen.svg">
+  <img alt="FIG. 00 SPECIMEN — this repository indexed by itself: src/ and the root documents drawn as nested CONTAINS rings, with the CALLS, IMPORTS and INHERITS edges bundled through the centres of the discs they cross." src="assets/specimen-paper.svg">
+</picture>
 
-# Inflorescence
+# *inflorescence*
 
-**Deep, structured understanding of any codebase — for your AI assistant.**
+MCP server. Your repository as a graph: parsed, summarized, embedded, kept live.
 
-An MCP server that turns a repository into a queryable **code graph** (AST → Memgraph),
-layers **dual RAG** and **BM25** search on top, and keeps it all **live** as you edit.
+The plate above is not an illustration. It is this repository as the server holds it, rendered
+from the export of its own index. Every ring is a `CONTAINS` edge, every curve is a `CALLS`,
+`IMPORTS` or `INHERITS` edge bundled through the discs it crosses, and every number printed on
+it is counted from the export.
 
-![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
-![MCP](https://img.shields.io/badge/MCP-server-8A2BE2)
-![Memgraph](https://img.shields.io/badge/graph-Memgraph-FB6E00)
-![License](https://img.shields.io/badge/license-MIT-2EA043)
-[![CI](https://github.com/uiqkos/inflorescence/actions/workflows/ci.yml/badge.svg)](https://github.com/uiqkos/inflorescence/actions/workflows/ci.yml)
+| | edge | what it records |
+|---|---|---|
+| `#FF3AA8` | `CALLS` | a call site, resolved to the entity it reaches; carries `resolution` |
+| `#8B7BFF` | `IMPORTS` | a module pulling in another module, a document, or an `External` package |
+| `#E6FF3D` | `INHERITS` / `IMPLEMENTS` | a base class or interface, inside the project or `External` |
+| `#EBE8E1` | `CONTAINS` | the containment spine: directory → module → class → method |
+| `#000000` | `HAS_CHUNK` | an entity to the overlapping windows of its own text |
 
-</div>
-
-![Inflorescence indexing its own call graph](assets/dashboard-graph.png)
-
-<div align="center"><sub>Inflorescence indexing itself — 80 modules and the 393 calls, imports and inheritances between them.</sub></div>
+Those five are the whole vocabulary of the graph, and the whole palette of this document.
 
 ---
 
-Most assistants read a codebase one file at a time. **Inflorescence** gives them the whole
-shape at once: which function calls which, what a module *does* (not just what it says), and
-where a symbol lives — reachable through **12 MCP tools**, a **Cypher** console, and a visual
-**dashboard**.
+## FIG. 01 · PARSE
 
-It combines three views of your code, all kept in sync incrementally:
+One pass over the tree, in this order. Nothing later in the list runs if something earlier
+refuses.
 
-- **A code graph** — modules, classes, functions, methods and their real relationships
-  (`CALLS`, `IMPORTS`, `INHERITS`, `IMPLEMENTS`, `CONTAINS`), stored in Memgraph and queryable in Cypher.
-  `CALLS` edges carry provenance: compiler-grade resolution via SCIP indexers where the project
-  builds, a measured-precision syntactic ladder elsewhere — and calls that can't be resolved are
-  recorded on the caller (`external_calls` / `unresolved_calls`) instead of silently dropped.
-- **Meaning-based search** — LLM summaries and code chunks embedded into HNSW vector indexes,
-  so you can find code by *what it does* even when the wording differs.
-- **Exact keyword search** — BM25 full-text indexes over symbol names, signatures, summaries,
-  and raw code, for literal identifiers, string literals, and error text.
+1. **Scan.** Walk the root, honoring `.gitignore` (unless `RESPECT_GITIGNORE=false`),
+   `.inflorescenceignore` (always), `EXCLUDE_PATTERNS`, `MAX_FILE_SIZE_BYTES`, and
+   `SKIP_GENERATED`. Dependency lock files and linked git worktrees are dropped
+   unconditionally, before includes are even consulted.
+2. **Parse.** Python through the stdlib `ast` (with an LLM extractor as fallback for a file
+   that fails to parse); JavaScript, TypeScript, Go and Rust through tree-sitter; every
+   configured non-code extension through the document parser, which emits one node per file
+   and extracts no structure.
+3. **Resolve.** Cross-file `CALLS`, `IMPORTS`, `INHERITS`, `IMPLEMENTS`. See `RESOLUTION`
+   below for the ladder and for what happens to a call site that no rung can place.
+4. **Gate.** Price the run and compare it against the cap. See `FIG. 06 · COST`.
+5. **Summarize.** Bottom-up: leaf, then module, then directory. A node whose
+   `summary_input_hash` matches what the database already holds is reused, not re-sent.
+6. **Embed.** Code chunks (`CHUNK_SIZE` / `CHUNK_OVERLAP`, AST-aware) and summaries, into two
+   separate vector spaces.
+7. **Write.** Batched `UNWIND` into Memgraph, `DB_WRITE_BATCH_SIZE` rows at a time.
 
-## Highlights
+Indexing persists incrementally: entities are name-searchable right after parsing, summaries
+stream in batch by batch, and an interrupted run resumes without repeating LLM spend.
 
-| | |
+---
+
+## FIG. 02 · GRAPH
+
+Ten node types and five edge types, plus the chunks.
+
+```
+directory ──CONTAINS───▶ directory · module · document
+module    ──CONTAINS───▶ class · function
+class     ──CONTAINS───▶ method
+
+module    ──IMPORTS────▶ module · document · External
+class     ──INHERITS───▶ class · External
+class     ──IMPLEMENTS─▶ interface · External
+function  ──CALLS──────▶ function · method
+Code      ──HAS_CHUNK──▶ CodeChunk
+```
+
+| | values |
 |---|---|
-| **Multi-language parsing** | Python (stdlib `ast`), JavaScript / TypeScript / Go / Rust (tree-sitter); a Python file that fails to parse falls back to an LLM extractor |
-| **Documentation too** | READMEs, design notes and `docs/**.md` are indexed whole — one node per file, body split into overlapping chunks — so the *why* is searchable next to the code |
-| **Real relationship graph** | Cross-file call/import/inheritance resolution — not just a symbol dump |
-| **Dual RAG** | Code chunks *and* LLM summaries embedded separately, then fused and deduped per entity |
-| **3-level summaries** | node → module → directory hierarchical summaries, generated once and reused |
-| **Live incremental updates** | a file watcher re-indexes on save; unchanged summaries and embeddings are reused, so an edit costs pennies |
-| **Cost guard** | a first-time index is gated by a pre-flight dollar estimate you can cap |
-| **Batteries included** | one-command setup (`init`), a health check (`doctor`), and a web dashboard |
+| `node_types` | `module` `class` `function` `method` `directory` `interface` `enum` `struct` `trait` `document` |
+| relationship types | `CONTAINS` `CALLS` `IMPORTS` `INHERITS` `IMPLEMENTS` `HAS_CHUNK` |
+| node labels | `Code` + exactly one type label (`Module`, `Class`, …); `CodeChunk`; `External` |
+| `CALLS.resolution` | `semantic` `exact` `import` `field-type` `self` `same-module` `same-package` |
 
-## How it works
+Every entity carries `id`, `name`, `file_path`, `line_start` / `line_end`, `signature`,
+`docstring`, `summary`, `summary_input_hash`, `parent_id`, `checksum`, `calls_provenance`,
+`external_calls`, `unresolved_calls`, and its summary embedding. `graph_schema` returns this
+list at run time, which is what you should read before writing Cypher.
 
-```mermaid
-flowchart TD
-    A["AI assistant"] -->|"MCP over stdio"| S["MCP server · 12 tools"]
-    D["Dashboard<br/>127.0.0.1:8321"] --> R
-
-    S --> PM["ProjectManager"]
-    PM --> GB["GraphBuilder<br/>parse · resolve · summarize"]
-    PM --> RI["RAGIndexer<br/>chunk · embed"]
-    PM --> FW["FileWatcher<br/>debounce · reconcile"]
-    FW -.->|"on save"| PM
-
-    GB --> L["LLMClient"]
-    RI --> L
-    GB --> R["GraphRepository"]
-    RI --> R
-    S --> R
-
-    R --> MG[("Memgraph<br/>graph · HNSW vectors · BM25")]
-    L --> API["OpenRouter<br/>summaries · embeddings"]
-
-    classDef entry fill:#dbeafe,stroke:#2563eb,color:#1e293b
-    classDef core fill:#ede9fe,stroke:#7c3aed,color:#1e293b
-    classDef store fill:#ffedd5,stroke:#ea580c,color:#1e293b
-    classDef ext fill:#f1f5f9,stroke:#64748b,color:#1e293b
-    class A,D entry
-    class S,PM,GB,RI,FW,R,L core
-    class MG store
-    class API ext
-```
-
-Indexing walks the repo (honoring `.gitignore` / `.inflorescenceignore`, size limits, and
-generated-file skips), parses each file to nodes and edges, resolves cross-file relationships,
-generates hierarchical summaries, embeds everything, and writes it to Memgraph in batched
-transactions. Re-indexing only re-summarizes and re-embeds what actually changed:
-
-```mermaid
-flowchart LR
-    SCAN["Scan repository<br/>gitignore · size limit · generated-file skip"] --> PARSE
-    PARSE["Parse each file<br/>ast · tree-sitter · LLM fallback"] --> RESOLVE
-    RESOLVE["Resolve cross-file edges<br/>CALLS · IMPORTS · INHERITS · IMPLEMENTS"] --> GATE
-
-    GATE{"Estimated cost within<br/>MAX_INDEX_COST_USD?"}
-    GATE -->|no| STOP["Refuse before spending,<br/>report the estimate"]
-    GATE -->|yes| HASH
-
-    HASH{"Content hash<br/>changed?"}
-    HASH -->|unchanged| REUSE["Reuse stored summary<br/>and embeddings"]
-    HASH -->|changed| SUM["Summarize<br/>node → module → directory"]
-
-    SUM --> EMB["Embed<br/>code chunks + summaries"]
-    REUSE --> WRITE
-    EMB --> WRITE
-    WRITE["Batched UNWIND write"] --> MG[("Memgraph")]
-
-    classDef step fill:#ede9fe,stroke:#7c3aed,color:#1e293b
-    classDef gate fill:#fef9c3,stroke:#ca8a04,color:#1e293b
-    classDef halt fill:#fee2e2,stroke:#dc2626,color:#1e293b
-    classDef store fill:#ffedd5,stroke:#ea580c,color:#1e293b
-    class SCAN,PARSE,RESOLVE,SUM,EMB,REUSE,WRITE step
-    class GATE,HASH gate
-    class STOP halt
-    class MG store
-```
-
-### What the graph looks like
-
-```mermaid
-flowchart TD
-    DIR["Directory"] -->|CONTAINS| MOD["Module"]
-    DIR -->|CONTAINS| DOC["Document<br/>(README.md, notes.txt)"]
-    MOD -->|CONTAINS| CLS["Class / Struct"]
-    MOD -->|CONTAINS| FN["Function"]
-    CLS -->|CONTAINS| METH["Method"]
-    FN -->|HAS_CHUNK| CH["CodeChunk"]
-    DOC -->|HAS_CHUNK| CH
-
-    METH -.->|CALLS| FN
-    FN -.->|CALLS| FN
-    MOD -.->|IMPORTS| MOD
-    CLS -.->|INHERITS| CLS
-    CLS -.->|IMPLEMENTS| IFACE["Interface"]
-
-    MOD -.->|IMPORTS| EXT["External<br/>(net/http, pydantic)"]
-    CLS -.->|INHERITS| EXT
-
-    classDef container fill:#dbeafe,stroke:#2563eb,color:#1e293b
-    classDef entity fill:#ede9fe,stroke:#7c3aed,color:#1e293b
-    classDef chunk fill:#ffedd5,stroke:#ea580c,color:#1e293b
-    classDef ext fill:#fef9c3,stroke:#ca8a04,color:#1e293b
-    class DIR,MOD container
-    class CLS,FN,METH,IFACE,DOC entity
-    class CH chunk
-    class EXT ext
-```
-
-Solid edges are containment — the spine you traverse to browse the tree. Dashed edges are the
-real relationships between entities. Every node also carries its signature, docstring, source
-range and an embedded summary.
-
-**`Document`** nodes are whole non-code files — `README.md`, `docs/**.md`, `notes.txt`, but
-also `index.css`, `index.html`, `tsconfig.json`, `docker-compose.yml`, `pyproject.toml`. They
-sit in the containment tree beside modules, but they are leaves: a heading is not a symbol,
-nothing calls a paragraph, and a CSS rule is not a function — so no structure is invented
-above them. Their content reaches search as overlapping chunks of the file body, which is what
-makes `@media (prefers-reduced-motion)` in the middle of a stylesheet findable at all, and
-their summary is written by a prompt that asks what the file answers rather than what it calls.
-They own no outgoing edges, but code that imports one by path — `import './index.css'`,
+**`document` nodes** are non-code files indexed whole — prose, stylesheets, markup and
+configuration. They are leaves: a heading is not a symbol, nothing calls a paragraph, and a CSS
+rule is not a function, so no structure is invented above them. Their body reaches search as
+overlapping windows (`DOCUMENT_CHUNK_SIZE` / `DOCUMENT_CHUNK_OVERLAP`), which is what makes a
+`@media (prefers-reduced-motion)` block in the middle of a stylesheet findable at all. They own
+no outgoing edges, but code that imports one by path — `import './index.css'`,
 `import cfg from './config.json'` — points an `IMPORTS` edge at it, so "who pulls in this
-stylesheet" is a normal `get_related_entities(direction="incoming")` question.
-Filter them in or out like any other type — `search_semantic(..., node_types=["document"])`, or
-`node_types=["function", "method"]` to exclude them.
+stylesheet" is an ordinary `get_related_entities(direction="incoming")` call. Filter them in or
+out with `node_types=["document"]` like any other type.
 
-**`External`** nodes are the exception: a package the project imports or a base class it
-inherits from, which lives outside the indexed tree. They are deliberately *not* labelled
-`Code`, so they never appear in entity listings, counts, search or summaries — but they make
-the dependency graph traversable:
+**`External` nodes** are packages the project imports and base classes it inherits from,
+living outside the indexed tree. They are deliberately *not* labelled `Code`, so they never
+appear in entity listings, counts, search or summaries — but they make the dependency graph
+traversable:
 
 ```cypher
 MATCH (:Code {project: $project})-[:IMPORTS]->(e:External {project: $project})
 RETURN e.root AS dependency, count(*) AS uses ORDER BY uses DESC
 ```
 
-## Quick start
+---
+
+## FIG. 03 · SUMMARY
+
+Every entity gets one LLM-written summary, and it is what `search_semantic` searches. A
+container's summary is written from its children's summaries, so the hierarchy reads
+bottom-up: method → class → module → directory.
+
+Re-summarization is decided by a content hash, not by a timestamp. `summary_input_hash` is
+`H(source + signature + docstring)` for a leaf and `H(ordered child descriptors, each carrying
+that child's current summary)` for a container. A changed leaf therefore propagates exactly one
+path upward — the file, its directory, the root — and nothing else in the project is re-sent.
+
+On failure the previous summary is kept and the hash is cleared, so the node is dirty again
+next run: stale beats empty (INV-3). `USE_LLM_SUMMARIES=false` skips this stage entirely and
+builds a graph with code-chunk embeddings and no summaries.
+
+---
+
+## FIG. 04 · SEARCH
+
+Five ways in. They differ in what is embedded, not in how the results are shaped.
+
+| tool | searches | reach for it when |
+|---|---|---|
+| `search_semantic` | summary vectors | you know what the code *does*, not what it is called |
+| `search_code` | code-chunk vectors | you half-remember the shape of the code itself |
+| `search_hybrid` | both, deduplicated per entity | you do not want to choose |
+| `search_text` | BM25 over names, signatures, summaries, raw code | an identifier, a string literal, an error message, non-English text |
+| `search_entities` | entity names, case-insensitive substring | you know part of the identifier — and it answers the moment parsing finishes, before any summary exists |
+
+All five take `node_types`, `include_paths` / `exclude_paths` globs, `include_tests`,
+`min_score`, `limit` and `offset`. Summaries and the identifiers they are matched against are
+English-dominated, so a query in another language embeds far from that space and returns a
+plausible-looking wrong answer rather than an error — put non-English text and exact strings
+through `search_text`.
+
+**An empty result says which kind of empty it is.** This is INV-7, and it is the reason to
+trust a page that carries nothing:
+
+- Not indexed → `project_not_indexed`, with the sentence *"This is different from an indexed
+  project that simply has no matches."*
+- A typo'd argument → `invalid_node_type` / `invalid_direction`, checked before the database is
+  touched, never an empty page.
+- The scan stopped at an internal ceiling → `page.truncated: true`, so a short page there is not
+  evidence that nothing matches.
+- The hits were far away → `"weak": true` on each hit below `SEMANTIC_WEAK_THRESHOLD` (0.5 by
+  default), and `meta.weak_results: true` when *every* hit on the page was weak. That is the
+  closest a vector search can honestly get to "this code is not here". `search_text` never sets
+  it: BM25 scores are unbounded relevance, not similarities.
+- An empty page gets neither flag, because no hits is not the same claim as "the hits were far
+  away".
+- The file was never indexed at all → `meta.index_coverage` on every empty first page. This is
+  the gap the others could not see: staleness is defined against a node, so a file that never
+  entered the index has nothing to flag, and an empty page came back with `"checked": 0`, empty
+  `stale`/`missing` lists and a watcher line promising a daemon was following the tree. The
+  block re-checks the directories this index knows against the filesystem and either names
+  files that are on disk and absent from the index, or states that nothing under that scope is
+  missing — which is what makes "it does not exist" a safe conclusion instead of a guess. It is
+  bounded on purpose (only known directories, capped in count and wall-clock) and says so when
+  it stops early. `get_entity_structure(file_path=…)` answers the same question directly: a
+  path that exists on disk but was never indexed reads differently from one that does not exist.
+
+Every response carrying entities also names its provenance: `meta.answered_from` (path,
+`branch @ short commit`, and for a worktree the checkout it belongs to), and
+`meta.index_freshness`, which re-hashes that page's files and flags an item whose file changed
+after indexing (`"stale": true`) or is gone from disk (`"file_missing": true`). An unflagged
+item was checked and still matches. When the files on a page live in an independent checkout
+inside that tree — a submodule, a vendored repository on its own branch — `meta.nested_checkouts`
+names it and its HEAD, because that, not the outer branch in `answered_from`, is the code being
+read. Search hits from test-like paths carry `"is_test": true`; pass `include_tests=false`
+whenever you are looking for an implementation rather than its tests — a test summary restates
+the vocabulary of the code it exercises, so tests out-rank that code on the very queries used to
+find it.
+
+---
+
+## FIG. 05 · WATCH
+
+An index is a snapshot. Nothing about indexing keeps it matching the code.
+
+Indexing through the MCP server leaves a file watcher inside *that server process* — a child of
+one editor session, which dies when the session does. It is real while it lasts and worthless
+afterwards: close the window and the index stops moving while every tool keeps answering in the
+present tense. `meta.index_freshness.watcher` says which of the two you have.
+
+The daemon is the process that is supposed to be running:
 
 ```bash
-uv tool install git+https://github.com/uiqkos/inflorescence
-inflorescence init
+inflorescence watch add /path/to/repo    # register an already-indexed project
+inflorescence watch install              # macOS: launchd job, runs at login, starts now
+inflorescence watch status               # who is registered, and what is actually followed
+inflorescence watch status --stale       # ...and how far each project has drifted from disk
+inflorescence watch run                  # foreground instead (this is what launchd runs)
+inflorescence watch rm /path/to/repo     # stop following; the index itself is left alone
+inflorescence watch uninstall            # remove the launchd job; indexes untouched
 ```
 
-That is the whole installation. `init` walks through everything the server needs, in order:
-
-- asks for an [OpenRouter](https://openrouter.ai/) API key and stores it in
-  `~/.config/inflorescence/.env`. The key must have **credit on it** — `doctor` checks that a
-  key is present, not that it has balance; an exhausted key passes the check and then fails
-  every call, leaving you with a graph and no summaries or embeddings;
-- makes sure Docker works: launches Docker Desktop / OrbStack if it is installed but not
-  running, and on a macOS without Docker offers to install it via Homebrew;
-- pulls the **`memgraph-mage`** image (first run only, >1 GB — the vector indexes that make
-  semantic search work do not exist on a plain Memgraph build) and starts the
-  `inflorescence-memgraph` container;
-- registers the MCP server with Claude Code, or prints the JSON block for any other MCP client;
-- finishes by running `inflorescence doctor`.
-
-The only prerequisite installed by hand is [uv](https://docs.astral.sh/uv/) itself (plus
-Docker Desktop or [OrbStack](https://orbstack.dev/), if you are not on macOS with Homebrew).
-`uv tool install inflorescence` (PyPI) will follow from the first tagged release.
-
-<details>
-<summary>From a checkout instead (development)</summary>
-
-```bash
-# 1. Get the code and its dependencies
-git clone https://github.com/uiqkos/inflorescence
-cd inflorescence
-uv sync
-
-# 2. Start Memgraph (+ Memgraph Lab on http://localhost:3000)
-docker compose up -d
-
-# 3. Configure — stores the key, starts Memgraph, registers the MCP server with Claude Code
-uv run inflorescence init
-
-# 4. Verify everything is wired up
-uv run inflorescence doctor
-```
-</details>
-
-On a fresh install `doctor` reports **three** passes and one failure — the schema is created
-by the first index, so it cannot exist yet:
+`watch status` leads with the machine-level fact — a daemon either runs here or it does not —
+then separates the three per-project states, because only one of them means the index can be
+trusted an hour from now:
 
 ```
-[PASS] Config loads: pydantic Settings constructed
-[PASS] OPENROUTER_API_KEY: present
-[PASS] Memgraph reachable: bolt://localhost:7687
-[FAIL] Schema present: core indexes not found — run an index first
+Daemon: running on this machine (my-laptop.local:76027:efdf2ae…)
+
+WATCHED /Users/me/code/shop  [current]
+        shop_3c1f07aa — daemon my-laptop.local:76027:efdf2ae…
+IDLE    /Users/me/code/api  [867 file(s) to reindex, ~$7.97 to catch up]
+        api_1c0ffee0 — registered, no daemon running
+OFF     /Users/me/code/scratch
+        scratch_deadbeef — not registered
 ```
 
-Index something, and the fourth check goes green:
+`IDLE` is the state after a reboot: the registry still says the project is followed and nothing
+is following it. `--stale` adds the bracketed figures — how many files an incremental re-index
+would touch and what the catch-up would cost — by re-hashing every indexed file, which is
+seconds per thousand files.
 
-```bash
-inflorescence index /path/to/repo --dry-run   # estimate volume + cost, no writes
-inflorescence index /path/to/repo             # build the graph for real
-inflorescence doctor                          # now four green checks
-```
+Four decisions worth knowing:
 
-From then on your assistant can call **`index_directory`** itself.
+- **Registration is explicit.** Indexing a tree does not enlist it. A machine accumulates
+  worktrees for branches abandoned weeks ago, and following those spends money summarizing
+  commits nobody will read. The registry is a `watched` flag on the project root node, not a
+  file.
+- **Adoption reconciles first.** A watcher only ever hears about edits made while it runs, so
+  the daemon runs one ordinary incremental re-index when it picks a project up. That catch-up
+  is priced and gated by `MAX_INDEX_COST_USD` exactly like a manual re-index; a refusal leaves
+  the daemon watching, and `WATCH_CATCH_UP=false` turns it off for zero unattended spend.
+- **One daemon per machine.** A second `watch run` refuses at the door and names the process
+  that already holds the job. The claim is keyed by hostname, so a shared Memgraph still lets
+  another machine run its own.
+- **One claim per project under that.** Each followed project is claimed by a lease with a
+  heartbeat, so nothing re-indexes a save twice and a `SIGKILL`ed daemon releases its projects
+  in a couple of minutes rather than wedging them forever. The launchd job restarts only
+  *failed* runs, which is what makes that case self-heal, while a deliberate stop stays stopped.
 
-<details>
-<summary>Where the key is stored, and how Memgraph gets started</summary>
+`watch install` pins the directory you install from into the job and refuses to install if no
+API key is visible from there. Both guard the same trap: settings come from a project-local
+`.env` as well as the per-user one, and a launchd job starts in `/`, where a checkout's `.env`
+does not exist. Install from the directory whose `.env` holds your key, or run
+`inflorescence init` to write the per-user file and install from anywhere.
 
-`init` writes the key to **`~/.config/inflorescence/.env`** (`%APPDATA%\inflorescence\.env` on
-Windows), not to a `.env` beside the directory you ran it from. An MCP client launches the
-server with its own working directory, so a project-local key is invisible to the very process
-that needs it — that produced a server which started cleanly and then failed every LLM call.
-A project `.env` still works and takes precedence when present; real environment variables
-outrank both.
-
-Memgraph is started for you. Inside a checkout of this repository `init` uses `docker compose`
-(which also brings up Memgraph Lab); anywhere else it starts a standalone container —
-`inflorescence-memgraph`, published on loopback only, with its data in a named volume so the
-graph survives `docker rm`. `serve` does the same on startup, since an MCP client offers no
-moment at which you could have started the database yourself. When Docker itself is installed
-but not running (the default state of a fresh laptop), the Docker Desktop or OrbStack app is
-launched and the daemon awaited; the `memgraph-mage` image is pulled as its own patient step
-on first run, so a multi-minute download never masquerades as "could not start Memgraph".
-
-To run it by hand instead:
-
-```bash
-docker run -d --name inflorescence-memgraph \
-  -p 127.0.0.1:7687:7687 \
-  -v inflorescence_mg_data:/var/lib/memgraph \
-  memgraph/memgraph-mage:latest
-```
-</details>
-
-The server runs over stdio and is registered for you by `init`. To run it by hand:
-
-```bash
-inflorescence serve                # normal
-inflorescence --debug serve        # verbose logs (handler events, update lifecycle)
-```
-
-## The 12 MCP tools
-
-**Indexing**
-- **`index_directory`** — index or re-index a directory: parse, build the graph, summarize, embed.
-  Call with `preview=true` first for a cost estimate. Indexing through the server also starts a
-  **file watcher** that keeps the graph in sync as you edit.
-
-**Graph exploration**
-- **`list_entities`** — list indexed entities, with pagination and glob path filters
-- **`get_entity_structure`** — browse the containment hierarchy under a node, file, or the project root
-- **`get_entity_context`** — an entity's parent, children, and incoming/outgoing relations
-- **`get_related_entities`** — entities related to a node by a given relationship, addressed
-  either by `node_id` or by a `name` substring the tool resolves itself (so "who calls X" is
-  one call; an ambiguous name fails with the candidate list instead of guessing)
-- **`search_entities`** — find entities by name substring
-
-**Search**
-- **`search_code`** — vector similarity over raw source-code chunks
-- **`search_semantic`** — vector search by *meaning* over summaries (find code by what it does)
-- **`search_hybrid`** — combined code + summary vector search, deduplicated per entity
-- **`search_text`** — exact keyword (BM25) search over names, signatures, summaries, and raw code
-
-The three vector searches label how close they actually got: a hit below
-`SEMANTIC_WEAK_THRESHOLD` carries `"weak": true`, and a page where every hit is weak also sets
-`meta.weak_results` — the honest form of "nothing here looks like what you asked for", since a
-top-k search cannot prove absence. Confirm with `search_text` on exact terms.
-
-Every response that carries entities also says where it came from and how old it is:
-`meta.answered_from` names the tree — path, `branch @ short commit`, and, for a git worktree,
-the checkout it belongs to — and `meta.index_freshness` re-hashes that page's files, flagging
-an item whose file changed since indexing (`"stale": true`) or vanished (`"file_missing":
-true`). With several worktrees of one repository on disk, those two lines are what tell you
-whether the answer describes the branch you are working on.
-
-**Direct query**
-- **`cypher_query`** — run paginated, read-only Cypher against Memgraph (each `MATCH` is project-scoped)
-- **`graph_schema`** — describe the graph (labels, node types, relationship types, property keys,
-  named indexes, query rules) so you can write Cypher without guessing
-
-## Live incremental updates
-
-Index a project through the server and Inflorescence watches it. On save, the watcher debounces
-the change, then reconciles the graph — new functions appear, deleted ones are removed, changed
-signatures update, and cross-file edges are re-resolved. Summaries and embeddings for **unchanged**
-nodes are reused, so a one-file edit re-summarizes only that file's path to the root, not the whole
-project.
-
-Unchanged content is not re-*written* either. The whole project is re-parsed and re-resolved
-(a one-line edit can change what another file is recorded as calling), but a chunk or a
-summary vector the database already holds is left exactly where it is instead of being
-re-stored with an identical value — each of those writes costs a round trip and a
-vector-index update. The `chunks` and `summaries` an update reports are therefore what it
-**wrote**, not how much the project contains; `db` in the same result carries the totals.
-
-```mermaid
-sequenceDiagram
-    participant You
-    participant W as FileWatcher
-    participant PM as ProjectManager
-    participant MG as Memgraph
-
-    You->>W: save src/app/service.py
-    W->>W: debounce, 5s quiet period
-    Note over W: further saves join the same flush
-    W->>PM: flush 1 changed path
-    PM->>PM: cost gate — background must not<br/>silently outspend an explicit index
-    PM->>MG: read stored hashes and summaries
-    MG-->>PM: 10 nodes, 5 unchanged
-    PM->>PM: re-summarize 5, reuse 5
-    PM->>MG: write nodes, edges, embeddings
-    Note over PM,MG: on failure the previous summary is kept —<br/>a stale answer beats a blank one
-```
-
-Run with `--debug` to watch the events flow:
+On save, the watcher debounces (`WATCHER_DEBOUNCE_SECONDS`, default 5s), then reconciles: new
+functions appear, deleted ones are removed, changed signatures update, cross-file edges are
+re-resolved. Run with `--debug` to watch it:
 
 ```
 Observed modified event for project=…: src/app/service.py (1 path(s) pending flush)
@@ -359,118 +253,145 @@ Detected 1 changed and 0 deleted file(s); rebuilding project
 Summarization complete: 10 nodes, 5 regenerated, 5 reused
 ```
 
-## Dashboard
+The whole project is re-parsed and re-resolved — a one-line edit can change what another file
+is recorded as calling — but a chunk or summary vector the database already holds is left
+exactly where it is instead of being re-stored with an identical value. The `chunks` and
+`summaries` an update reports are therefore what it **wrote**; `db` in the same result carries
+the totals.
 
-A local web UI for exploring indexed graphs:
+---
+
+## FIG. 06 · COST
+
+Indexing costs real money. Two mechanisms keep that deliberate (INV-10).
+
+**Preview.** `index_directory(path, preview=true)` and `inflorescence index <path> --dry-run`
+both count files, bytes, entities and tokens and price them — no database writes, no LLM calls,
+no watcher started. Read the estimate, then run for real.
 
 ```bash
-inflorescence dashboard                       # opens http://127.0.0.1:8321
-inflorescence dashboard --port 9000 --no-browser
+inflorescence index /path/to/repo --dry-run          # estimate volume + cost
+inflorescence index /path/to/repo                    # build
+inflorescence index /path/to/repo --max-cost 2.50    # refuse above this estimate
+inflorescence index /path/to/repo --force            # re-parse and re-resolve unchanged files
 ```
 
-Five views, switchable per project. Every screenshot below is Inflorescence indexing its own
-source — 1,364 entities across 70 files.
+**Cap.** `MAX_INDEX_COST_USD` (default `10.0`, empty to disable) gates *every* run that would
+spend: a first index, a re-index, each watcher flush, and the daemon's catch-up. The per-call
+`max_cost_usd` argument overrides it for that run. An estimate above the cap is refused before
+any money is spent, and the refusal reports the estimate so you can raise the cap deliberately.
 
-**Overview** — entity and relation counts, type breakdowns, summary coverage, most-called and
-most-imported entities, largest files.
+A first index is priced over the whole tree; a re-index and a watcher update are priced over
+only the files whose content moved. So a routine refresh of a large repository is never rejected
+for work it is going to reuse — while an upgrade that widens what the indexer admits (one new
+`DOCUMENT_EXTENSIONS` entry can make thousands of files newly billable) still has to clear the
+cap before it spends. The estimate uses `LLM_PRICE_INPUT_USD_PER_MTOK`,
+`LLM_PRICE_OUTPUT_USD_PER_MTOK` and `EMBEDDING_PRICE_USD_PER_MTOK`, whose defaults match the
+default models: switch models and update the prices, or the cap measures the wrong thing.
 
-![Dashboard overview](assets/dashboard-overview.png)
+`--force` re-parses and re-resolves even when no file changed — needed after an upgrade that
+improves edge resolution, since the incremental path compares content checksums and a better
+indexer would otherwise never reach an unchanged project. Summaries and embeddings are still
+reused by content hash, so it costs nothing. It is not a data wipe.
 
-**Explorer** — the containment tree with hierarchical summaries; per-entity pages with summary,
-signature, docstring, source, and clickable relations.
+### Narrowing a scope: `prune`
 
-![Dashboard explorer](assets/dashboard-explorer.png)
+`--exclude` keeps a path out of a *scan*; it does not remove what an earlier, wider scan already
+stored. That asymmetry is deliberate — an excluded file is still on disk, so a re-index cannot
+tell "the operator narrowed the scope" from "the scan lost these files", and a refresh that
+guesses wrong deletes paid work (INV-1/INV-3). Dropping what a narrowed scope no longer covers
+is therefore its own command:
 
-**Query** — a read-only Cypher console with presets; node results render as a graph.
+```bash
+inflorescence prune /path/to/repo --exclude tests/golden --dry-run   # what would go
+inflorescence prune /path/to/repo --exclude tests/golden             # drop it
+```
 
-![Dashboard Cypher console](assets/dashboard-query.png)
+It costs nothing — no scan, no parse, no LLM, no embedding — and deletes the nodes and chunks of
+every indexed file the pattern refuses, plus directory nodes left holding nothing. The patterns
+are merged into the project's stored scan scope, so the watcher stops re-admitting those paths.
+`--include` replaces the stored include scope instead, pruning anything it does not cover.
 
-**Graph** — an interactive force-directed graph, shown at the top of this page: whole-project
-module overview or the neighborhood of any entity; edge direction shown by animated particles;
-filter by relation type, expand by double-click, export PNG. **Replay** lights the graph up in
-build order — root directory, then files, then the code inside them, with calls and imports
-fading in as their endpoints land. Purely cosmetic: nodes are revealed in the position they
-already settled into, so the layout never moves and the camera never chases it. It reads
-nothing, writes nothing, and leaves the graph exactly as it was.
+### Keeping a tree out for good: `.inflorescenceignore`
 
-**Tools** — the MCP surface, callable by hand. Every tool the server hands an agent is listed
-with its real description; picking one builds a form from its JSON schema (required fields
-marked, defaults shown, `directory` pre-filled with the project's indexed path). Run it and the
-panel shows what the agent gets: the parsed payload in a foldable JSON viewer, the raw text
-block byte for byte, the argument object that was sent, plus duration, payload size and an
-approximate token count. Entity ids in a result link straight into the Explorer. Recent calls
-are kept, so you can click one and re-run it with a single value changed.
+`--exclude` lasts for the call that passes it. To settle the question once, commit a
+`.inflorescenceignore` — gitignore syntax, honored in any directory under the root, merged with
+a same-directory `.gitignore`, and honored whatever `RESPECT_GITIGNORE` says, because its whole
+point is a path you want in git and out of the index:
 
-![Dashboard MCP tools console](assets/dashboard-tools.png)
+```gitignore
+# shop/.inflorescenceignore
+worker/tests/golden/
+worker/analysis/sites/
+```
 
-Calls run in the background on their own event loop: a long `index_directory` survives a page
-reload, keeps the rest of the dashboard responsive, and can be cancelled (cancellation lands at
-the tool's next await, so a blocking filesystem scan may still finish). The two money-spending
-paths are explicit — tools that call an embedding or LLM API are labelled in the list, and
-`index_directory` with `preview=false` is refused by the API unless the confirmation checkbox
-was ticked. Indexing from here deliberately starts no file watcher: the MCP server owns that.
+Every scan reads it — an explicit index, a watcher update, an agent calling `index_directory`
+with no arguments — so no caller has to remember a flag, and the rule travels with the
+repository instead of living in one machine's database. The three answer a fixture tree
+together: `.inflorescenceignore` to keep it out from now on, `--exclude` for a one-off run,
+`prune` once to drop what the earlier, wider run already stored.
 
-## Configuration
+---
 
-All settings are environment variables (or a `.env` file). The ones you are likely to touch:
+## FIG. 07 · INSTALL
 
-| Variable | Default | Description |
-|---|---|---|
-| `OPENROUTER_API_KEY` | — | OpenRouter API key (**required**) |
-| `MEMGRAPH_URL` | `bolt://localhost:7687` | Memgraph connection URL |
-| `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` | — | Optional Memgraph auth |
-| `LLM_MODEL` | `google/gemini-2.5-flash-lite` | Model for summaries and LLM parsing |
-| `CODE_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Code-chunk embeddings |
-| `SUMMARY_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | Summary embeddings |
-| `SEMANTIC_WEAK_THRESHOLD` | `0.5` | Cosine similarity below which a vector hit is labelled `"weak"`. Model-dependent; a label, not a filter (that is the per-query `min_score`) |
-| `USE_LLM_SUMMARIES` | `true` | Set `false` for a graph-only index that sends nothing to an LLM |
-| `INDEX_DOCUMENTS` | `true` | Index non-code files (prose, styles, markup, config — see [Supported languages](#supported-languages)) as whole documents. `false` leaves them out of the scan entirely |
-| `DOCUMENT_EXTENSIONS` | see [below](#supported-languages) | Which extensions count as a document. Narrow it to index only some of them |
-| `MAX_FILE_SIZE_BYTES` | `262144` | Skip files larger than this |
-| `MAX_INDEX_COST_USD` | `10.0` | Cost cap on a first index **and** on every watcher update. Set empty to remove the cap |
-| `REQUIRE_SEARCH_INDEXES` | `true` | Refuse to index against a Memgraph that cannot host vector indexes, instead of paying for unsearchable embeddings |
-| `USE_SCIP_SEMANTIC` | `true` | Use SCIP indexers for call resolution — see [below](#optional-compiler-grade-call-resolution) |
-| `WATCHER_DEBOUNCE_SECONDS` | `5.0` | Debounce window before a change flush |
-| `LOG_LEVEL` | `INFO` | Root log level. `--debug` overrides it |
+```bash
+uv tool install git+https://github.com/uiqkos/inflorescence
+inflorescence init
+```
 
-`MAX_INDEX_COST_USD` is a cap, not a budget: an index whose *estimate* exceeds it is refused
-before any money is spent, and the CLI reports the estimate so you can raise the cap
-deliberately. The estimate uses the price settings in `.env.example`, which match the default
-models — switch models and you should update the prices too, or the cap will be measuring the
-wrong thing.
+That is the whole installation. `init` walks through everything the server needs, in order:
 
-**[`.env.example`](.env.example) is the complete reference** — every setting, with its default
-and what it is for. The table above is a subset.
+- asks for an [OpenRouter](https://openrouter.ai/) API key and writes it to
+  `~/.config/inflorescence/.env` (`%APPDATA%\inflorescence\.env` on Windows). The key must have
+  **credit on it**: `doctor` checks that a key is present, not that it has balance, and an
+  exhausted key passes the check and then fails every call;
+- makes sure Docker works — launches Docker Desktop / OrbStack if installed but not running,
+  and on a macOS without Docker offers to install it via Homebrew;
+- pulls the **`memgraph-mage`** image (first run only, >1 GB — the vector indexes semantic
+  search needs do not exist on a plain Memgraph build) and starts the `inflorescence-memgraph`
+  container;
+- registers the MCP server with Claude Code, or prints the JSON block for any other client;
+- finishes by running `inflorescence doctor`.
 
-Logs go to a per-user location (`~/Library/Logs/inflorescence/` on macOS,
-`$XDG_STATE_HOME/inflorescence/` on Linux, `%LOCALAPPDATA%\inflorescence\` on Windows), capped
-at 10 MB per file with 3 rotations. Override with `--log-file`.
+The only prerequisite installed by hand is [uv](https://docs.astral.sh/uv/) itself, plus Docker
+Desktop or [OrbStack](https://orbstack.dev/) if you are not on macOS with Homebrew.
+`uv tool install inflorescence` (PyPI) will follow from the first tagged release. Python 3.11+.
 
-## What leaves your machine
+On a fresh install `doctor` reports one failure — the schema is created by the first index, so
+it cannot exist yet:
 
-Indexing sends your source code to third-party APIs. Specifically:
+```
+[PASS] Config loads: pydantic Settings constructed
+[PASS] OPENROUTER_API_KEY: present
+[PASS] Memgraph reachable: bolt://localhost:7687
+[PASS] Watch daemon: no projects registered (0 indexed)
+[FAIL] Schema present: not found
+       hint: Run `inflorescence index <path>` to create the schema
+[PASS] SCIP indexers: go=docker, python=docker, typescript=docker
 
-- **To the LLM** (OpenRouter by default): the source of each entity, truncated to
-  `SUMMARY_MAX_SOURCE_CHARS` (12 000 characters), for summarization — and the whole file for
-  any Python file the AST parser cannot handle, which falls back to an LLM extractor.
-- **To the embeddings endpoint**: every code chunk and every generated summary.
+Doctor: problems found
+```
 
-Nothing else is transmitted: no paths outside the indexed repository, no telemetry, no
-analytics. The graph, the vectors, and the dashboard are entirely local.
+Index something and that line goes green. From then on your assistant can call
+`index_directory` itself. The `SCIP` rows appear only while `USE_SCIP_SEMANTIC` is on, and
+never fail the run — they report which rung each language would use, and which container image
+would execute, before you spend anything.
 
-If that is not acceptable for a given repository, `USE_LLM_SUMMARIES=false` builds the code
-graph and skips summarization — but code-chunk embeddings still reach the embeddings endpoint,
-so a fully offline index means pointing `CODE_EMBEDDING_BASE_URL` at a local
-OpenAI-compatible server.
+### Running the server by hand
 
-## MCP client configuration
+```bash
+inflorescence serve                # stdio; this is also what a bare `inflorescence` does
+inflorescence --debug serve        # verbose logs (handler events, update lifecycle)
+inflorescence serve --allow-degraded   # start even if Memgraph is unreachable
+```
 
-The easiest path is `inflorescence init`, which detects Claude Code and runs `claude mcp add` for
-you (or prints a ready-to-paste Claude Desktop snippet otherwise).
+### MCP client configuration
 
-`uv tool install` places the `inflorescence` script in uv's tool-bin directory, which may not be on
-your MCP client's `PATH`. To avoid "command not found", use the **absolute path** to the installed
-script (find it with `which inflorescence`):
+`init` detects Claude Code and runs `claude mcp add` for you, or prints a ready-to-paste Claude
+Desktop snippet otherwise. `uv tool install` places the `inflorescence` script in uv's tool-bin
+directory, which may not be on your client's `PATH` — use the absolute path (`which
+inflorescence`):
 
 ```json
 {
@@ -484,185 +405,532 @@ script (find it with `which inflorescence`):
 }
 ```
 
-The `env` block is belt-and-braces. Since the key lives in `~/.config/inflorescence/.env`, the
-server finds it whatever working directory the client launches it from, and the block can be
-omitted — it is worth keeping only if you want a different key for this one client.
+The `env` block is belt-and-braces. The key lives in `~/.config/inflorescence/.env`, so the
+server finds it whatever working directory the client launches it from; keep the block only if
+you want a different key for this one client.
 
-## Optional: compiler-grade call resolution
+<details>
+<summary>From a checkout instead (development)</summary>
 
-`CALLS` edges are resolved by a ladder. The top rung uses [SCIP](https://sourcegraph.com/docs/code-search/code-navigation/explanations/scip)
-indexers — the same machinery Sourcegraph uses — which resolve calls the way a compiler does
-rather than by matching names.
+```bash
+git clone https://github.com/uiqkos/inflorescence
+cd inflorescence
+uv sync
 
-**You do not install them.** If Docker is available, the indexer runs in a container that
-already carries the toolchain it needs, with the repository mounted **read-only**:
+docker compose up -d              # optional: Memgraph + Lab on http://localhost:3000
+uv run inflorescence init         # stores the key, starts Memgraph, registers the server
+uv run inflorescence doctor
+```
+</details>
 
-| Language | Indexer | Version | Image | Installed by hand instead |
+<details>
+<summary>Where the key is stored, and how Memgraph gets started</summary>
+
+`init` writes the key to **`~/.config/inflorescence/.env`**, not to a `.env` beside the
+directory you ran it from. An MCP client launches the server with its own working directory, so
+a project-local key is invisible to the very process that needs it — that produced a server
+which started cleanly and then failed every LLM call. A project `.env` still works and takes
+precedence when present; real environment variables outrank both.
+
+Memgraph is started for you. Inside a checkout of this repository `init` uses `docker compose`
+(which also brings up Lab); anywhere else it starts a standalone container. Either way it is
+**one container, `inflorescence-memgraph`** — compose pins that name rather than taking its own
+— published on loopback only, with its data in a named volume so the graph survives
+`docker rm`. `serve` does the same on startup, since an MCP client offers no moment at which
+you could have started the database yourself. When Docker is installed but not running (the
+default state of a fresh laptop), the Docker Desktop or OrbStack app is launched and the daemon
+awaited; the `memgraph-mage` image is pulled as its own patient step on first run, so a
+multi-minute download never masquerades as "could not start Memgraph".
+
+The single name is load-bearing. Two containers over one database volume do not give you a
+spare: they fight for port 7687, and the loser can end up *running* yet attached to no network
+— publishing nothing, refusing every connection mid-handshake, and unfixable by restarting it.
+`doctor` reports a second container as soon as it exists, while the database still answers.
+
+So the two paths defend against each other. `init` and `serve` adopt whatever container already
+holds the volume instead of adding one. Compose, which cannot adopt a container it did not
+create, fails loudly on the pinned name — `Conflict. The container name
+"/inflorescence-memgraph" is already in use` means the database is already up and compose has
+nothing to do (`docker start inflorescence-memgraph` is the whole job; use compose only if you
+also want Lab, and then start from `docker compose down`).
+
+If you meet a spare anyway, stop it (`docker stop <name>`); to repair a container already
+orphaned off the network, recreate it — the graph is in the volume, not the container:
+
+```bash
+docker rm -f inflorescence-memgraph && docker run -d --name inflorescence-memgraph \
+  --restart unless-stopped -p 127.0.0.1:7687:7687 \
+  -v inflorescence_mg_data:/var/lib/memgraph \
+  memgraph/memgraph-mage:latest
+```
+
+Give it a couple of minutes on a populated graph: `memgraph-mage` loads its query modules and
+replays the last snapshot before it opens bolt (~100s on a 187k-node graph), so a database that
+is merely starting looks exactly like one that is down. `docker logs -f inflorescence-memgraph`
+shows which it is.
+</details>
+
+---
+
+## FIG. 08 · TOOLS
+
+Thirteen tools. The catalogue card, one line each; the server publishes each tool's full
+docstring as its description, so this is the index, not the text.
+
+**Index**
+
+| tool | |
+|---|---|
+| `index_directory` | Index or re-index a directory: parse, build the graph, summarize, embed. `preview=true` prices it first; the result's `watching` says what will keep it current afterwards |
+
+**Graph**
+
+| tool | |
+|---|---|
+| `list_entities` | Inventory in path order, unranked, with pagination and glob path filters — "what is in this package" |
+| `get_entity_structure` | The `CONTAINS` outline under a node, file or project root, one to three levels deep |
+| `get_entity_context` | One call, one known `node_id`: full summary plus parent, children, incoming and outgoing edges |
+| `get_related_entities` | Entities related by relationship and `direction` (`both` / `incoming` / `outgoing`), addressed by `node_id` **or** by a `name` substring the tool resolves itself — so "who calls X" is one call. An ambiguous name returns the candidates instead of guessing |
+| `search_entities` | Case-insensitive substring of an entity's name; answers before any summary exists |
+
+**Search**
+
+| tool | |
+|---|---|
+| `search_code` | Vector similarity over raw code chunks |
+| `search_semantic` | Vector search by meaning over summaries |
+| `search_hybrid` | Both, deduplicated per entity |
+| `search_text` | Exact BM25 over names, signatures, summaries and raw code |
+
+**Query**
+
+| tool | |
+|---|---|
+| `cypher_query` | Paginated read-only Cypher. Writes, `CALL`, `LOAD`, admin clauses and `LIMIT`/`SKIP` are rejected; every `MATCH` must be project-scoped |
+| `graph_schema` | Labels, node types, relationship types, property keys, named indexes, query rules and worked examples — no graph scan |
+
+**Feedback**
+
+| tool | |
+|---|---|
+| `send_feedback` | The agent's channel back to the maintainer: which description sent it to the wrong tool, which result was empty when the code plainly exists, what took four calls |
+
+Limits are clamped, not errors: `limit` is capped at 500 for graph tools and `cypher_query`,
+100 for the four searches; navigation summaries are truncated to 200 characters (use
+`get_entity_context` for the full one); a search hit carries at most three `matches`, with
+`matches_total` present only when the list was trimmed.
+
+---
+
+## DASHBOARD
+
+```bash
+inflorescence dashboard                       # http://127.0.0.1:8321
+inflorescence dashboard --port 9000 --no-browser --host 127.0.0.1
+```
+
+Five views, switchable per project, served by a local Starlette app over the same
+`GraphRepository` the MCP tools use.
+
+- **Overview** (`/api/projects/{project}/stats`) — entity and relation counts, type
+  breakdowns, summary coverage, most-called and most-imported entities, largest files.
+- **Explorer** (`/tree`, `/entity`, `/code`) — the containment tree with hierarchical
+  summaries; per-entity pages with summary, signature, docstring, source and clickable
+  relations.
+- **Graph** (`/specimen`) — the specimen: the whole project as nested `CONTAINS` discs, the
+  same layout as the plate at the top of this file, laid out client-side from one compact
+  payload. Scope it to a path prefix, drop to files only, keep only entities that already carry
+  a summary (so the specimen grows batch by batch while an index runs), fit the frame, or ask
+  for the shortest route between two entities over the real edges. `/graph` still serves the
+  neighbourhood of one entity, filterable by relation type, but the view no longer uses it.
+- **Query** (`/query`, POST) — the read-only Cypher console with presets; node-bearing rows can
+  be numbered onto the specimen, so a query's answer is shown on the real graph rather than as a
+  separate picture.
+- **Tools** (`/api/tools`, `/api/tools/call`, `/api/tools/runs/…`) — the MCP surface, callable
+  by hand. Every tool the server hands an agent is listed with its real description; picking one
+  builds a form from its JSON schema (required fields marked, defaults shown, `directory`
+  pre-filled). The panel then shows what the agent gets: parsed payload, raw text block byte for
+  byte, the argument object that was sent, plus duration, payload size and an approximate token
+  count. Entity ids in a result link into the Explorer, and recent calls can be re-run with one
+  value changed.
+
+The specimen is one canvas: drag to pan, wheel to zoom toward the cursor, click a node to pin
+it, double-click a disc to frame it, `F` to fit, `Esc` to peel back one layer (panel, then
+replay, then the pin). Hovering traces the question an agent asks the server — who calls this
+(pink, incoming) and what it calls (blue, outgoing); the pinned card carries the entity's name,
+type, `path:lines`, summary and degrees, with links into the Explorer, the route tool and a path
+scope. Selecting an entity anywhere — the tree, a search result, a Cypher row — aims the
+specimen at it, and a search's hits land on the graph numbered, a weak match drawn weakly.
+
+**route** takes two entities, picked on the canvas or typed by name, and draws the shortest path
+between them over the real edges (a `CALLS`, `IMPORTS` or `INHERITS` edge costs 1, a step up or
+down `CONTAINS` costs 2.4), listed as `create_server ─CALLS→ create_components ─CALLS→
+GraphRepository` in the colours of the edges it used. If nothing connects them, it says so.
+
+**gfx** switches the display and nothing else: labels, edge ink, the idle pulse, the load bloom,
+the row-tearing glitch, the scanlines, and the paper variant — the same specimen as ink on a
+herbarium sheet. The dirt is live rather than baked, on by default, off in one click. **replay**
+re-runs the bloom (pause, 0.5–4×), **rec** captures the canvas to a video file, **png** saves a
+still. The graph view ships no vendored JavaScript: layout, bundling, camera and routing are
+`static/pack.js`, derived from the landing page's specimen engine. On a 17 623-entity,
+24 234-edge index the layout takes 0.7 s and a drawn frame about 1.4 ms — and a specimen left
+open costs almost nothing, because the canvas repaints only when something actually changed:
+the camera, a hover, a pin, a filter, entities landing from a live index. Sitting still, on
+another view, or in a background tab, it draws nothing at all.
+
+The header carries two badges answering different questions. The pulsing **indexing** badge
+means a run is happening right now. The **watch** badge beside it is about the rest of the time:
+`watched` when a daemon follows this tree, `watch idle` when the project is registered but
+nothing is running it, `unwatched` when nothing keeps it current at all. Clicking it runs a
+drift check against disk (`/freshness`) — a real scan, too slow to poll, so it is asked for —
+and reports `up to date` or `N file(s) behind ≈$X`.
+
+Tool calls run in the background on their own event loop: a long `index_directory` survives a
+page reload, keeps the rest of the dashboard responsive, and can be cancelled (cancellation
+lands at the tool's next await, so a blocking filesystem scan may still finish). The two
+money-spending paths are explicit — tools that call an embedding or LLM API are labelled, and
+`index_directory` with `preview=false` is refused by the API unless the confirmation checkbox
+was ticked. Indexing from here deliberately starts no file watcher: the MCP server owns that.
+
+![Dashboard graph](assets/dashboard-graph.png)
+![Dashboard overview](assets/dashboard-overview.png)
+![Dashboard explorer](assets/dashboard-explorer.png)
+![Dashboard Cypher console](assets/dashboard-query.png)
+![Dashboard MCP tools console](assets/dashboard-tools.png)
+
+---
+
+## WORKTREES
+
+A linked git worktree is a different tree, so it is its own project — but the main checkout's
+index is a free cache donor, and none of this needs a flag.
+
+- **First read query indexes it inline.** A worktree of an *indexed* checkout is the one case
+  where a tool indexes instead of refusing: the query that triggered it waits for the finished
+  index, so the answer is never built on a half-index. Parallel first queries are serialized to
+  one build by an asyncio lock plus a cross-process lease.
+- **The donor's graph is copied inside Memgraph.** `WORKTREE_CLONE` (default on) copies the
+  donor's nodes, summaries and chunk vectors server-side, so nothing crosses the wire. Any
+  clone failure is non-fatal: the partial clone is deleted and the client-side path runs
+  instead.
+- **Only the differing files are re-indexed.** After the clone, the checksums that differ from
+  the donor are reconciled and the files this branch deleted are dropped. A byte-identical
+  worktree has nothing left to index.
+- **The preview prices only what the donor does not cover.** `index_directory(preview=true)` on
+  such a worktree reports `worktree_of`, `donor_covered_files` and `uncovered_files`, and prices
+  only the uncovered ones — pricing the whole tree quoted ~$50 for an index that actually costs
+  ~$0, and a preview that scares you away from a free operation is worse than no preview.
+- **The result says which path ran.** `worktree_of` names the donor; `cloned` (copied node,
+  chunk and edge counts) is present only on the server-side path.
+- **A deleted worktree's index is reaped.** Every index of a detected worktree stamps that fact
+  on the project root node, which is what lets the janitor drop the index of a worktree git no
+  longer knows — and leave every other project alone. `WORKTREE_JANITOR_ENABLED` governs it;
+  an ordinary project is never a candidate.
+
+`WORKTREE_AUTO_INDEX=false` disables the whole behaviour. With several worktrees of one
+repository on disk, `meta.answered_from` and `meta.index_freshness.live_worktrees` are what tell
+you whether an answer describes the branch you are working on — ask a worktree directly by
+passing its path as `directory`.
+
+---
+
+## RESOLUTION
+
+`CALLS` edges are resolved by a ladder, and every edge records which rung placed it in its
+`resolution` property, so compiler-grade edges are always distinguishable from heuristic ones.
+
+| rung | `resolution` | |
+|---|---|---|
+| SCIP indexer | `semantic` | compiler-grade, where the project builds |
+| syntactic ladder | `exact` `import` `field-type` `self` `same-module` `same-package` | in that order; 100% precision against SCIP ground truth in our measurements |
+| unresolved, bound to an import outside the project | — | recorded on the caller as `external_calls` |
+| unresolved, nothing to bind to | — | recorded on the caller as `unresolved_calls` |
+
+What cannot be resolved is **recorded, not guessed**. There is deliberately no "globally unique
+short name" fallback (it measured 39% precision) and no `candidates[0]` pick, because a wrong
+edge is worse than an honest gap: an agent that trusts a fabricated call graph reasons
+confidently to the wrong conclusion. A node with zero outgoing `CALLS` and empty
+`external_calls` / `unresolved_calls` genuinely calls nothing. Module nodes carry
+`calls_provenance` (`scip-go` / `scip-python` / `scip-typescript`, or `heuristic`).
+
+The design, the per-rung precision measurements and the known limits are in
+[docs/calls-resolution.md](docs/calls-resolution.md).
+
+**You do not install the SCIP indexers.** If Docker is available the indexer runs in a container
+that already carries its toolchain, with the repository mounted **read-only**:
+
+| language | indexer | version | image | by hand instead |
 |---|---|---|---|---|
 | Go | `scip-go` | 0.2.7 | `inflorescence-scip-go` | `go install github.com/scip-code/scip-go/cmd/scip-go@v0.2.7` |
 | Python | `scip-python` | 0.6.6 | `inflorescence-scip-node` | `npm install -g @sourcegraph/scip-python@0.6.6` |
 | TypeScript / JavaScript | `scip-typescript` | 0.4.0 | `inflorescence-scip-node` | `npm install -g @sourcegraph/scip-typescript@0.4.0` |
 
-The versions are pinned in the Dockerfiles, so a rebuild of the same Dockerfile installs the
-same indexers — that is what makes "build the image yourself" (below) a meaningful
-alternative to pulling ours.
-
-A binary already on `PATH` wins — it is faster, with no container to start. `SCIP_RUNNER`
-pins one rung (`auto`, the default, `native`, or `docker`); `SCIP_IMAGES` overrides an image.
-The two images are split by toolchain, not by language: neither indexer is a standalone
-binary — `scip-go` drives `go list` and both of the others are Node programs — so indexing a
-Python repository pulls the Node image and never a Go toolchain.
+A binary already on `PATH` wins — it is faster, with no container to start. `SCIP_RUNNER` pins
+one rung (`auto` by default, or `native`, or `docker`); `SCIP_IMAGES` overrides an image;
+`SCIP_TIMEOUT_SECONDS` bounds one run. The two images are split by toolchain, not by language:
+`scip-go` drives `go list` and the other two are Node programs, so indexing a Python repository
+pulls the Node image and never a Go toolchain.
 
 Containerizing this rung is not only about setup. A SCIP indexer necessarily executes the
-**indexed project's own build configuration**, which is exactly the code you have least
-reason to trust when you point this tool at someone else's repository to read it. In the
-container it sees one read-only mount and nothing else of your machine.
+**indexed project's own build configuration** — exactly the code you have least reason to trust
+when you point this tool at someone else's repository to read it. In the container it sees one
+read-only mount and nothing else of your machine.
 
-### Three ways to run this rung — pick your trust level
+> Indexing untrusted code? Set `USE_SCIP_SEMANTIC=false`, or leave `SCIP_RUNNER` on its default,
+> which confines that toolchain to a container.
 
-Pulling a container image from a stranger's personal namespace is a fair thing to hesitate
-over. All three paths below are first-class; nothing degrades except as documented.
-
-1. **Build the images yourself.**
-
-   ```bash
-   inflorescence build-images
-   ```
-
-   The Dockerfiles ship inside the package (readable in
-   [`src/inflorescence/docker/`](src/inflorescence/docker)), with the indexer versions
-   pinned — a rebuild installs the same tools, versions in the table above. The command
-   tags the result with exactly the references the docker rung looks for, and `docker run`
-   uses a locally present tag without contacting any registry — after building, no pull
-   ever happens. To be precise about what "local" means: the *build* itself still
-   downloads — the base image from Docker Hub, `scip-go` sources via proxy.golang.org, the
-   two npm indexers from npm — but every ingredient is named in a recipe you can read,
-   instead of arriving as one opaque blob.
-
-2. **Pull the published images and check who built them.** They are built multi-arch and
-   pushed by [CI](.github/workflows/images.yml) from a visible commit of this repository —
-   not from anyone's laptop — and carry GitHub artifact attestations (Sigstore under the
-   hood). Verify before first use:
-
-   ```bash
-   gh attestation verify oci://ghcr.io/uiqkos/inflorescence-scip-go:v1 --owner uiqkos
-   gh attestation verify oci://ghcr.io/uiqkos/inflorescence-scip-node:v1 --owner uiqkos
-   ```
-
-   The code references these images by immutable digest, not by tag: a tag can be silently
-   re-pointed in the registry, a digest cannot. `inflorescence doctor` prints the exact
-   reference that will run on your machine and whether it is already local.
-
-3. **Turn the rung off.**
-
-   ```bash
-   USE_SCIP_SEMANTIC=false
-   ```
-
-   No containers start at all. `CALLS` edges come from the syntactic ladder — 100%
-   precision in our measurements, with recall of 84.5% on Go and 66% on Python — and
-   everything it cannot resolve is recorded honestly in `external_calls` /
-   `unresolved_calls` rather than guessed.
-
-Worth stating plainly: the alternative to the container is not "everything stays local" —
-it is `go install` / `npm install -g` of the same third-party indexer **with no sandbox at
-all**, and an indexer, wherever it runs, executes the build configuration of the repository
-being indexed. The container is the contained option: repository mounted read-only, index
-written to a separate mount, `--rm`, your uid, and nothing else of the host exposed
-(`docker_scip_argv` in
-[`scip_semantic.py`](src/inflorescence/code_indexer/scip_semantic.py)).
-
-Sizes, measured: scip-go — 243 MB on disk, 76 MB of network transfer; scip-node — 310 MB
-and 100 MB. Two images rather than one because a merged image would cost ~545 MB and
-~170 MB of transfer for *everyone*, including a user who only ever indexes Python; only a
-polyglot repository would come out ahead, and then by about 6 MB. (A future Rust indexer
-would push a unified image past a gigabyte.)
-
-None of this is required. A missing indexer, a project that does not build, or a timeout
-degrades that language to the syntactic ladder — the index still succeeds, and every `CALLS`
-edge records which rung resolved it in its `resolution` property, so you can always tell
-compiler-grade edges from heuristic ones. `inflorescence doctor` reports which rung each
+A missing indexer, a project that does not build, or a timeout degrades that language to the
+syntactic ladder without failing the index. `inflorescence doctor` reports which rung each
 language would use before you spend anything.
 
-```mermaid
-flowchart LR
-    C["A call site"] --> SCIP
+---
 
-    SCIP{"SCIP indexer available<br/>and project builds?"}
-    SCIP -->|yes| SEM["resolution: <b>scip</b><br/>compiler-grade"]
-    SCIP -->|"no · fails · times out"| LADDER
+## SUPPLY CHAIN
 
-    LADDER["Syntactic ladder, in order:<br/>exact · import · field-type<br/>self · same-module · same-package"] --> HIT
+Three ways to run the SCIP rung. All three are first-class; nothing degrades except as
+documented.
 
-    HIT{"A rung matched?"}
-    HIT -->|yes| SYN["resolution: that rung<br/>100% precision vs SCIP ground truth"]
-    HIT -->|no| EXT
+**1 · Build the images yourself.**
 
-    EXT{"Bound to an import<br/>outside the project?"}
-    EXT -->|yes| E1["Recorded on the caller:<br/><b>external_calls</b>"]
-    EXT -->|no| E2["Recorded on the caller:<br/><b>unresolved_calls</b>"]
-
-    classDef gate fill:#fef9c3,stroke:#ca8a04,color:#1e293b
-    classDef good fill:#dcfce7,stroke:#16a34a,color:#1e293b
-    classDef honest fill:#e0f2fe,stroke:#0284c7,color:#1e293b
-    classDef step fill:#ede9fe,stroke:#7c3aed,color:#1e293b
-    class SCIP,HIT,EXT gate
-    class SEM,SYN good
-    class E1,E2 honest
-    class C,LADDER step
+```bash
+inflorescence build-images                          # both
+inflorescence build-images --language go --tag v1   # one, --registry to retag
 ```
 
-What cannot be resolved is **recorded, not guessed**. There is deliberately no
-"globally unique short name" fallback — it measured 39% precision — and no
-`candidates[0]` pick, because a wrong edge is worse than an honest gap: an agent that trusts
-a fabricated call graph reasons confidently to the wrong conclusion. So a node with zero
-outgoing `CALLS` edges and empty `external_calls` / `unresolved_calls` genuinely calls nothing.
+The Dockerfiles ship inside the package ([`src/inflorescence/docker/`](src/inflorescence/docker))
+with the indexer versions pinned, so a rebuild installs the same tools. The command tags the
+result with exactly the references the docker rung looks for, and `docker run` uses a locally
+present tag without contacting any registry — after building, no pull ever happens. To be
+precise about what "local" means: the *build* still downloads (the base image from Docker Hub,
+`scip-go` sources via proxy.golang.org, the two npm indexers from npm), but every ingredient is
+named in a recipe you can read instead of arriving as one opaque blob.
 
-The design, the per-rung precision measurements and the known limits are written up in
-[docs/calls-resolution.md](docs/calls-resolution.md).
+**2 · Pull the published images and check who built them.** They are built multi-arch and pushed
+by [CI](.github/workflows/images.yml) from a visible commit of this repository — not from
+anyone's laptop — and carry GitHub artifact attestations (Sigstore underneath):
 
-> **Indexing untrusted code?** The SCIP pass runs a real build toolchain *inside* the
-> repository being indexed, which reads that repository's build configuration. Set
-> `USE_SCIP_SEMANTIC=false` for code you have not reviewed.
+```bash
+gh attestation verify oci://ghcr.io/uiqkos/inflorescence-scip-go:v1 --owner uiqkos
+gh attestation verify oci://ghcr.io/uiqkos/inflorescence-scip-node:v1 --owner uiqkos
+```
 
-## Supported languages
+The code references these images by **immutable digest**, not by tag: a tag can be silently
+re-pointed in the registry, a digest cannot. `inflorescence doctor` prints the exact reference
+that will run on your machine and whether it is already local.
 
-| Language | Parser |
+**3 · Turn the rung off.** `USE_SCIP_SEMANTIC=false`. No containers start at all; `CALLS` edges
+come from the syntactic ladder, and everything it cannot resolve is recorded honestly.
+
+Worth stating plainly: the alternative to the container is not "everything stays local" — it is
+`go install` / `npm install -g` of the same third-party indexer **with no sandbox at all**, and
+an indexer, wherever it runs, executes the build configuration of the repository being indexed.
+The container is the contained option: repository mounted read-only, index written to a separate
+mount, `--rm`, your uid, and nothing else of the host exposed (`docker_scip_argv` in
+[`scip_semantic.py`](src/inflorescence/code_indexer/scip_semantic.py)).
+
+Sizes, measured: scip-go — 243 MB on disk, 76 MB of network transfer; scip-node — 310 MB and
+100 MB. Two images rather than one because a merged image would cost ~545 MB and ~170 MB of
+transfer for everyone, including a user who only ever indexes Python; only a polyglot repository
+would come out ahead, and then by about 6 MB.
+
+---
+
+## FEEDBACK
+
+The agent on the other end of the MCP connection is the only witness to how these tools behave
+in a real task. It is the one that read a description and picked the wrong tool, got an empty
+page it could not tell apart from "nothing matches", or spent four calls on a question one call
+should have answered — and then worked around it inside a session that closed an hour later.
+`send_feedback` is where that goes instead. The server asks for it in its own instructions.
+
+```
+send_feedback(
+  message="search_semantic('retry backoff') returned 5 weak hits, all from tests, while the "
+          "implementation is in net/retry.go — search_text on 'backoff' found it immediately.",
+  kind="wrong_result",      # bug · wrong_result · missing_capability · confusing_docs
+                            # performance · praise · experience_report · other
+  severity="high",          # low · medium · high · blocking
+  tool="search_semantic",
+  directory="/path/to/repo" # records the tree, its branch and its commit
+)
+```
+
+An unrecognized `kind` or `severity` is filed as `other` / `medium` rather than refused. Read
+what came in:
+
+```bash
+inflorescence feedback                  # newest 20, oldest first
+inflorescence feedback --kind bug       # just the breakage
+inflorescence feedback --limit 0 --json # everything, machine-readable
+inflorescence feedback --path           # where the file lives
+```
+
+```
+Feedback log: ~/.config/inflorescence/feedback.jsonl
+2 entries
+
+fb_20260908T101500Z_3a0ca9  2026-09-08 10:15:00  wrong_result/high  [search_semantic]
+    search_semantic('retry backoff') returned 5 weak hits, all from tests…
+    tree:  /path/to/repo (main @ a1b2c3d)
+```
+
+Two decisions, both deliberate:
+
+- **It is a plain file, not a node in Memgraph.** The reports worth having most are written when
+  the database is unreachable, the project was never indexed, or a tool just raised. A sink that
+  shares a failure domain with the thing being reported is empty at the only moment it matters.
+  `send_feedback` needs no database, no index, no LLM and no API key.
+- **Nothing leaves your machine.** Entries are appended as JSONL to `FEEDBACK_PATH`, never
+  uploaded anywhere. There is no telemetry in this project. Whether any of it reaches the
+  maintainer is your decision, made by reading the file and forwarding what you choose.
+
+Entries are capped per report (20 000 characters of message, 4 000 per other field) and nothing
+ever rewrites or deletes one — the log grows until you prune it yourself.
+
+---
+
+## LANGUAGES
+
+| | |
 |---|---|
-| Python | stdlib `ast` — with an LLM fallback if a file fails to parse |
-| JavaScript / TypeScript | tree-sitter |
-| Go | tree-sitter |
-| Rust | tree-sitter |
-| Prose | `.md`, `.markdown`, `.mdx`, `.rst`, `.txt`, `.text`, `.adoc`, `.asciidoc`, `.org` — indexed whole, not parsed |
-| Styles | `.css`, `.scss`, `.sass`, `.less`, `.styl` — indexed whole, not parsed |
-| Markup | `.html`, `.htm` — indexed whole, not parsed |
-| Configuration | `.json`, `.jsonc`, `.yaml`, `.yml`, `.toml`, `.ini`, `.cfg`, `.conf` — indexed whole, not parsed |
+| Python | stdlib `ast`, with an LLM fallback if a file fails to parse |
+| JavaScript / TypeScript | tree-sitter (`.js` `.jsx` `.ts` `.tsx`) |
+| Go | tree-sitter (`.go`) |
+| Rust | tree-sitter (`.rs`) |
+| Prose | `.md` `.markdown` `.mdx` `.rst` `.txt` `.text` `.adoc` `.asciidoc` `.org` — indexed whole, not parsed |
+| Styles | `.css` `.scss` `.sass` `.less` `.styl` — indexed whole, not parsed |
+| Markup | `.html` `.htm` — indexed whole, not parsed |
+| Configuration | `.json` `.jsonc` `.yaml` `.yml` `.toml` `.ini` `.cfg` `.conf` — indexed whole, not parsed |
+| Shell / operator scripts | `.sh` `.bash` `.zsh` `.fish` `.ps1` — indexed whole, not parsed |
+| Build files, by exact name | `Makefile` `GNUmakefile` `Dockerfile` `Containerfile` `Justfile` `Procfile` `Rakefile` `Brewfile` `.env.example` (and `.sample` / `.template` / `.dist`) — indexed whole, not parsed |
 
-Only these extensions are scanned; files in other languages are skipped today. The
-parser layer is pluggable (`ParserRegistry` maps an extension to a parser), so broad
-tree-sitter coverage is a natural next step — see the note below.
+Only these extensions and names are scanned; files in other languages are skipped today. The parser layer
+is pluggable (`ParserRegistry` maps an extension to a parser), so broader tree-sitter coverage is
+a natural next step.
 
-Documents are deliberately *not* parsed for structure: each file becomes one `Document`
-node and its body is split into overlapping windows (`DOCUMENT_CHUNK_SIZE` /
-`DOCUMENT_CHUNK_OVERLAP`), which is what keeps a passage in the middle of a long guide —
-or a `@media (prefers-reduced-motion)` block in the middle of a stylesheet — retrievable.
-They are summarized and embedded like code, so they cost money like code: `preview=true`
-prices them along with everything else, and adding them to an already-indexed project makes
-the next re-index quote more than the last one did. Set `INDEX_DOCUMENTS=false` to leave
-them out entirely, or narrow `DOCUMENT_EXTENSIONS`.
+Documents are summarized and embedded like code, so they cost like code: `preview=true` prices
+them along with everything else, and adding them to an already-indexed project makes the next
+re-index quote more than the last one did. `INDEX_DOCUMENTS=false` leaves them out entirely;
+`DOCUMENT_EXTENSIONS` and `DOCUMENT_FILENAMES` narrow the set.
 
-Three guards keep generated bulk out. Dependency lock files are dropped **by name**,
-whatever the extension list says — `package-lock.json`, `npm-shrinkwrap.json`,
-`pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `deno.lock`, `poetry.lock`, `pdm.lock`,
-`uv.lock`, `Pipfile.lock`, `Cargo.lock`, `composer.lock`, `Gemfile.lock`, `go.sum`,
-`mix.lock`, `flake.lock`, `packages.lock.json`. Anything over `MAX_FILE_SIZE_BYTES` is
-reported in `skipped_large_files` rather than summarized. And `.gitignore` plus the default
-excludes already keep `node_modules/`, `dist/`, `build/` and friends out of the scan.
+Shell scripts and `Makefile`s are in that list for a reason worth stating: in most repositories
+they *are* the runbook. The exact invocation, every flag, and the comment explaining why a flag
+is mandatory live in a wrapper script and nowhere else, so a graph holding every Python module
+of a `scripts/` directory and none of its nine shell scripts cannot answer "how is this actually
+launched". One consequence survives the fix and is worth knowing: a document owns no outgoing
+edges, so a module invoked only as `python -m scripts.runner` from a shell wrapper still
+has no incoming `CALLS` edge — operator-facing entry points look callerless, and a dead-code
+judgement made from incoming edges alone will be wrong about exactly those. A real `.env` is
+never indexed; only its committed template is.
+
+Three guards keep generated bulk out. **Lock files** are dropped by name whatever the extension
+list says — `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`,
+`bun.lock`, `bun.lockb`, `deno.lock`, `poetry.lock`, `pdm.lock`, `uv.lock`, `Pipfile.lock`,
+`Cargo.lock`, `composer.lock`, `Gemfile.lock`, `go.sum`, `mix.lock`, `flake.lock`,
+`packages.lock.json`. **Generated output** is skipped while `SKIP_GENERATED` is on: protobuf
+output, `*.min.js`, `*.min.css`, bundles, plus any file whose first 2048 bytes carry
+`@generated` or `Code generated` … `DO NOT EDIT`. And anything over `MAX_FILE_SIZE_BYTES` is
+reported in `skipped_large_files` rather than summarized.
+
 `.xml` is deliberately absent: in practice it is dominated by machine-written trees (IDE
-settings, JUnit/coverage reports, generated resources) whose tag soup chunks and embeds
-badly, and its hand-written uses belong to toolchains this indexer has no parser for.
+settings, JUnit/coverage reports, generated resources) whose tag soup chunks and embeds badly,
+and its hand-written uses belong to toolchains this indexer has no parser for.
 
-## Development
+---
+
+## CLI
+
+One console script, `inflorescence`. A bare invocation is `serve`.
+
+| command | arguments |
+|---|---|
+| `serve` | `--allow-degraded` |
+| `index <path>` | `--include GLOB` · `--exclude GLOB` (both repeatable) · `--dry-run` · `--max-cost USD` · `--force` |
+| `prune <path>` | `--exclude GLOB` · `--include GLOB` (both repeatable) · `--dry-run` |
+| `watch add\|rm <path>` | — |
+| `watch status [path]` | `--stale` |
+| `watch run\|install\|uninstall` | — |
+| `feedback` | `--limit N` (0 = all) · `--kind KIND` · `--json` · `--path` |
+| `dashboard` | `--host HOST` (default `127.0.0.1`) · `--port N` (default `8321`) · `--no-browser` |
+| `init` | — |
+| `doctor` | — |
+| `build-images` | `--language go\|node\|all` · `--tag v1` · `--registry ghcr.io/uiqkos` |
+
+Global, before the subcommand: `--debug` (overrides `LOG_LEVEL`) and `--log-file PATH`.
+
+---
+
+## CONFIGURATION
+
+Every setting is an environment variable. Two dotenv files are read, in ascending precedence —
+`~/.config/inflorescence/.env` (written by `init`; `%APPDATA%\inflorescence\.env` on Windows),
+then `./.env` from the process's working directory — and real environment variables outrank
+both.
+
+| variable | default | |
+|---|---|---|
+| `OPENROUTER_API_KEY` | — | OpenRouter API key (**required**) |
+| `MEMGRAPH_URL` | `bolt://localhost:7687` | connection URL |
+| `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` | — | optional auth |
+| `LLM_MODEL` | `google/gemini-2.5-flash-lite` | summaries and the LLM parse fallback |
+| `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint |
+| `CODE_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | code-chunk embeddings |
+| `SUMMARY_EMBEDDING_MODEL` | `openai/text-embedding-3-small` | summary embeddings |
+| `EMBEDDING_DIMENSION` | `1536` | must match both models; changing it requires a re-index |
+| `SEMANTIC_WEAK_THRESHOLD` | `0.5` | cosine similarity below which a vector hit is labelled `weak`. A label, not a filter — that is the per-query `min_score` |
+| `USE_LLM_SUMMARIES` | `true` | `false` builds a graph-only index that sends nothing to an LLM |
+| `INDEX_DOCUMENTS` | `true` | index non-code files as whole documents; `false` leaves them out of the scan |
+| `DOCUMENT_EXTENSIONS` | see `LANGUAGES` | which extensions count as a document |
+| `DOCUMENT_FILENAMES` | see `LANGUAGES` | exact filenames that count as a document (`Makefile`, `Dockerfile`, `.env.example`, …) |
+| `MAX_FILE_SIZE_BYTES` | `262144` | skip files larger than this |
+| `MAX_INDEX_COST_USD` | `10.0` | cap on every run that would spend; empty removes it |
+| `REQUIRE_SEARCH_INDEXES` | `true` | refuse to index against a Memgraph that cannot host vector indexes, rather than paying for unsearchable embeddings |
+| `RESPECT_GITIGNORE` | `true` | `.inflorescenceignore` is honored either way |
+| `SKIP_GENERATED` | `true` | skip recognisably generated files |
+| `USE_SCIP_SEMANTIC` | `true` | compiler-grade `CALLS` resolution where the project builds |
+| `SCIP_RUNNER` | `auto` | `auto` / `native` / `docker` |
+| `WORKTREE_AUTO_INDEX` | `true` | index a worktree of an indexed checkout on its first query |
+| `WORKTREE_CLONE` | `true` | copy the donor graph inside Memgraph; `false` falls back to the client-side path |
+| `WORKTREE_JANITOR_ENABLED` | `true` | reap the indexes of worktrees git no longer knows |
+| `WATCHER_DEBOUNCE_SECONDS` | `5.0` | quiet period before a change flush |
+| `WATCH_REFRESH_SECONDS` | `30.0` | how often the daemon re-reads its registry (the delay before `watch add` takes effect) |
+| `WATCH_CATCH_UP` | `true` | reconcile a project against disk when the daemon picks it up |
+| `FEEDBACK_PATH` | `~/.config/inflorescence/feedback.jsonl` | where `send_feedback` appends |
+| `LOG_LEVEL` | `INFO` | `--debug` overrides it |
+
+**[`.env.example`](.env.example) is the complete reference** — every setting, with its default
+and what it is for. The table above is the subset most people touch. Chunking
+(`CHUNK_SIZE` 3000, `CHUNK_OVERLAP` 1000, `DOCUMENT_CHUNK_SIZE` 800, `DOCUMENT_CHUNK_OVERLAP`
+200), batching (`BATCH_SIZE` 10, `RAG_INDEX_BATCH_SIZE` 256, `DB_WRITE_BATCH_SIZE` 500), the
+price settings and `SUMMARY_MAX_SOURCE_CHARS` (12 000) are documented there.
+
+Logs go to a per-user location — `~/Library/Logs/inflorescence/` on macOS,
+`$XDG_STATE_HOME/inflorescence/` on Linux, `%LOCALAPPDATA%\inflorescence\` on Windows — capped
+at 10 MB per file with 3 rotations, plus `watch.out.log` / `watch.err.log` for the launchd job.
+Override with `--log-file`.
+
+---
+
+## WHAT LEAVES YOUR MACHINE
+
+Indexing sends your source code to third-party APIs. Specifically:
+
+- **To the LLM** (OpenRouter by default): the source of each entity, truncated to
+  `SUMMARY_MAX_SOURCE_CHARS` (12 000 characters), for summarization — and the whole file for any
+  Python file the AST parser cannot handle, which falls back to an LLM extractor.
+- **To the embeddings endpoint**: every code chunk and every generated summary.
+
+Nothing else is transmitted: no paths outside the indexed repository, no telemetry, no
+analytics. The graph, the vectors, the dashboard and the feedback log are entirely local.
+
+If that is not acceptable for a given repository, `USE_LLM_SUMMARIES=false` builds the code
+graph and skips summarization — but code-chunk embeddings still reach the embeddings endpoint,
+so a fully offline index means pointing `CODE_EMBEDDING_BASE_URL` at a local OpenAI-compatible
+server.
+
+---
+
+## DEVELOPMENT
 
 ```bash
 git clone https://github.com/uiqkos/inflorescence
@@ -674,73 +942,67 @@ uv run ruff check src/ tests/  # lint
 
 The test suite needs **nothing running** — no Memgraph, no API key, no network. Tests that
 require a live database skip themselves unless `INFLORESCENCE_TEST_MEMGRAPH_URL` is set, so a
-clean clone gives you a green run in seconds. To include them:
+clean clone gives a green run in seconds. To include them:
 
 ```bash
-docker compose up -d           # Memgraph + Lab
+docker compose up -d           # Memgraph + Lab (the same container `init` uses)
 INFLORESCENCE_TEST_MEMGRAPH_URL=bolt://localhost:7687 uv run pytest
 ```
 
-What unit tests cannot check cheaply — that the tools return real payloads against a live
-stack, and that editing one file does not re-summarize the project — is a manual gate in
-[docs/smoke-test.md](docs/smoke-test.md).
+What unit tests cannot check cheaply — that the tools return real payloads against a live stack,
+and that editing one file does not re-summarize the project — is a manual gate in
+[docs/smoke-test.md](docs/smoke-test.md). CI runs in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 
-## Design invariants
+---
 
-An index is a derivative of your code that costs real money and real time to produce, lives
-a long time, and should update cheaply. Ten rules protect that, and every one of them is the
-residue of a production incident rather than an abstraction. Comments in `src/` and `tests/`
-cite them as `INV-1` … `INV-10`; this is the key.
+## DESIGN INVARIANTS
 
-- **INV-1 · Paid-for data is never destroyed** — An update *reconciles* (upsert what is live,
-  delete only what is genuinely stale) instead of wiping and rebuilding, so nothing stored is
-  removed before its replacement is actually written. A failed run degrades to *stale* data,
-  never to *empty*: updates once began with a project-wide delete, so a crashed run left the
-  project with no chunks and no embeddings.
-- **INV-2 · Fail closed — no mutation without working dependencies** — If the LLM, an
-  embedding endpoint, or the database is unreachable or a key is invalid, a cheap pre-flight
-  aborts *before* the first write instead of discovering it at node 800; a server with a
-  broken configuration stays read-only. A keyless server once "indexed" happily, took a 401
-  on every call, and wrote the results of those failures into the graph.
-- **INV-3 · Stale beats empty** — On partial failure the previous value is kept together with
-  a marker to recompute on the next run; good data is never overwritten with a fallback or a
-  blank. A summarization failure once wrote `summary=""` over 876 perfectly good summaries.
-- **INV-4 · One mutation per project at a time** — Concurrent updates to the same project are
-  impossible by construction (a lock), not by lucky timing, and re-running the same update is
-  a cheap no-op thanks to checksums. Two watcher flushes racing each other once erased each
-  other's writes, reporting "1660 re-embedded, stored 0".
-- **INV-5 · Cost is proportional to the change** — Editing one file costs O(file), not
-  O(project): summaries are reused by content hash, chunk ids are content-derived and stable,
-  and no-op events are discarded before any work starts. A full recompute happens only on an
-  explicit request, and a re-run with no changes must cost zero API calls — deleting a single
-  file once triggered a re-embed of the entire project.
-- **INV-6 · Only indexable paths affect the index** — Events for paths that were never in the
-  index (temp files, gitignored paths, unsupported extensions) are filtered out as early as
-  possible and cannot start work, and "absent from the scan" is never read as "deleted" —
-  only something that really was indexed can be deleted. Saving an ignored file was once
-  classified as a deletion and triggered a full rebuild, looping on phantom
+An index is a derivative of your code that costs real money and real time to produce, lives a
+long time, and should update cheaply. Ten rules protect that, and every one is the residue of a
+production incident rather than an abstraction. Comments in `src/` and `tests/` cite them as
+`INV-1` … `INV-10`.
+
+- **INV-1 · Paid-for data is never destroyed.** An update reconciles — upsert what is live,
+  delete only what is genuinely stale — instead of wiping and rebuilding, so nothing stored is
+  removed before its replacement is written. Updates once began with a project-wide delete, so a
+  crashed run left the project with no chunks and no embeddings.
+- **INV-2 · Fail closed — no mutation without working dependencies.** If the LLM, an embedding
+  endpoint or the database is unreachable, or a key is invalid, a cheap pre-flight aborts before
+  the first write instead of discovering it at node 800. A keyless server once "indexed"
+  happily, took a 401 on every call, and wrote the results of those failures into the graph.
+- **INV-3 · Stale beats empty.** On partial failure the previous value is kept together with a
+  marker to recompute next run. A summarization failure once wrote `summary=""` over 876
+  perfectly good summaries.
+- **INV-4 · One mutation per project at a time.** Concurrent updates are impossible by
+  construction (a lock), not by lucky timing. Two watcher flushes racing each other once erased
+  each other's writes, reporting "1660 re-embedded, stored 0".
+- **INV-5 · Cost is proportional to the change.** Editing one file costs O(file), not
+  O(project): summaries are reused by content hash, chunk ids are content-derived and stable, and
+  a re-run with no changes must cost zero API calls. Deleting a single file once triggered a
+  re-embed of the entire project.
+- **INV-6 · Only indexable paths affect the index.** Events for paths that were never indexed are
+  filtered out before they can start work, and "absent from the scan" is never read as
+  "deleted". Saving an ignored file was once classified as a deletion and looped on phantom
   `0 changed, N deleted`.
-- **INV-7 · Telemetry tells the truth about the database** — "Stored N" means N rows in the
-  database as counted by the write, not N rows submitted; attempts and successes are counted
-  separately, a mass failure logs at ERROR rather than INFO, and an operation's result
-  reports actual post-run state. A run once reported "828 re-embedded" with zero rows
-  actually written, and nothing above WARNING revealed it.
-- **INV-8 · Any corruption heals on the next run** — Every incomplete state (an empty
-  summary, a NULL embedding, a file with no chunks, a blank input hash) is detectable by a
-  query and repaired by the next healthy run, with no rebuild and no manual surgery, so a run
-  killed at any point leaves state that repair converges from. Verified in practice: 876
-  summaries, 1448 chunks and 1704 embeddings all came back from a single `index`.
-- **INV-9 · Project filter before limit** — One database holds many projects, so every global
-  query (vector search, BM25) applies project scope before or around top-k, or over-fetches
-  and trims after filtering; one project can never evict another's results. Vector search
-  once took a global top-k and filtered afterwards, returning zero hits for a project whose
-  neighbour had filled the whole top-k.
-- **INV-10 · The user's money is spent deliberately** — A first index is gated by a cost
-  estimate, and a background operation may never silently spend more than an explicit one.
-  Paying twice for what is already paid for — re-embedding unchanged content — is a bug by
-  definition: each phantom rebuild once re-paid for 1448 chunk embeddings and threw the
-  result away.
+- **INV-7 · Telemetry tells the truth about the database.** "Stored N" means N rows as counted by
+  the write; attempts and successes are counted separately; an operation's result reports actual
+  post-run state. A run once reported "828 re-embedded" with zero rows written, and nothing
+  above WARNING revealed it. This is also why an empty search page says which kind of empty it
+  is.
+- **INV-8 · Any corruption heals on the next run.** Every incomplete state — an empty summary, a
+  NULL embedding, a file with no chunks, a blank input hash — is detectable by a query and
+  repaired by the next healthy run. Verified in practice: 876 summaries, 1448 chunks and 1704
+  embeddings all came back from a single `index`.
+- **INV-9 · Project filter before limit.** One database holds many projects, so every global
+  query applies project scope before or around top-k. Vector search once took a global top-k and
+  filtered afterwards, returning zero hits for a project whose neighbour had filled it.
+- **INV-10 · The user's money is spent deliberately.** A first index is gated by an estimate, and
+  a background operation may never silently spend more than an explicit one. Each phantom rebuild
+  once re-paid for 1448 chunk embeddings and threw the result away.
 
-## License
+---
+
+## LICENSE
 
 [MIT](LICENSE) © 2026 Kirill

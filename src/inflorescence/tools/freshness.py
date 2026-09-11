@@ -29,6 +29,14 @@ This is a **file-level** check, not a node-level one. "stale" means the file cha
 line numbers may have shifted and the summary may describe older code — not that this
 particular function or class is what changed.
 
+The block also answers the question a clean page provokes rather than settles: *will this
+stay true?* ``watcher`` says whether a watch daemon is following this tree right now, is
+registered but not running (the state after a reboot), or was never registered — with the
+command that changes it. A page whose files all hash fresh and whose watcher is ``none`` is
+an index that was correct at some past moment and is drifting from that moment onwards; the
+freshness flags alone cannot say that, because they only ever look at the handful of files
+this answer happened to return.
+
 The block carries one more honesty signal, ``live_worktrees``. Every file of the main
 checkout can hash fresh while a branch checked out in one of its git worktrees holds a
 completely different version of that code: the worktree is a *separate project*, indexed
@@ -45,7 +53,15 @@ Alongside the freshness block, every such response carries ``meta.answered_from`
 tree the query was answered from, named by path, branch and short commit (see
 :func:`describe_origin`). Freshness says whether the answer is current; that line says
 *current with what*, which is the question a repository with several worktrees on disk
-actually raises.
+actually raises. When the files on the page belong to an independent checkout *inside* that
+tree — a submodule, a vendored repository — ``meta.nested_checkouts`` names it and its own
+HEAD (:func:`describe_nested_checkouts`), because the outer branch says nothing about code
+that is on a different one.
+
+What this module cannot see is a file that was never indexed: with no node there is no
+checksum, so ``checked``/``stale``/``missing`` are all silent about it and a clean block over
+a missing file reads as a clean bill of health. That gap is answered separately, on empty
+pages, by :mod:`inflorescence.tools.coverage`.
 
 Cost: one MD5 per *distinct* path on the page (memoized here), so a 50-item page of one
 module reads one file. Nothing outside the page is scanned. The worktree count adds one
@@ -76,6 +92,49 @@ _ITEM_FLAG = {STALE: "stale", MISSING: "file_missing"}
 
 # Directory nodes carry a folder as their ``file_path``; nothing about them is hashable.
 _DIRECTORY_NODE_TYPE = NodeType.DIRECTORY.value
+
+
+def _watcher_notice(state: Mapping[str, Any]) -> str:
+    """Say whether anything is keeping this index current, and what to do when nothing is.
+
+    Freshness answers "do the files on THIS page still match" — a page-sized question. The
+    reader's next one is bigger: can the rest of the answer be trusted, and will it still be
+    true in an hour. A clean page says nothing about that, and a reader with no other signal
+    reads a clean page as a current index, which is exactly how a graph built last week gets
+    quoted in the present tense.
+
+    Three states, each with its action inside the sentence, because the reader may not have
+    the tool description in context: followed right now, registered but with nothing running
+    (the state after a reboot — the fix is to start the daemon, not to re-index), and never
+    registered (an index that only ever moves when someone re-indexes it by hand).
+    """
+    if state.get("live"):
+        # The clause after the semicolon is not decoration. Read without it, on an empty
+        # page, this sentence says "everything on disk is in the index" — and an agent acted
+        # on exactly that reading over a file the daemon had never seen (field report,
+        # 10.09.2026). A watcher promises to follow saves; it cannot promise coverage, and
+        # meta.index_coverage is what actually checks.
+        return (
+            "live — a watch daemon is following this tree and re-indexes what you save; a file "
+            "it has not picked up yet, or one created while it was not running, is simply "
+            "absent from the index"
+        )
+    if state.get("watched") and state.get("daemon_live"):
+        # Registered seconds ago and not yet picked up, or picked up by nothing because the
+        # daemon refused it. "Start the daemon" is wrong advice in both — one is running.
+        return (
+            "registered but not yet followed by the running daemon — everything below is as "
+            "fresh as the last index until it is; `inflorescence watch status` says why"
+        )
+    if state.get("watched"):
+        return (
+            "registered but no daemon is running it — everything below is as fresh as the "
+            "last index and no fresher; start it with `inflorescence watch run`"
+        )
+    return (
+        "none — this index changes only when something re-indexes it; follow this tree with "
+        "`inflorescence watch add <path>`"
+    )
 
 
 def _live_worktrees_notice(count: int) -> str:
@@ -120,6 +179,74 @@ def describe_origin(root: Path) -> str:
     return line
 
 
+# How many distinct directories a page's paths may be traced up through when looking for a
+# nested checkout. A page is at most 100 items and its files cluster in a handful of folders,
+# so this is generous; it exists so a pathological page cannot turn one answer into hundreds
+# of `stat` calls.
+_MAX_SUBPROJECT_DIRS = 24
+
+
+def describe_nested_checkouts(root: Path, rel_paths: Iterable[str]) -> list[str]:
+    """Name any independent git checkout the answer's files actually live in.
+
+    ``answered_from`` names the tree the query was addressed to. In a monorepo that vendors
+    its subprojects as submodules — or simply holds nested repositories — that is the *outer*
+    checkout, and its branch says nothing about the code being returned: a field report
+    (10.09.2026) has ``answered_from`` reading ``main @ 1a2b3c4`` while every file on the
+    page came from a subproject sitting on ``feature/nightly-batch`` at a different commit. The
+    line was not wrong so much as answering a different question than the one it appeared to.
+
+    So the response says both: the tree it was answered from, and — when the files are in one
+    — the nested checkout they belong to, with its own branch and commit.
+
+    Walks each path upward to its nearest enclosing ``.git`` (memoized per directory, capped
+    by :data:`_MAX_SUBPROJECT_DIRS`), and reports nothing at all in the ordinary case where
+    that is the project root itself. Every failure is silence: a provenance line that might
+    be wrong is worse than none (the same rule :func:`describe_origin` follows).
+    """
+    nested: dict[str, str | None] = {}
+    seen_dirs: set[str] = set()
+    for rel_path in rel_paths:
+        directory = str(rel_path).replace("\\", "/").rsplit("/", 1)[0] if "/" in str(rel_path) else ""
+        if not directory or directory in seen_dirs:
+            continue
+        if len(seen_dirs) >= _MAX_SUBPROJECT_DIRS:
+            break
+        seen_dirs.add(directory)
+        segments = directory.split("/")
+        # Deepest first: a submodule inside a submodule belongs to the inner one.
+        for depth in range(len(segments), 0, -1):
+            candidate = "/".join(segments[:depth])
+            if candidate in nested:
+                if nested[candidate] is not None:
+                    break
+                continue
+            try:
+                is_checkout = (root / candidate / ".git").exists()
+            except OSError:
+                is_checkout = False
+            if not is_checkout:
+                nested[candidate] = None
+                continue
+            head = head_description(root / candidate)
+            nested[candidate] = head or "an independent checkout"
+            break
+    return [
+        f"{directory} ({head})"
+        for directory, head in sorted(nested.items())
+        if head is not None
+    ]
+
+
+def _nested_checkouts_notice(lines: list[str]) -> str:
+    """Phrase the nested-checkout list as the correction to ``answered_from`` that it is."""
+    joined = "; ".join(lines)
+    return (
+        f"files on this page live in a checkout of their own, whose HEAD — not the one in "
+        f"answered_from — is the code you are reading: {joined}"
+    )
+
+
 def count_live_worktrees(root: Path) -> int:
     """How many linked worktrees of *root*'s checkout currently exist on disk.
 
@@ -150,14 +277,25 @@ class FreshnessChecker:
         stored: Mapping[str, str],
         live_worktrees: int = 0,
         origin: str | None = None,
+        watch_state: Mapping[str, Any] | None = None,
     ) -> None:
         self._root = root
         self._stored = dict(stored)
         self._live_worktrees = live_worktrees
         self._origin = origin
+        self._watch_state = watch_state
         # path -> status; doubles as the "already read this file" memo and as the record
         # of which paths this page actually touched (`checked` counts its keys).
         self._statuses: dict[str, str] = {}
+
+    @property
+    def indexed_files(self) -> set[str]:
+        """Every path this project stored a checksum for — the index's file inventory.
+
+        Already loaded for the freshness check, so the coverage check on an empty page
+        (:mod:`inflorescence.tools.coverage`) costs no extra round trip.
+        """
+        return set(self._stored)
 
     def status(self, file_path: str) -> str:
         """Return the freshness status of one root-relative path, hashing it at most once."""
@@ -245,6 +383,8 @@ class FreshnessChecker:
             "missing": sorted(buckets[MISSING]),
             "unknown": sorted(buckets[UNKNOWN]),
         }
+        if self._watch_state is not None:
+            block["watcher"] = _watcher_notice(self._watch_state)
         if self._live_worktrees:
             block["live_worktrees"] = _live_worktrees_notice(self._live_worktrees)
         return block
@@ -263,23 +403,32 @@ class FreshnessChecker:
         meta = payload.setdefault("meta", {})
         if self._origin:
             meta["answered_from"] = self._origin
+            nested = describe_nested_checkouts(self._root, self._statuses)
+            if nested:
+                meta["nested_checkouts"] = _nested_checkouts_notice(nested)
         meta["index_freshness"] = self.meta()
         return payload
 
 
-def unchecked_empty_page(directory: str | None = None) -> dict[str, Any]:
+def unchecked_empty_page(
+    directory: str | None = None, watch_state: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
     """The ``index_freshness`` block for a response that returns no entities at all.
 
     A degenerate page still carries the block — the "unflagged means fresh" convention
     only reads if it is unconditional — and says plainly that it checked nothing. Built
     from an empty checker so its shape cannot drift from the real one. Pass *directory*
-    to keep the ``live_worktrees`` warning on this page too: an empty answer is exactly
-    where "the branch state is elsewhere" is most worth saying.
+    to keep the ``live_worktrees`` warning on this page too, and *watch_state* to keep the
+    ``watcher`` line: an empty answer is exactly where "the branch state is elsewhere" and
+    "nothing has been keeping this current" are most worth saying, because an empty page
+    reads as "there is nothing here" and both are reasons it might not be.
     """
     if directory is None:
-        return FreshnessChecker(Path(), {}).meta()
+        return FreshnessChecker(Path(), {}, watch_state=watch_state).meta()
     root = Path(directory).resolve()
-    return FreshnessChecker(root, {}, live_worktrees=count_live_worktrees(root)).meta()
+    return FreshnessChecker(
+        root, {}, live_worktrees=count_live_worktrees(root), watch_state=watch_state
+    ).meta()
 
 
 async def build_checker(repo: Any, project: str, directory: str) -> FreshnessChecker:
@@ -295,4 +444,5 @@ async def build_checker(repo: Any, project: str, directory: str) -> FreshnessChe
         stored,
         live_worktrees=count_live_worktrees(root),
         origin=describe_origin(root),
+        watch_state=await repo.get_watch_state(project),
     )

@@ -523,16 +523,37 @@ async def test_list_projects_returns_marker_aware_rows() -> None:
     conn = FakeConnection(
         rows=[
             {"project": "a_1", "root_path": "/a", "worktree_of": None, "main_root_path": None},
-            {"project": "b_1", "root_path": "/b", "worktree_of": "a_1", "main_root_path": "/a"},
+            {
+                "project": "b_1",
+                "root_path": "/b",
+                "worktree_of": "a_1",
+                "main_root_path": "/a",
+                "watched": True,
+            },
         ]
     )
     repo = GraphRepository(conn)  # type: ignore[arg-type]
 
     projects = await repo.list_projects()
 
+    # `watched` is the watch-daemon registry flag: absent (a project predating the registry,
+    # or never registered) must read as False rather than None, because the daemon branches
+    # on it directly.
     assert projects == [
-        {"project": "a_1", "root_path": "/a", "worktree_of": None, "main_root_path": None},
-        {"project": "b_1", "root_path": "/b", "worktree_of": "a_1", "main_root_path": "/a"},
+        {
+            "project": "a_1",
+            "root_path": "/a",
+            "worktree_of": None,
+            "main_root_path": None,
+            "watched": False,
+        },
+        {
+            "project": "b_1",
+            "root_path": "/b",
+            "worktree_of": "a_1",
+            "main_root_path": "/a",
+            "watched": True,
+        },
     ]
     query, _ = conn.reads[0]
     assert "dir:." in query

@@ -1,6 +1,9 @@
 """Whole-file indexing for documents: prose (.md, .rst, .txt), styles (.css, .scss),
-markup (.html) and configuration (.json, .yaml, .toml, .ini) — see
-:data:`inflorescence.config.DEFAULT_DOCUMENT_EXTENSIONS` for the full set.
+markup (.html), configuration (.json, .yaml, .toml, .ini) and the runbook layer — shell
+scripts (.sh, .bash, .zsh) plus build files named rather than suffixed (``Makefile``,
+``Dockerfile``, ``.env.example``). See
+:data:`inflorescence.config.DEFAULT_DOCUMENT_EXTENSIONS` and
+:data:`inflorescence.config.DEFAULT_DOCUMENT_FILENAMES` for the full sets.
 
 A document has no structure this graph can model: a heading is not a symbol, nothing
 CALLS a paragraph, a CSS rule is not a function and a JSON object is not a class. An
@@ -25,7 +28,7 @@ from pathlib import Path
 
 from inflorescence.code_indexer.models import CodeNode, Edge, NodeType
 from inflorescence.code_indexer.parser.base_parser import BaseParser
-from inflorescence.config import DEFAULT_DOCUMENT_EXTENSIONS
+from inflorescence.config import DEFAULT_DOCUMENT_EXTENSIONS, DEFAULT_DOCUMENT_FILENAMES
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +42,24 @@ def _normalize_extension(extension: str) -> str:
 class DocumentParser(BaseParser):
     """Emits one node per document file, with no structure extraction."""
 
-    def __init__(self, extensions: Sequence[str] | None = None) -> None:
+    def __init__(
+        self,
+        extensions: Sequence[str] | None = None,
+        filenames: Sequence[str] | None = None,
+    ) -> None:
         source = DEFAULT_DOCUMENT_EXTENSIONS if extensions is None else extensions
         self._extensions = sorted({_normalize_extension(e) for e in source if e.strip()})
+        names = DEFAULT_DOCUMENT_FILENAMES if filenames is None else filenames
+        # Case-sensitive, unlike extensions: on a case-sensitive filesystem ``makefile`` and
+        # ``Makefile`` are two different files and both are conventional, so both are listed
+        # explicitly rather than folded together — which would also admit ``MAKEFILE.md``.
+        self._filenames = sorted({n.strip() for n in names if n.strip()})
 
     def get_supported_extensions(self) -> list[str]:
         return list(self._extensions)
+
+    def get_supported_filenames(self) -> list[str]:
+        return list(self._filenames)
 
     def parse_file(self, file_path: Path, root_path: Path) -> tuple[list[CodeNode], list[Edge]]:
         rel = str(file_path.relative_to(root_path))

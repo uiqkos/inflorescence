@@ -1,6 +1,14 @@
 services:
   memgraph:
     image: memgraph/memgraph-mage:latest
+    # The same name the code starts on its own (docker_env.MEMGRAPH_CONTAINER), and not
+    # compose's default `inflorescence-memgraph-1`. Both paths reach the same machine:
+    # `inflorescence init` uses compose inside this checkout, `inflorescence serve` starts
+    # the container directly from anywhere else. Under two different names those two paths
+    # build two Memgraphs over the one volume below — they then fight for port 7687, and
+    # the loser is left running but attached to no network, unreachable and unrepairable
+    # by restart. One name makes the second path adopt the first path's container.
+    container_name: inflorescence-memgraph
     ports:
       # Loopback only: Memgraph runs without authentication and holds the source code of
       # every indexed repository; docker's default of binding 0.0.0.0 would hand both to
@@ -9,8 +17,35 @@ services:
     volumes:
       - mg_data:/var/lib/memgraph
     command:
+      # Kept byte-identical with docker_env.MEMGRAPH_STORAGE_ARGS — `init` starts this
+      # container through compose, `serve` starts it with `docker run` from anywhere else,
+      # and the two must configure the same machine. Change one, change the other.
       - "--storage-snapshot-on-exit=true"
-      - "--storage-snapshot-interval-sec=300"
+      # Six hours, not the five minutes this used to say. A snapshot is a full dump of the
+      # database, and this database is mostly embeddings: 1536 float32 per chunk, so it
+      # crossed 5.6 GB at ~190k vectors. At a 300-second interval Memgraph spent roughly two
+      # minutes out of every five writing those 5.6 GB — ~1.6 TB of SSD writes a day, ten
+      # snapshot threads of CPU, and a 5.6 GB churn through the VM's page cache that kept
+      # OrbStack's host footprint pinned near the VM's full 8 GB. None of it bought any
+      # durability the WAL below does not already provide.
+      #
+      # The interval is not a durability knob here — WAL is on and replays every committed
+      # transaction since the last snapshot, and --storage-snapshot-on-exit covers the clean
+      # stop. What the interval actually controls is how much WAL a cold recovery must
+      # replay. Six hours of this workload is tens of MB of WAL (the whole wal/ directory
+      # was 23 MB under the old interval), which replays in seconds.
+      #
+      # Note that a periodic snapshot fires whenever *any* transaction has landed since the
+      # last one — and something always has, because the watch daemon writes a lease
+      # heartbeat every 30 seconds (db/lease.py:HEARTBEAT_INTERVAL_S). There is no idle
+      # state in which this schedule quietly stops costing anything, which is exactly why
+      # the interval has to be sized against the database, not left at a default.
+      - "--storage-snapshot-interval-sec=21600"
+      # Two, not the default three. Retention multiplies the snapshot size on disk: three
+      # copies of 5.6 GB is 17 GB, and that was most of the 20 GB the volume had grown to.
+      # Two still survives a snapshot found corrupt at recovery; one would leave nothing to
+      # fall back to.
+      - "--storage-snapshot-retention-count=2"
     healthcheck:
       test: ["CMD-SHELL", "echo 'RETURN 1;' | mgconsole || exit 1"]
       interval: 10s

@@ -921,15 +921,53 @@ async def test_get_entity_structure_resolves_file_root_and_paginates_children() 
 
 
 @pytest.mark.asyncio
-async def test_get_entity_structure_returns_structured_not_found_error() -> None:
+async def test_get_entity_structure_returns_structured_not_found_error(tmp_path: Path) -> None:
+    """A path that is in neither the index nor the filesystem says so — and says both halves.
+
+    "Structure root not found" was true and useless: it read identically for a typo and for a
+    real file the index had never seen, which is the ambiguity INV-7 exists to remove.
+    """
     mcp = FastMCP("test")
     repo = FakeGraphRepositoryV2()
     repo.root = None
     register_graph_tools(mcp, FakeManager(), repo)
 
-    payload = _payload(await mcp.call_tool("get_entity_structure", {"directory": "/tmp/project", "file_path": "missing.py"}))
+    payload = _payload(
+        await mcp.call_tool(
+            "get_entity_structure", {"directory": str(tmp_path), "file_path": "missing.py"}
+        )
+    )
 
-    assert payload == {"error": {"code": "not_found", "message": "Structure root not found"}}
+    assert payload["error"]["code"] == "not_found"
+    message = payload["error"]["message"]
+    assert "missing.py" in message and "no such file on disk" in message
+
+
+@pytest.mark.asyncio
+async def test_get_entity_structure_says_when_the_file_exists_but_was_never_indexed(
+    tmp_path: Path,
+) -> None:
+    """The field-report case: a real file, absent from the index, reported as plain "not found".
+
+    An agent read that as "this file does not exist" over a 174-line module sitting on disk
+    and was one step from writing it a second time. The error must name the gap and the fix.
+    """
+    mcp = FastMCP("test")
+    repo = FakeGraphRepositoryV2()
+    repo.root = None
+    register_graph_tools(mcp, FakeManager(), repo)
+    (tmp_path / "wave_queue.py").write_text("QUEUE = 1\n", encoding="utf-8")
+
+    payload = _payload(
+        await mcp.call_tool(
+            "get_entity_structure",
+            {"directory": str(tmp_path), "file_path": "wave_queue.py"},
+        )
+    )
+
+    message = payload["error"]["message"]
+    assert "exists on disk but is NOT in this index" in message
+    assert "index_directory" in message
 
 
 @pytest.mark.asyncio
@@ -1518,6 +1556,16 @@ def entity(
     }
 
 
+# The `watcher` line every freshness block carries for an ordinary indexed project: nothing
+# is following it, so the index only moves when someone re-indexes it. Its exact wording is
+# pinned by test_freshness_block_names_who_keeps_the_index_current; the other tests just need
+# the block to match.
+UNWATCHED = (
+    "none — this index changes only when something re-indexes it; follow this tree with "
+    "`inflorescence watch add <path>`"
+)
+
+
 class StoredChecksums:
     """The ``get_checksums`` every entity-returning tool calls once, for freshness.
 
@@ -1525,16 +1573,25 @@ class StoredChecksums:
     answer for a fake project whose files were never really indexed, and the one status
     that puts no flag on an item, so the tool tests above keep asserting bare entity refs.
     Tests that care set ``repo.checksums``; ``checksum_calls`` guards the one-call budget.
+
+    Also serves the watch state the same block reports (whether a daemon is keeping this
+    index current): unwatched by default, which is what an ordinary indexed project is.
     """
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
         self.checksums: dict[str, str] = {}
         self.checksum_calls = 0
+        self.watch_state: dict[str, object] = {"watched": False, "live": False, "holder": None}
+        self.watch_state_calls = 0
 
     async def get_checksums(self, project: str) -> dict[str, str]:
         self.checksum_calls += 1
         return dict(self.checksums)
+
+    async def get_watch_state(self, project: str) -> dict[str, object]:
+        self.watch_state_calls += 1
+        return dict(self.watch_state)
 
 
 class FakeEmbedder:
@@ -2220,7 +2277,13 @@ async def test_get_entity_context_tool_paginates_and_trims_sections() -> None:
         "answered_from": str(Path("/tmp/project").resolve()),
         # /tmp/project holds no such files, and the fake stored no checksums: every path
         # on the page is 'unknown', which is meta-only and flags no item.
-        "index_freshness": {"checked": 2, "stale": [], "missing": [], "unknown": ["pkg/a.py", "pkg/b.py"]},
+        "index_freshness": {
+            "checked": 2,
+            "stale": [],
+            "missing": [],
+            "unknown": ["pkg/a.py", "pkg/b.py"],
+            "watcher": UNWATCHED,
+        },
     }
 
 
@@ -2335,6 +2398,60 @@ async def test_search_entities_tool_returns_paginated_entity_refs() -> None:
     assert payload["page"] == page_dict(20, 0, None, False)
     assert payload["meta"]["query"] == "Worker"
     assert payload["meta"]["node_types"] == ["method"]
+
+
+class EmptySearchRepository(FakeGraphRepositoryV2):
+    """Finds nothing — the shape of the field report this test is about."""
+
+    async def search_entities(
+        self,
+        project: str,
+        query: str,
+        node_types: list[str] | None,
+        limit: int,
+        offset: int,
+    ) -> list[dict[str, object]]:
+        return []
+
+
+class CoverageManager(FakeManager):
+    """A manager that can answer "what is on disk that the index does not hold"."""
+
+    async def scan_uncovered(
+        self, directory: str, indexed_paths: object, scope: object = None
+    ) -> dict[str, object]:
+        from inflorescence.code_indexer.graph_builder import GraphBuilder
+        from inflorescence.code_indexer.models import IndexerConfig
+
+        builder = GraphBuilder(
+            repo=None,
+            llm=None,
+            config=IndexerConfig(use_llm_summaries=False, use_llm_fallback_parser=False),
+        )
+        return builder.scan_uncovered(Path(directory), list(indexed_paths), scope)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_search_says_what_the_index_does_not_cover(tmp_path: Path) -> None:
+    """End to end: the tool that reported "nothing named wave_queue exists" now names the file.
+
+    The whole path is under test — the page comes back empty, the freshness block is clean,
+    and the coverage block is what keeps the response from reading as proof of absence.
+    """
+    (tmp_path / "wave_queue.py").write_text("QUEUE = []\n", encoding="utf-8")
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, CoverageManager(), EmptySearchRepository())
+
+    payload = _payload(
+        await mcp.call_tool(
+            "search_entities", {"directory": str(tmp_path), "query": "wave_queue", "limit": 10}
+        )
+    )
+
+    assert payload["items"] == []
+    coverage = payload["meta"]["index_coverage"]
+    assert coverage["not_indexed"] == ["wave_queue.py"]
+    assert "NOT evidence of absence" in coverage["note"]
 
 
 LONG_SUMMARY = "A long multi-paragraph summary. " * 20  # 640 chars, over the preview bound
@@ -3009,7 +3126,9 @@ async def test_list_entities_reports_a_fresh_page_with_no_item_flags(tmp_path: P
 
     payload = _payload(await mcp.call_tool("list_entities", {"directory": str(tmp_path), "limit": 10}))
 
-    assert payload["meta"]["index_freshness"] == {"checked": 2, "stale": [], "missing": [], "unknown": []}
+    assert payload["meta"]["index_freshness"] == {
+        "checked": 2, "stale": [], "missing": [], "unknown": [], "watcher": UNWATCHED,
+    }
     assert payload["items"] == [
         entity("pkg/a.py::run", "run", "function", "pkg/a.py", 2, 4, "Runs."),
         entity("tests/test_a.py::test_run", "test_run", "function", "tests/test_a.py", 1, 3, "Tests."),
@@ -3035,6 +3154,7 @@ async def test_list_entities_flags_only_the_entities_of_the_changed_file(tmp_pat
         "stale": ["pkg/a.py"],
         "missing": [],
         "unknown": [],
+        "watcher": UNWATCHED,
     }
     assert payload["items"][0]["id"] == "pkg/a.py::run"
     assert payload["items"][0]["stale"] is True
@@ -3063,6 +3183,7 @@ async def test_search_text_reports_a_deleted_file_as_missing(tmp_path: Path) -> 
         "stale": [],
         "missing": ["pkg/module.py"],
         "unknown": [],
+        "watcher": UNWATCHED,
     }
     assert payload["items"][0]["entity"]["file_path"] == "pkg/module.py"
     assert payload["items"][0]["entity"]["file_missing"] is True
@@ -3086,6 +3207,7 @@ async def test_search_semantic_leaves_files_without_a_stored_checksum_unflagged(
         "stale": [],
         "missing": [],
         "unknown": ["pkg/low.py", "pkg/module.py", "tests/test_module.py"],
+        "watcher": UNWATCHED,
     }
     assert all("stale" not in item["entity"] for item in payload["items"])
     assert all("file_missing" not in item["entity"] for item in payload["items"])
@@ -3118,6 +3240,7 @@ async def test_get_entity_context_annotates_entity_parent_and_sections(tmp_path:
         "stale": ["pkg/a.py"],
         "missing": [],
         "unknown": [],
+        "watcher": UNWATCHED,
     }
     assert repo.checksum_calls == 1
 
@@ -3195,7 +3318,9 @@ async def test_search_tools_always_report_index_freshness(tool_name: str, tmp_pa
 
     payload = _payload(await mcp.call_tool(tool_name, {"directory": str(tmp_path), "query": "worker"}))
 
-    assert payload["meta"]["index_freshness"] == {"checked": 1, "stale": [], "missing": [], "unknown": []}
+    assert payload["meta"]["index_freshness"] == {
+        "checked": 1, "stale": [], "missing": [], "unknown": [], "watcher": UNWATCHED,
+    }
     assert repo.checksum_calls == 1, "one get_checksums per tool call"
 
 
@@ -3209,7 +3334,7 @@ async def test_graph_tools_always_report_index_freshness(tool_name: str, tmp_pat
     payload = _payload(await mcp.call_tool(tool_name, {"directory": str(tmp_path), **_GRAPH_TOOL_ARGS[tool_name]}))
 
     block = payload["meta"]["index_freshness"]
-    assert set(block) == {"checked", "stale", "missing", "unknown"}
+    assert set(block) == {"checked", "stale", "missing", "unknown", "watcher"}
     assert block["checked"] >= 1 and block["stale"] == [] and block["missing"] == []
     assert repo.checksum_calls == 1
 
@@ -3224,7 +3349,9 @@ async def test_search_text_reports_freshness_even_for_an_empty_query(tmp_path: P
     payload = _payload(await mcp.call_tool("search_text", {"directory": str(tmp_path), "query": "***"}))
 
     assert payload["items"] == []
-    assert payload["meta"]["index_freshness"] == {"checked": 0, "stale": [], "missing": [], "unknown": []}
+    assert payload["meta"]["index_freshness"] == {
+        "checked": 0, "stale": [], "missing": [], "unknown": [], "watcher": UNWATCHED,
+    }
 
 
 @pytest.mark.asyncio

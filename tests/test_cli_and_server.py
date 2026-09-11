@@ -36,6 +36,7 @@ def test_create_server_registers_expected_tools(monkeypatch) -> None:
             "search_text",
             "cypher_query",
             "graph_schema",
+            "send_feedback",
         }
     finally:
         watcher.stop_all()

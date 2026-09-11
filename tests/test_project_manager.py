@@ -336,6 +336,65 @@ async def test_update_project_reads_chunk_vectors_only_for_the_files_that_moved(
 
 
 @pytest.mark.asyncio
+async def test_reindex_of_an_indexed_project_is_gated_by_the_cost_cap(tmp_path: Path) -> None:
+    """INV-10 covers a re-index, not only a project's first index.
+
+    The gate used to live on the first-time branch alone, so an already-indexed project could
+    be re-indexed for any amount. That is not a theoretical hole: widening what the indexer
+    admits (one new DOCUMENT_EXTENSIONS entry) makes thousands of files newly billable behind
+    a call that reads like a cheap refresh — measured at ~$57 on a real repo, unasked.
+    """
+    from inflorescence.cost import IndexCostExceededError
+
+    repo = FakeProjectRepository({"nodes": 500, "edges": 900, "chunks": 40, "summaries": 400})
+    builder = FakeGraphBuilder(update_result=([object()], [object()]))
+    builder.pending_change_paths_result = [f"fixtures/case_{i}.json" for i in range(4000)]
+    builder.estimate_result = {"estimated_tokens": 5_000_000_000, "estimated_nodes": 5_000_000}
+    rag = FakeRAGIndexer()
+    manager = ProjectManager(repo=repo, graph_builder=builder, rag_indexer=rag, settings=Settings(_env_file=None))
+
+    with pytest.raises(IndexCostExceededError) as caught:
+        await manager.index_directory(str(tmp_path))
+
+    assert builder.updates == 0                      # gated before parse/summarize/embed
+    assert rag.summary_indexes == 0
+    assert caught.value.changed_files == 4000        # priced over the changed set, not the tree
+    assert "4000 changed file(s)" in str(caught.value)
+    # The full-tree preview is the first-time branch's question and must not be asked here:
+    # pricing an incremental run over the whole repo would reject work it is about to reuse.
+    assert builder.previews == 0
+
+
+@pytest.mark.asyncio
+async def test_reindex_with_a_small_changed_set_is_not_gated(tmp_path: Path) -> None:
+    """The gate must not turn a routine refresh of a large project into a refusal."""
+    repo = FakeProjectRepository({"nodes": 50_000, "edges": 90_000, "chunks": 4_000, "summaries": 40_000})
+    builder = FakeGraphBuilder(update_result=([object()], [object()]))
+    builder.pending_change_paths_result = ["src/app.py"]
+    builder.estimate_result = {"estimated_tokens": 900, "estimated_nodes": 30}
+    rag = FakeRAGIndexer()
+    manager = ProjectManager(repo=repo, graph_builder=builder, rag_indexer=rag, settings=Settings(_env_file=None))
+
+    await manager.index_directory(str(tmp_path))
+
+    assert builder.updates == 1
+    assert builder.estimated_paths == [["src/app.py"]]
+
+
+@pytest.mark.asyncio
+async def test_reindex_passes_the_run_scope_to_the_cost_gate(tmp_path: Path) -> None:
+    """Excluded paths are not billable, so the gate has to price the same scope the run uses."""
+    repo = FakeProjectRepository({"nodes": 500, "edges": 900, "chunks": 40, "summaries": 400})
+    builder = FakeGraphBuilder(update_result=([object()], [object()]))
+    rag = FakeRAGIndexer()
+    manager = ProjectManager(repo=repo, graph_builder=builder, rag_indexer=rag, settings=Settings(_env_file=None))
+
+    await manager.index_directory(str(tmp_path), exclude_patterns=["tests/golden"])
+
+    assert builder.pending_change_path_calls == [(None, ["tests/golden"])]
+
+
+@pytest.mark.asyncio
 async def test_update_project_is_gated_by_the_cost_cap(tmp_path: Path) -> None:
     from inflorescence.cost import IndexCostExceededError
 
@@ -1507,6 +1566,11 @@ class FakeGraphBuilder:
         # normal "there is work to do" path runs. A no-op test flips it to False and asserts
         # neither preflight nor the vector dump happened.
         self.pending_changes = True
+        # The files a re-index would pay for, as the cost gate on the incremental path reads
+        # them. Empty by default so that gate short-circuits and tests about other things are
+        # unaffected; a gate test fills it and sets `estimate_result` to something expensive.
+        self.pending_change_paths_result: list[str] = []
+        self.pending_change_path_calls: list[tuple[list[str] | None, list[str] | None]] = []
         # Worktree seeding observation: which stored_summaries the build was handed, which
         # paths the cost gate priced, and how often the full-scan preview was used at all.
         self.build_stored_summaries: list[dict[str, dict[str, object]] | None] = []
@@ -1545,6 +1609,16 @@ class FakeGraphBuilder:
         exclude_patterns: list[str] | None = None,
     ) -> bool:
         return self.pending_changes
+
+    async def pending_change_paths(
+        self,
+        project: str,
+        root_path: Path,
+        include_patterns: list[str] | None = None,
+        exclude_patterns: list[str] | None = None,
+    ) -> list[str]:
+        self.pending_change_path_calls.append((include_patterns, exclude_patterns))
+        return list(self.pending_change_paths_result)
 
     async def preflight(self) -> None:
         self.preflights += 1

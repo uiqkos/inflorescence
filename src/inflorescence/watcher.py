@@ -35,6 +35,7 @@ class _DebouncedHandler(FileSystemEventHandler):
         exclude_patterns: list[str],
         loop: asyncio.AbstractEventLoop,
         extensions: set[str] | None = None,
+        filenames: set[str] | None = None,
     ) -> None:
         super().__init__()
         self._project = project
@@ -42,6 +43,7 @@ class _DebouncedHandler(FileSystemEventHandler):
         self._debounce_seconds = debounce_seconds
         self._exclude_patterns = exclude_patterns
         self._extensions = extensions
+        self._filenames = filenames or set()
         self._loop = loop
 
         self._lock = threading.Lock()
@@ -72,15 +74,25 @@ class _DebouncedHandler(FileSystemEventHandler):
         """Return True if *path* can never affect the index.
 
         Filters, as early as possible (INV-6), events that cannot change the index: a suffix no
-        parser handles (when an extension set is configured), an exclude pattern matching a
-        path *component* (``node_modules``, ``.git``), or a ``*.ext`` glob matching the path
-        tail (``*.log``, ``*.min.js``). Editor temp files, logs, and build artifacts otherwise
-        debounce into flushes. This is a coarse pre-filter, not the authoritative scan: the
-        builder still applies gitignore/globs, and a no-op flush is now cheap regardless, so a
-        pattern this misses costs a scan+checksum diff at worst, never a paid embedding.
+        parser handles and a name no parser claims (when an extension set is configured), an
+        exclude pattern matching a path *component* (``node_modules``, ``.git``), or a
+        ``*.ext`` glob matching the path tail (``*.log``, ``*.min.js``). Editor temp files,
+        logs, and build artifacts otherwise debounce into flushes. This is a coarse
+        pre-filter, not the authoritative scan: the builder still applies gitignore/globs, and
+        a no-op flush is now cheap regardless, so a pattern this misses costs a scan+checksum
+        diff at worst, never a paid embedding.
+
+        The filename set has to travel with the extension set: filtering on the suffix alone
+        drops every save of a ``Makefile`` or a ``Dockerfile`` before the builder hears about
+        it, which is the same class of silence as never scanning the file — the index simply
+        stops following files it does contain.
         """
         p = Path(path)
-        if self._extensions is not None and p.suffix not in self._extensions:
+        if (
+            self._extensions is not None
+            and p.suffix not in self._extensions
+            and p.name not in self._filenames
+        ):
             return True
         parts = p.parts
         for pattern in self._exclude_patterns:
@@ -169,10 +181,12 @@ class FileWatcher:
         project_manager: ProjectManager,
         settings: Settings,
         extensions: set[str] | None = None,
+        filenames: set[str] | None = None,
     ) -> None:
         self._project_manager = project_manager
         self._settings = settings
         self._extensions = extensions
+        self._filenames = filenames
         # project name -> (Observer, handler)
         self._watchers: dict[str, tuple[Observer, _DebouncedHandler]] = {}
 
@@ -194,6 +208,7 @@ class FileWatcher:
             exclude_patterns=self._settings.exclude_patterns,
             loop=loop,
             extensions=self._extensions,
+            filenames=self._filenames,
         )
 
         observer = Observer()

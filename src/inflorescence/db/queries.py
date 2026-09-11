@@ -184,7 +184,32 @@ LIST_PROJECTS = """
 MATCH (n:Code:Directory {id: 'dir:.'})
 WHERE n.root_path IS NOT NULL AND n.root_path <> ''
 RETURN n.project AS project, n.root_path AS root_path,
-       n.worktree_of AS worktree_of, n.worktree_main_root AS main_root_path
+       n.worktree_of AS worktree_of, n.worktree_main_root AS main_root_path,
+       n.watched AS watched
+"""
+
+# The watch registry lives on the same project root node as root_path and scope, because a
+# watched project is by definition an indexed one: the daemon updates an existing graph, it
+# never creates one. Storing it here (rather than in a file beside the daemon) keeps one
+# source of truth that `watch add`, the daemon and any MCP server all read from the database
+# they already share, and makes `watch status` answerable without the daemon running.
+# Registry flag and daemon liveness in one round trip, because they are only meaningful
+# together: `watched` without a live claim is the state after a reboot (registered, but
+# nothing is running it) and reads very differently from never having been registered.
+# The lease node is read, never written, here — see `db.lease` for the claim itself.
+GET_WATCH_STATE = """
+MATCH (n:Code:Directory {id: 'dir:.', project: $project})
+OPTIONAL MATCH (l:IndexLock {project: $claim_key})
+OPTIONAL MATCH (d:IndexLock {project: $daemon_key})
+RETURN coalesce(n.watched, false) AS watched,
+       l.holder AS holder, l.expires_at AS expires_at,
+       d.holder AS daemon_holder, d.expires_at AS daemon_expires_at
+"""
+
+SET_PROJECT_WATCHED = """
+MATCH (n:Code:Directory {id: 'dir:.', project: $project})
+SET n.watched = $watched
+RETURN count(n) AS matched
 """
 
 # The ONLY deletion of a whole project the janitor is allowed to issue. The marker is
@@ -834,7 +859,8 @@ SET n.root_path = null,
     n.index_include = null,
     n.index_exclude = null,
     n.worktree_of = null,
-    n.worktree_main_root = null
+    n.worktree_main_root = null,
+    n.watched = null
 """
 
 # Verification. Counted independently of the writes, per label and per relationship type, on

@@ -29,3 +29,12 @@ class BaseParser(ABC):
     @abstractmethod
     def get_supported_extensions(self) -> list[str]:
         """Return list of file extensions this parser supports (e.g. ['.py'])."""
+
+    def get_supported_filenames(self) -> list[str]:
+        """Return exact filenames this parser claims regardless of extension.
+
+        Empty for every language parser: a source file is identified by its suffix. Only
+        documents need this — ``Makefile`` and ``Dockerfile`` carry no suffix at all, and
+        ``.env.example``'s (``.example``) says nothing about what is inside it.
+        """
+        return []

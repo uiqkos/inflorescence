@@ -59,6 +59,9 @@ def _stub_started_daemon(monkeypatch, *, image_local: bool = True) -> None:
     monkeypatch.setattr(de, "ensure_docker_daemon", lambda *a, **k: True)
     monkeypatch.setattr(de, "image_present", lambda image: image_local)
     monkeypatch.setattr(de, "_wait_for_port", lambda port, seconds: True)
+    # No rival container over the volume: the ordinary machine. The tests that care about
+    # one say so themselves, and the rest get to assert on the docker calls they mean.
+    monkeypatch.setattr(de, "containers_on_volume", lambda *a, **k: [])
 
 
 def test_ensure_memgraph_starts_an_existing_stopped_container(monkeypatch) -> None:
@@ -119,3 +122,85 @@ def test_ensure_memgraph_gives_up_when_the_daemon_cannot_start(monkeypatch) -> N
 
     assert de.ensure_memgraph("bolt://localhost:7687") is False
     assert consulted == []
+
+
+def test_containers_on_volume_reads_name_and_state(monkeypatch) -> None:
+    monkeypatch.setattr(
+        de, "_run", lambda argv, **k: "inflorescence-memgraph\trunning\ninflorescence-memgraph-1\texited\n"
+    )
+    assert de.containers_on_volume() == [
+        ("inflorescence-memgraph", "running"),
+        ("inflorescence-memgraph-1", "exited"),
+    ]
+
+
+def test_containers_on_volume_asks_docker_for_stopped_ones_too(monkeypatch) -> None:
+    """A stopped rival still counts: `docker start` on it restarts the fight. That is also
+    why the filter is `volume=` — docker matches `publish=` only against running containers,
+    so the port filter would call a machine clean while the duplicate sat there waiting."""
+    seen: list[list[str]] = []
+    monkeypatch.setattr(de, "_run", lambda argv, **k: seen.append(argv) or "")
+
+    de.containers_on_volume()
+    assert seen and "-a" in seen[0]
+    assert f"volume={de.MEMGRAPH_VOLUME}" in seen[0]
+
+
+def test_ensure_memgraph_adopts_a_rival_container_instead_of_making_a_second(monkeypatch) -> None:
+    """`docker compose up` in a checkout of this repository creates the database under its
+    own name. Creating ours beside it does not add a database, it splits one: two Memgraphs
+    over one volume fight for the bolt port and the loser is left running yet unreachable."""
+    _stub_started_daemon(monkeypatch)
+    monkeypatch.setattr(de, "container_state", lambda name: None)
+    monkeypatch.setattr(de, "containers_on_volume", lambda *a, **k: [("inflorescence-memgraph-1", "exited")])
+    ran: list[list[str]] = []
+    monkeypatch.setattr(de, "_run", lambda argv, **k: ran.append(argv) or "")
+
+    assert de.ensure_memgraph("bolt://localhost:7687") is True
+    assert ran == [["docker", "start", "inflorescence-memgraph-1"]]
+
+
+def test_ensure_memgraph_only_waits_on_a_rival_that_already_runs(monkeypatch) -> None:
+    _stub_started_daemon(monkeypatch)
+    monkeypatch.setattr(de, "container_state", lambda name: None)
+    monkeypatch.setattr(de, "containers_on_volume", lambda *a, **k: [("inflorescence-memgraph-1", "running")])
+    ran: list[list[str]] = []
+    monkeypatch.setattr(de, "_run", lambda argv, **k: ran.append(argv) or "")
+
+    assert de.ensure_memgraph("bolt://localhost:7687") is True
+    assert ran == []
+
+
+def test_recovery_hint_names_the_rival_container(monkeypatch) -> None:
+    monkeypatch.setattr(de, "containers_on_volume", lambda *a, **k: [("inflorescence-memgraph-1", "running")])
+    hint = de.recovery_hint()
+    assert "inflorescence-memgraph-1" in hint
+    assert "docker stop" in hint
+
+
+def test_recovery_hint_tells_a_networkless_container_apart_from_a_slow_one(monkeypatch) -> None:
+    """Both refuse connections; only one is fixed by waiting. A container attached to no
+    network publishes nothing and never will — restarting does not reattach it."""
+    monkeypatch.setattr(de, "containers_on_volume", lambda *a, **k: [])
+    monkeypatch.setattr(de, "container_is_networkless", lambda name: True)
+    assert "docker rm" in de.recovery_hint()
+
+    monkeypatch.setattr(de, "container_is_networkless", lambda name: False)
+    slow = de.recovery_hint()
+    assert "docker rm" not in slow, "a database still replaying its snapshot must not be recreated"
+    assert "docker logs" in slow
+
+
+def test_container_is_networkless_only_on_a_zero_network_count(monkeypatch) -> None:
+    monkeypatch.setattr(de, "_run", lambda argv, **k: "0\n")
+    assert de.container_is_networkless("x") is True
+    monkeypatch.setattr(de, "_run", lambda argv, **k: "1\n")
+    assert de.container_is_networkless("x") is False
+    monkeypatch.setattr(de, "_run", lambda argv, **k: None)  # container gone
+    assert de.container_is_networkless("x") is False
+
+
+def test_bolt_budget_outlasts_snapshot_replay() -> None:
+    """memgraph-mage was measured opening bolt ~100s after start on a 187k-node graph.
+    The old 60s budget reported a database that was merely busy starting as unreachable."""
+    assert de._BOLT_OPEN_TIMEOUT >= 150.0

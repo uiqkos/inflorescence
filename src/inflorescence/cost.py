@@ -1,9 +1,10 @@
 """Pre-flight indexing cost estimation (USD).
 
 Turns the no-cost scan preview (``estimated_tokens`` / ``estimated_nodes``) into a rough
-dollar figure using the configured model prices, so a first-time index can be gated by a
-``max_index_cost_usd`` cap before spending anything. The estimate is deliberately a slight
-over-estimate (it is a guard, not a billing system).
+dollar figure using the configured model prices, so any run that would spend can be gated by
+a ``max_index_cost_usd`` cap before spending anything — a first-time index over the whole
+tree, an incremental re-index or a watcher update over just the files whose content moved.
+The estimate is deliberately a slight over-estimate (it is a guard, not a billing system).
 """
 
 from __future__ import annotations
@@ -19,15 +20,26 @@ _SUMMARY_EMBED_TOKENS_PER_NODE = 90
 
 
 class IndexCostExceededError(Exception):
-    """Raised when a first-time index's estimated cost exceeds the configured cap."""
+    """Raised when an index run's estimated cost exceeds the configured cap.
 
-    def __init__(self, estimated_usd: float, limit_usd: float) -> None:
+    Raised for all three gated runs: a first-time index (priced over the whole tree), an
+    incremental re-index and a background watcher update (both priced over just the files
+    whose content moved). ``changed_files``, when set, says how many files the quoted
+    estimate covers, so the message cannot be misread as the price of the whole project.
+    """
+
+    def __init__(
+        self, estimated_usd: float, limit_usd: float, *, changed_files: int | None = None
+    ) -> None:
         self.estimated_usd = estimated_usd
         self.limit_usd = limit_usd
+        self.changed_files = changed_files
+        scope = f" over {changed_files} changed file(s)" if changed_files is not None else ""
         super().__init__(
-            f"Estimated indexing cost ${estimated_usd:.4f} exceeds the limit ${limit_usd:.4f}. "
-            f"Raise the limit (max_index_cost_usd / --max-cost), narrow scope with --exclude, "
-            f"or preview with --dry-run."
+            f"Estimated indexing cost ${estimated_usd:.4f}{scope} exceeds the limit "
+            f"${limit_usd:.4f}. Raise the limit (max_index_cost_usd, --max-cost or the "
+            f"max_cost_usd argument), narrow scope with --exclude / exclude_patterns, or "
+            f"look first with --dry-run / preview=true."
         )
 
 

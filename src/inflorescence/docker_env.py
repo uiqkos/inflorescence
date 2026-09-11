@@ -37,6 +37,10 @@ _DOCKER_START_TIMEOUT = 120.0
 # the CLI was killed mid-pull, silently, every time. The pull is therefore its own step
 # with a budget measured in minutes, not seconds.
 _PULL_TIMEOUT = 1800.0
+# memgraph-mage opens bolt only after loading its query modules and replaying the last
+# snapshot. Measured at ~100s on a 187k-node graph, so the old 60s budget gave up on a
+# database that was merely busy starting — and reported it as unreachable.
+_BOLT_OPEN_TIMEOUT = 180.0
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 # macOS has no native dockerd — the daemon lives inside one of these apps, and "installed
@@ -157,6 +161,24 @@ def local_bolt_port(memgraph_url: str) -> int | None:
     return parsed.port or 7687
 
 
+# Storage flags, kept byte-identical with the `command:` block in docker-compose.yml at the
+# repository root. The two start the same container over the same named volume — `init` goes
+# through compose, `serve` runs docker directly from anywhere — so a flag changed in one place
+# and not the other means the machine behaves differently depending on which path last
+# started it, which is indistinguishable from a bug in the database. Compose carries the long
+# rationale; the short version is that a snapshot dumps the whole graph, this graph is mostly
+# 1536-float embeddings, and at 190k vectors that dump is 5.6 GB. The old five-minute interval
+# therefore rewrote 5.6 GB roughly every five minutes, forever, because the watch daemon's
+# 30-second lease heartbeat guarantees the "anything committed since the last snapshot?" test
+# is always true. Durability comes from the WAL and from snapshot-on-exit, not from this
+# interval; the interval only bounds how much WAL a cold start replays.
+MEMGRAPH_STORAGE_ARGS = [
+    "--storage-snapshot-on-exit=true",
+    "--storage-snapshot-interval-sec=21600",
+    "--storage-snapshot-retention-count=2",
+]
+
+
 def memgraph_run_argv(port: int) -> list[str]:
     """``docker run`` for the Memgraph container.
 
@@ -164,6 +186,8 @@ def memgraph_run_argv(port: int) -> list[str]:
     docker's default of binding 0.0.0.0 would hand it to anyone on the same network. The
     named volume is what makes the graph outlive the container — without it, a `docker rm`
     silently discards every index the user paid an LLM to build.
+
+    Storage flags come from :data:`MEMGRAPH_STORAGE_ARGS`, which compose duplicates verbatim.
     """
     return [
         "docker", "run", "-d",
@@ -172,8 +196,7 @@ def memgraph_run_argv(port: int) -> list[str]:
         "-p", f"127.0.0.1:{port}:7687",
         "-v", f"{MEMGRAPH_VOLUME}:/var/lib/memgraph",
         MEMGRAPH_IMAGE,
-        "--storage-snapshot-on-exit=true",
-        "--storage-snapshot-interval-sec=300",
+        *MEMGRAPH_STORAGE_ARGS,
     ]
 
 
@@ -181,6 +204,39 @@ def container_state(name: str) -> str | None:
     """Docker's status word for *name* ("running", "exited", ...), or None if absent."""
     out = _run(["docker", "inspect", "-f", "{{.State.Status}}", name])
     return out.strip() if out and out.strip() else None
+
+
+def containers_on_volume(volume: str = MEMGRAPH_VOLUME) -> list[tuple[str, str]]:
+    """Every container mounting *volume*, running or not, as ``(name, state)``.
+
+    Two containers over one Memgraph data directory is the failure this exists to prevent.
+    They fight for the same snapshot and the same published port, and the loser is not
+    merely stopped: it can be left *running* yet attached to no network, which no amount of
+    `docker start` recovers from. Stopped containers count — starting the wrong one restarts
+    the fight — and that is why the filter is `volume=` and not `publish=`: docker matches
+    a published port only on containers that are currently up.
+    """
+    out = _run(["docker", "ps", "-a", "--filter", f"volume={volume}", "--format", "{{.Names}}\t{{.State}}"])
+    if not out:
+        return []
+    found: list[tuple[str, str]] = []
+    for line in out.splitlines():
+        name, _, state = line.partition("\t")
+        if name.strip():
+            found.append((name.strip(), state.strip()))
+    return found
+
+
+def container_is_networkless(name: str) -> bool:
+    """True when *name* is running but attached to no network — so it publishes nothing.
+
+    Observed under OrbStack after a second container claimed the same host port: `docker
+    inspect` keeps saying "running", `docker port` prints nothing, and every bolt connection
+    dies with an incomplete handshake. `docker restart` does not reattach it; only recreating
+    the container does, which is why this is reported rather than repaired here.
+    """
+    out = _run(["docker", "inspect", "-f", "{{len .NetworkSettings.Networks}}", name])
+    return out is not None and out.strip() == "0"
 
 
 def port_open(port: int, *, host: str = "127.0.0.1", timeout: float = 1.0) -> bool:
@@ -200,11 +256,16 @@ def _wait_for_port(port: int, deadline_seconds: float) -> bool:
     return False
 
 
-def ensure_memgraph(memgraph_url: str, *, wait_seconds: float = 60.0) -> bool:
+def ensure_memgraph(memgraph_url: str, *, wait_seconds: float = _BOLT_OPEN_TIMEOUT) -> bool:
     """Make a local Memgraph reachable, starting the container if needed.
 
     Returns True when the bolt port accepts connections. Fast path — an already-listening
     port — costs one loopback connect, so this is cheap enough to call on every startup.
+
+    Never creates a *second* container for a database that already has one. The container
+    this manages by name is only half the story: `docker compose up` in a checkout of this
+    repository makes its own, under its own name, over the same named volume — and two
+    Memgraphs over one data directory is a broken database, not a spare.
     """
     port = local_bolt_port(memgraph_url)
     if port is None:
@@ -220,7 +281,15 @@ def ensure_memgraph(memgraph_url: str, *, wait_seconds: float = 60.0) -> bool:
         )
         return False
 
-    state = container_state(MEMGRAPH_CONTAINER)
+    container = MEMGRAPH_CONTAINER
+    state = container_state(container)
+    if state is None:
+        # No container under our name — but another may already hold this database.
+        rivals = [(name, rival) for name, rival in containers_on_volume() if name != container]
+        if rivals:
+            container, state = rivals[0]
+            logger.info("Reusing the existing Memgraph container %s (%s)", container, state)
+
     if state is None:
         # Pull explicitly before `docker run`: the run call has a timeout sized for
         # starting a container, not for downloading a multi-gigabyte image.
@@ -233,10 +302,10 @@ def ensure_memgraph(memgraph_url: str, *, wait_seconds: float = 60.0) -> bool:
     elif state == "running":
         argv = None  # up but not yet listening — only wait
     else:
-        argv = ["docker", "start", MEMGRAPH_CONTAINER]
+        argv = ["docker", "start", container]
 
     if argv is not None:
-        logger.info("Starting Memgraph (%s)", MEMGRAPH_CONTAINER)
+        logger.info("Starting Memgraph (%s)", container)
         if _run(argv, timeout=_DOCKER_START_TIMEOUT) is None:
             logger.warning(
                 "Could not start the Memgraph container. Is Docker running? "
@@ -246,5 +315,36 @@ def ensure_memgraph(memgraph_url: str, *, wait_seconds: float = 60.0) -> bool:
 
     started = _wait_for_port(port, wait_seconds)
     if not started:
-        logger.warning("Memgraph container started but port %d never opened within %.0fs", port, wait_seconds)
+        logger.warning(
+            "Memgraph container %s is up but port %d never opened within %.0fs. %s",
+            container, port, wait_seconds, recovery_hint(container, port),
+        )
     return started
+
+
+def recovery_hint(container: str = MEMGRAPH_CONTAINER, port: int = 7687) -> str:
+    """Why a running Memgraph container is unreachable, phrased as what to do about it.
+
+    Three states look identical from a refused connection, and only one of them is fixed by
+    waiting: still recovering its snapshot, still fighting a rival container, or already
+    orphaned onto no network. Naming the right one is the difference between a user who
+    waits another minute and one who restarts docker for an hour.
+    """
+    rivals = [name for name, _ in containers_on_volume() if name != container]
+    if rivals:
+        return (
+            f"Another container holds the same database volume ({', '.join(rivals)}). "
+            f"Two Memgraphs over one data directory fight for port {port} and neither wins reliably — "
+            f"stop the spare: docker stop {rivals[0]}"
+        )
+    if container_is_networkless(container):
+        return (
+            f"{container} is running but attached to no network, so it publishes nothing "
+            f"(`docker port {container}` prints nothing). Restarting does not reattach it; "
+            f"recreate it — the graph lives in the {MEMGRAPH_VOLUME} volume and survives:\n"
+            f"  docker rm -f {container} && " + " ".join(memgraph_run_argv(port))
+        )
+    return (
+        f"The image loads its query modules and replays the last snapshot before opening bolt, "
+        f"which takes ~2 minutes on a populated graph. Watch it finish: docker logs -f {container}"
+    )

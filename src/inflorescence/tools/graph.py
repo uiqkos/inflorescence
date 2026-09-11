@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 from inflorescence.db.repository import GraphRepository
 from inflorescence.project_manager import ProjectManager
+from inflorescence.tools.coverage import note_coverage
 from inflorescence.tools.freshness import build_checker
 from inflorescence.tools.gates import ensure_indexed, normalize_node_types
 from inflorescence.tools.path_filters import PathFilterConfig, filter_records_by_path
@@ -72,6 +74,37 @@ def _describe_candidate(row: dict[str, object]) -> str:
     return f"{row.get('id')} ({row.get('node_type')}, {row.get('file_path')})"
 
 
+def _structure_root_missing(directory: str, node_id: str | None, file_path: str | None) -> str:
+    """Explain a missing structure root, checking the filesystem before blaming the caller.
+
+    ``file_path`` is the one argument this server can verify on the spot, and the two
+    readings of "not found" are worlds apart: a typo'd path, or a real file that was never
+    indexed. Answering both with the same three words let an agent conclude a 174-line
+    module did not exist (field report, 10.09.2026) — one ``exists()`` call tells them apart.
+    """
+    if not file_path:
+        return (
+            f"No indexed entity with node_id={node_id!r}. Ids come from a search or listing "
+            "in this project; pass file_path= to address a file instead."
+        )
+    try:
+        on_disk = (Path(directory) / file_path).exists()
+    except OSError:  # an unreadable path is not evidence either way
+        on_disk = False
+    if on_disk:
+        return (
+            f"{file_path!r} exists on disk but is NOT in this index, so nothing about it is "
+            "searchable here — it was created after the last index run, or an exclude pattern "
+            "or .gitignore keeps it out. Read it from the filesystem, and run "
+            f"index_directory({directory!r}) to index it. This is not 'the file has no structure'."
+        )
+    return (
+        f"No indexed entity for file_path={file_path!r}, and no such file on disk under "
+        f"{directory!r} either. Paths are relative to the project root; list_entities("
+        f"node_types=[\"module\", \"document\"]) shows which files this index holds."
+    )
+
+
 async def _resolve_name(repo: GraphRepository, project: str, name: str) -> str | dict:
     """Resolve a name substring to exactly one node id, or to the error explaining why not.
 
@@ -87,7 +120,9 @@ async def _resolve_name(repo: GraphRepository, project: str, name: str) -> str |
             "not_found",
             f"No indexed entity's name contains {name!r}. Names are matched case-insensitively "
             "as a substring; for a term that appears in code or text rather than in a name, "
-            "use search_text.",
+            "use search_text. Note this says nothing about the filesystem: entities exist only "
+            "for files that were indexed, so a file written since the last index run has none — "
+            "search_entities reports what this index actually covers in meta.index_coverage.",
         )
     if len(rows) == 1:
         return str(rows[0]["id"])
@@ -173,6 +208,18 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         worktrees of this checkout are NOT in this index — their branch state is elsewhere;
         ask with ``directory`` set to the worktree itself, which indexes it almost for free
         (no LLM spend).
+
+        An EMPTY first page carries one more block, ``meta.index_coverage``: the index's file
+        count plus a bounded re-check of the directories it knows against the filesystem. It
+        either names files that are on disk and NOT in this index — an empty page over one of
+        those is a coverage gap, not absence: read them directly and ``index_directory`` to
+        make them queryable — or says nothing under that scope is missing, which is what
+        licenses the conclusion "this really does not exist here". Coverage is not freshness:
+        a file created since the last index run has no node to flag, so ``index_freshness``
+        stays clean and the ``watcher`` line stays reassuring while the file sits unqueryable.
+        ``meta.nested_checkouts`` appears when the files on the page live in an independent
+        git checkout inside this tree (a submodule or vendored repo on its own branch) —
+        that checkout's HEAD, not ``answered_from``, is the code you are reading.
         """
         node_types = normalize_node_types(node_types)
         if isinstance(node_types, dict):
@@ -198,7 +245,7 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             truncated=truncated,
         )
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(payload)
+        return await note_coverage(checker.stamp(payload), manager, directory, checker)
 
     @mcp.tool()
     async def get_entity_structure(
@@ -233,6 +280,15 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         worktrees of this checkout are NOT in this index — their branch state is elsewhere;
         ask with ``directory`` set to the worktree itself, which indexes it almost for free
         (no LLM spend).
+
+        ``meta.nested_checkouts`` appears when the files on this page live in an independent
+        git checkout inside this tree (a submodule or vendored repo on its own branch) — that
+        checkout's HEAD, not ``answered_from``, is the code you are reading.
+
+        A ``not_found`` error here distinguishes the two cases that matter: a ``file_path``
+        that does not exist under this directory at all, and one that exists on disk but was
+        never indexed (created after the last index run, or excluded) — the second is a
+        coverage gap, so read the file directly and ``index_directory`` to make it queryable.
         """
         node_types = normalize_node_types(node_types)
         if isinstance(node_types, dict):
@@ -242,7 +298,7 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             return not_indexed
         root = await repo.get_structure_root(project, node_id=node_id, file_path=file_path)
         if root is None:
-            return error_response("not_found", "Structure root not found")
+            return error_response("not_found", _structure_root_missing(directory, node_id, file_path))
         bounded_limit = clamp_limit(limit)
         bounded_offset = clamp_offset(offset)
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
@@ -394,6 +450,18 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         worktrees of this checkout are NOT in this index — their branch state is elsewhere;
         ask with ``directory`` set to the worktree itself, which indexes it almost for free
         (no LLM spend).
+
+        An EMPTY first page carries one more block, ``meta.index_coverage``: the index's file
+        count plus a bounded re-check of the directories it knows against the filesystem. It
+        either names files that are on disk and NOT in this index — an empty page over one of
+        those is a coverage gap, not absence: read them directly and ``index_directory`` to
+        make them queryable — or says nothing under that scope is missing, which is what
+        licenses the conclusion "this really does not exist here". Coverage is not freshness:
+        a file created since the last index run has no node to flag, so ``index_freshness``
+        stays clean and the ``watcher`` line stays reassuring while the file sits unqueryable.
+        ``meta.nested_checkouts`` appears when the files on the page live in an independent
+        git checkout inside this tree (a submodule or vendored repo on its own branch) —
+        that checkout's HEAD, not ``answered_from``, is the code you are reading.
         """
         # Argument validation before anything that touches the DB or auto-indexes.
         if bool(node_id) == bool(name):
@@ -458,7 +526,7 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             truncated=truncated,
         )
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(payload)
+        return await note_coverage(checker.stamp(payload), manager, directory, checker)
 
     @mcp.tool()
     async def search_entities(
@@ -494,6 +562,18 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         worktrees of this checkout are NOT in this index — their branch state is elsewhere;
         ask with ``directory`` set to the worktree itself, which indexes it almost for free
         (no LLM spend).
+
+        An EMPTY first page carries one more block, ``meta.index_coverage``: the index's file
+        count plus a bounded re-check of the directories it knows against the filesystem. It
+        either names files that are on disk and NOT in this index — an empty page over one of
+        those is a coverage gap, not absence: read them directly and ``index_directory`` to
+        make them queryable — or says nothing under that scope is missing, which is what
+        licenses the conclusion "this really does not exist here". Coverage is not freshness:
+        a file created since the last index run has no node to flag, so ``index_freshness``
+        stays clean and the ``watcher`` line stays reassuring while the file sits unqueryable.
+        ``meta.nested_checkouts`` appears when the files on the page live in an independent
+        git checkout inside this tree (a submodule or vendored repo on its own branch) —
+        that checkout's HEAD, not ``answered_from``, is the code you are reading.
         """
         node_types = normalize_node_types(node_types)
         if isinstance(node_types, dict):
@@ -524,4 +604,4 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             truncated=truncated,
         )
         checker = await build_checker(repo, project, directory)
-        return checker.stamp(payload)
+        return await note_coverage(checker.stamp(payload), manager, directory, checker)

@@ -100,7 +100,54 @@ _DOCUMENT_LANGUAGES: dict[str, str] = {
     ".ini": "ini",
     ".cfg": "ini",
     ".conf": "ini",
+    # Shell scripts are documents here even though _EXT_TO_LANGUAGE has a bash grammar for
+    # them: the pipeline gives a .sh file a Document node (it owns no symbols this graph
+    # models), so its body is windowed as text. An AST split at this entry point would chunk
+    # the same script a second, different way — and the thing worth retrieving from a runbook
+    # script is usually a comment above the command, which no bash AST node contains.
+    ".sh": "shell",
+    ".bash": "shell",
+    ".zsh": "shell",
+    ".fish": "shell",
+    ".ps1": "powershell",
 }
+
+# Documents routed by exact filename (config.DEFAULT_DOCUMENT_FILENAMES): same treatment,
+# but ``Path.suffix`` cannot find them — a Makefile has none and ``.env.example``'s is
+# ``.example``.
+_DOCUMENT_LANGUAGES_BY_NAME: dict[str, str] = {
+    "Makefile": "make",
+    "makefile": "make",
+    "GNUmakefile": "make",
+    "Dockerfile": "docker",
+    "Containerfile": "docker",
+    "Justfile": "just",
+    "justfile": "just",
+    "Procfile": "procfile",
+    "Rakefile": "ruby",
+    "Brewfile": "ruby",
+    ".env.example": "dotenv",
+    ".env.sample": "dotenv",
+    ".env.template": "dotenv",
+    ".env.dist": "dotenv",
+}
+
+
+def _document_language(file_path: str | Path) -> str | None:
+    """The chunk language label for a document, or None when the path is not one.
+
+    By exact filename first, then by suffix — the same precedence the parser registry
+    applies, so the two never disagree about what a file is.
+    """
+    path = Path(file_path)
+    by_name = _DOCUMENT_LANGUAGES_BY_NAME.get(path.name)
+    if by_name:
+        return by_name
+    suffix = path.suffix.lower()
+    if suffix in _DOCUMENT_LANGUAGES:
+        return _DOCUMENT_LANGUAGES[suffix]
+    return "text" if suffix in _TEXT_EXTENSIONS else None
+
 
 _BINARY_EXTENSIONS: frozenset[str] = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".svg", ".webp",
@@ -161,14 +208,15 @@ class Chunker:
         ext = file_path.suffix.lower()
         language = _EXT_TO_LANGUAGE.get(ext, "")
 
-        if ext in _DOCUMENT_LANGUAGES or ext in _TEXT_EXTENSIONS:
+        document_language = _document_language(file_path)
+        if document_language is not None:
             # Checked *before* _EXT_TO_LANGUAGE: several document formats (.css, .html,
-            # .json, .yaml, .toml) also have a CodeSplitter grammar, and the pipeline gives
-            # them a Document node, whose body is windowed as text. Preferring the AST here
-            # would make this entry point chunk the same stylesheet a second, different way.
+            # .json, .yaml, .toml, .sh) also have a CodeSplitter grammar, and the pipeline
+            # gives them a Document node, whose body is windowed as text. Preferring the AST
+            # here would make this entry point chunk the same stylesheet a second, different way.
             return self._chunk_text(
                 text, rel,
-                language=_DOCUMENT_LANGUAGES.get(ext, "text"),
+                language=document_language,
                 chunk_size=self.config.document_chunk_size,
                 chunk_overlap=self.config.document_chunk_overlap,
             )
@@ -478,7 +526,7 @@ class Chunker:
         predictable, and the *overlap* is what makes them safe: a passage the window boundary
         cuts in half still appears whole inside its neighbour, so it stays retrievable.
         """
-        language = _DOCUMENT_LANGUAGES.get(Path(node.file_path).suffix.lower(), "text")
+        language = _document_language(node.file_path) or "text"
         chunks = self._chunk_text(
             text,
             node.file_path,
