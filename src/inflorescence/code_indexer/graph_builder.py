@@ -34,6 +34,7 @@ from inflorescence.code_indexer.parser.registry import ParserRegistry
 from inflorescence.code_indexer.parser.resolver import resolve_edges
 from inflorescence.code_indexer.scip_semantic import SemanticCalls, semantic_calls_pass
 from inflorescence.code_indexer.summarizer import (
+    SUMMARY_PROMPT_VERSION,
     node_source,
     summarize_hierarchy,
     summarize_single,
@@ -554,6 +555,7 @@ class GraphBuilder:
                         "node_id": n.id,
                         "summary": n.summary,
                         "summary_input_hash": n.summary_input_hash,
+                        "summary_prompt_version": n.summary_prompt_version,
                     }
                     for n in batch
                     # Only non-empty summaries (success or kept-stale, the latter with
@@ -1086,8 +1088,10 @@ class GraphBuilder:
                 # surrogate — the node was never re-summarized (audit finding 8c). This now
                 # truly mirrors summarize_hierarchy, which clears the hash on failure.
                 node.summary_input_hash = ""
+                node.summary_prompt_version = ""
                 logger.warning("Failed to repair summary: %s: %s", node.id, exc)
             else:
+                node.summary_prompt_version = SUMMARY_PROMPT_VERSION
                 node.summary_input_hash = summary_input_hash(
                     node, children or [], source=node_source(node, root) if not children else ""
                 )
@@ -1129,7 +1133,10 @@ class GraphBuilder:
 
     async def _store_repaired(self, project: str, nodes: list[CodeNode]) -> None:
         items = [
-            {"node_id": n.id, "summary": n.summary, "summary_input_hash": n.summary_input_hash}
+            {
+                "node_id": n.id, "summary": n.summary, "summary_input_hash": n.summary_input_hash,
+                "summary_prompt_version": n.summary_prompt_version,
+            }
             for n in nodes
         ]
         if items:

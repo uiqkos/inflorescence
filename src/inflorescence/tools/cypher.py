@@ -355,7 +355,8 @@ def register_cypher_tools(mcp: FastMCP, manager: ProjectManager, conn: MemgraphC
             },
             "entity_properties": [
                 "id", "node_type", "name", "file_path", "line_start", "line_end",
-                "signature", "docstring", "summary", "summary_input_hash", "parent_id",
+                "signature", "docstring", "summary", "summary_input_hash", "summary_prompt_version",
+                "parent_id",
                 "project", "summary_embedding", "checksum", "root_path",
                 "external_calls", "unresolved_calls", "calls_provenance",
             ],
@@ -366,6 +367,12 @@ def register_cypher_tools(mcp: FastMCP, manager: ProjectManager, conn: MemgraphC
                 "could not bind (dynamic dispatch etc.). Module nodes carry calls_provenance "
                 "('scip-go'/'scip-python'/'scip-typescript' = compiler-grade, 'heuristic' = "
                 "syntactic ladder)."
+            ),
+            "summary_prompt_version": (
+                "Which revision of the summarization prompts wrote the summary ('<layout>.<prompt "
+                "digest>'; empty = written before revisions were recorded). A prompt change does "
+                "not re-summarize anything by itself, so one project can hold summaries of several "
+                "revisions; group by this property to see which."
             ),
             "chunk_properties": [
                 "id", "node_id", "file_path", "content", "start_line", "end_line",

@@ -530,10 +530,12 @@ class _SummaryNode:
         summary: str = "",
         summary_input_hash: str = "",
         file_path: str | None = None,
+        summary_prompt_version: str = "",
     ) -> None:
         self.id = node_id
         self.summary = summary
         self.summary_input_hash = summary_input_hash
+        self.summary_prompt_version = summary_prompt_version
         # The clone path scopes its paid phases by file, so these stand-ins carry one.
         # Defaults to the id, which is what a module node's id already is.
         self.file_path = node_id if file_path is None else file_path
@@ -605,7 +607,7 @@ async def test_worktree_seeding_writes_reused_summaries_into_the_new_project(tmp
     skeleton's empty summaries and the repair pass regenerates them for real money."""
     main, worktree = _worktree_dirs(tmp_path)
     nodes = [
-        _SummaryNode("a.py", "reused from donor", "h1"),   # reused -> must be written back
+        _SummaryNode("a.py", "reused from donor", "h1", summary_prompt_version="2.ab"),  # reused -> written back
         _SummaryNode("b.py", "freshly generated", "h2"),   # dirty -> already persisted by build
         _SummaryNode("c.py", "", ""),                      # failed with nothing to keep
     ]
@@ -623,7 +625,11 @@ async def test_worktree_seeding_writes_reused_summaries_into_the_new_project(tmp
 
     project = manager.get_project(str(worktree))
     assert repo.summaries_written == [
-        (project, [{"node_id": "a.py", "summary": "reused from donor", "summary_input_hash": "h1"}])
+        # The donor's prompt version travels with its summary: the text was not rewritten.
+        (project, [{
+            "node_id": "a.py", "summary": "reused from donor", "summary_input_hash": "h1",
+            "summary_prompt_version": "2.ab",
+        }])
     ]
     # The invariant the repair pass depends on: every node that ends the run with a summary
     # is either dirty (persisted batch-by-batch by the build) or explicitly written back —
@@ -985,7 +991,7 @@ async def test_clone_failure_deletes_the_partial_copy_and_falls_back_to_client_s
     assert builder.build_stored_summaries == [donor_summaries]
     assert repo.chunk_embedding_requests == [donor]
     assert repo.summaries_written == [
-        (project, [{"node_id": "a.py", "summary": "s", "summary_input_hash": "h1"}])
+        (project, [{"node_id": "a.py", "summary": "s", "summary_input_hash": "h1", "summary_prompt_version": ""}])
     ]
     assert result["worktree_of"] == donor
     assert result["seeded_summaries"] == 1

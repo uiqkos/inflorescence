@@ -345,6 +345,7 @@ def _code_node_from_row(row: Mapping[str, object]) -> CodeNode | None:
         docstring=str(row.get("docstring") or ""),
         summary=str(row.get("summary") or ""),
         summary_input_hash=str(row.get("summary_input_hash") or ""),
+        summary_prompt_version=str(row.get("summary_prompt_version") or ""),
     )
 
 
@@ -477,6 +478,7 @@ class GraphRepository:
                         "docstring": node.docstring,
                         "summary": node.summary,
                         "summary_input_hash": node.summary_input_hash,
+                        "summary_prompt_version": node.summary_prompt_version,
                         "parent_id": node.parent_id,
                         "external_calls": node.external_calls,
                         "unresolved_calls": node.unresolved_calls,
@@ -1353,6 +1355,7 @@ class GraphRepository:
             r["id"]: {
                 "summary": r["summary"],
                 "summary_input_hash": r["summary_input_hash"],
+                "summary_prompt_version": r.get("summary_prompt_version") or "",
                 "summary_embedding": r["summary_embedding"],
                 "summary_embedding_hash": r["summary_embedding_hash"],
             }
@@ -1381,6 +1384,7 @@ class GraphRepository:
             r["id"]: {
                 "summary": r["summary"],
                 "summary_input_hash": r["summary_input_hash"],
+                "summary_prompt_version": r.get("summary_prompt_version") or "",
                 "summary_embedding_hash": r["summary_embedding_hash"],
                 "has_embedding": bool(r["has_embedding"]),
             }

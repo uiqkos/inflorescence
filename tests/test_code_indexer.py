@@ -1889,3 +1889,30 @@ async def test_scanning_for_changes_does_not_hold_the_event_loop(tmp_path: Path)
 
     # Inline, the ticker would be starved for the whole 0.4s and land at ~0 ticks.
     assert ticks >= 5
+
+
+@pytest.mark.asyncio
+async def test_summaries_record_their_prompt_version_without_it_entering_the_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prompt edit is recorded on the summaries it writes, and re-buys none on its own."""
+    from inflorescence.code_indexer import prompts, summarizer
+    from inflorescence.code_indexer.summarizer import summarize_hierarchy
+
+    (tmp_path / "rules.py").write_text("def apply():\n    return 1\n")
+    parse = lambda: PythonAstParser().parse_file(tmp_path / "rules.py", tmp_path)  # noqa: E731
+    nodes, edges = parse()
+    await summarize_hierarchy(nodes, edges, tmp_path, CountingLLM())
+    assert {n.summary_prompt_version for n in nodes} == {summarizer.SUMMARY_PROMPT_VERSION}
+
+    stored = {n.id: {"summary": n.summary, "summary_input_hash": n.summary_input_hash,
+                     "summary_prompt_version": "1.old"} for n in nodes}
+    monkeypatch.setattr(prompts, "LEAF_SYSTEM_PROMPT", prompts.LEAF_SYSTEM_PROMPT + " Be brief.")
+    assert summarizer._prompt_version() != summarizer.SUMMARY_PROMPT_VERSION
+    again, again_edges = parse()
+    llm = CountingLLM()
+
+    await summarize_hierarchy(again, again_edges, tmp_path, llm, stored=stored)
+
+    assert llm.calls == 0, "a prompt change alone must not re-summarize"
+    assert {n.summary_prompt_version for n in again} == {"1.old"}, "reuse keeps the version that wrote the text"

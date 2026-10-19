@@ -29,6 +29,7 @@ SET n.node_type = $node_type,
     n.docstring = $docstring,
     n.summary = CASE WHEN keep_stored THEN n.summary ELSE $summary END,
     n.summary_input_hash = CASE WHEN keep_stored THEN n.summary_input_hash ELSE $summary_input_hash END,
+    n.summary_prompt_version = CASE WHEN keep_stored THEN n.summary_prompt_version ELSE $summary_prompt_version END,
     n.parent_id = $parent_id,
     n.external_calls = $external_calls,
     n.unresolved_calls = $unresolved_calls,
@@ -59,6 +60,7 @@ SET n.node_type = row.node_type,
     n.docstring = row.docstring,
     n.summary = CASE WHEN keep_stored THEN n.summary ELSE row.summary END,
     n.summary_input_hash = CASE WHEN keep_stored THEN n.summary_input_hash ELSE row.summary_input_hash END,
+    n.summary_prompt_version = CASE WHEN keep_stored THEN n.summary_prompt_version ELSE row.summary_prompt_version END,
     n.parent_id = row.parent_id,
     n.external_calls = row.external_calls,
     n.unresolved_calls = row.unresolved_calls,
@@ -239,6 +241,7 @@ MATCH (n:Code {project: $project})
 WHERE n.summary IS NOT NULL AND n.summary <> ''
 RETURN n.id AS id, n.summary AS summary,
        n.summary_input_hash AS summary_input_hash,
+       n.summary_prompt_version AS summary_prompt_version,
        n.summary_embedding AS summary_embedding,
        n.summary_embedding_hash AS summary_embedding_hash
 """
@@ -258,6 +261,7 @@ MATCH (n:Code {project: $project})
 WHERE n.summary IS NOT NULL AND n.summary <> ''
 RETURN n.id AS id, n.summary AS summary,
        n.summary_input_hash AS summary_input_hash,
+       n.summary_prompt_version AS summary_prompt_version,
        n.summary_embedding_hash AS summary_embedding_hash,
        (n.summary_embedding IS NOT NULL) AS has_embedding
 """
@@ -332,7 +336,8 @@ RETURN n.id AS id, n.file_path AS file_path,
 _NODE_FIELDS = """n.id AS id, n.name AS name, n.node_type AS node_type, labels(n) AS labels,
        n.file_path AS file_path, n.line_start AS line_start, n.line_end AS line_end,
        n.signature AS signature, n.docstring AS docstring, n.summary AS summary,
-       n.summary_input_hash AS summary_input_hash"""
+       n.summary_input_hash AS summary_input_hash,
+       n.summary_prompt_version AS summary_prompt_version"""
 
 # A summary embedding is stale — not just missing — when it was computed against a
 # different summary than the one now stored. `summary_embedding_hash` records the
@@ -749,7 +754,8 @@ STORE_SUMMARIES_BATCH = """
 UNWIND $rows AS row
 MATCH (n:Code {id: row.node_id, project: $project})
 SET n.summary = row.summary,
-    n.summary_input_hash = row.summary_input_hash
+    n.summary_input_hash = row.summary_input_hash,
+    n.summary_prompt_version = row.summary_prompt_version
 RETURN count(*) AS written
 """
 

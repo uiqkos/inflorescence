@@ -555,6 +555,7 @@ class ProjectManager:
                 "node_id": node.id,
                 "summary": node.summary,
                 "summary_input_hash": node.summary_input_hash,
+                "summary_prompt_version": node.summary_prompt_version,
             }
             for node in result.nodes
             if node.summary and node.id not in result.dirty_summary_ids

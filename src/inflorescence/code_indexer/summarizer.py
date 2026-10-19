@@ -88,6 +88,26 @@ def module_header(node: CodeNode, root_path: Path | None) -> str:
     return header[:MODULE_HEADER_MAX_CHARS]
 
 
+# Bump when the *user message* a summary is generated from changes shape — what is quoted
+# around the code (the path, the module header), not the code itself. The system prompts are
+# hashed in below, so editing a prompt string needs no bump.
+PROMPT_LAYOUT = 2
+
+
+def _prompt_version() -> str:
+    texts = sorted((name, value) for name, value in vars(prompts).items() if name.endswith("_SYSTEM_PROMPT"))
+    digest = hashlib.sha256("\x00".join(f"{name}={value}" for name, value in texts).encode("utf-8"))
+    return f"{PROMPT_LAYOUT}.{digest.hexdigest()[:8]}"
+
+
+# Which prompts wrote a summary, stored on the node as ``summary_prompt_version``. Deliberately
+# NOT part of :func:`summary_input_hash`: a prompt edit must never re-buy every summary in every
+# project on its own. It is a record — which summaries predate a prompt change, so a deliberate,
+# priced rebuild of one project can be decided from data (an empty value = written before
+# versions were recorded).
+SUMMARY_PROMPT_VERSION = _prompt_version()
+
+
 def summary_input_hash(node: CodeNode, children: list[CodeNode], source: str = "") -> str:
     """Content hash of a node's summarization input.
 
@@ -171,6 +191,7 @@ async def summarize_hierarchy(
         if prev and prev.get("summary_input_hash") == input_hash and prev.get("summary"):
             node.summary = str(prev["summary"])
             node.summary_input_hash = input_hash
+            node.summary_prompt_version = str(prev.get("summary_prompt_version") or "")
             return True
         return False
 
@@ -187,6 +208,7 @@ async def summarize_hierarchy(
         prev_summary = str(prev["summary"]) if prev and prev.get("summary") else ""
         node.summary = prev_summary or fallback
         node.summary_input_hash = ""
+        node.summary_prompt_version = str(prev.get("summary_prompt_version") or "") if prev_summary and prev else ""
         if not prev_summary:
             dirty.add(node.id)
 
@@ -211,6 +233,7 @@ async def summarize_hierarchy(
                     _keep_stale_on_failure(node, fallback="")
                 else:
                     node.summary = str(result)
+                    node.summary_prompt_version = SUMMARY_PROMPT_VERSION
                     dirty.add(node.id)
             if on_batch is not None:
                 await on_batch(batch)
@@ -284,6 +307,7 @@ async def summarize_hierarchy(
                 _keep_stale_on_failure(node, fallback=node.docstring or "")
             else:
                 node.summary = str(result)
+                node.summary_prompt_version = SUMMARY_PROMPT_VERSION
                 dirty.add(node.id)
             attempted.add(node.id)
         if on_batch is not None:

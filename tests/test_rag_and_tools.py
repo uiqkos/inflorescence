@@ -1186,7 +1186,7 @@ async def test_write_counters_report_rows_the_db_wrote_not_submitted(caplog) -> 
 @pytest.mark.asyncio
 async def test_repository_get_stored_summaries_maps_by_node_id() -> None:
     conn = RecordingQueryConnection([
-        {"id": "a.py::foo", "summary": "does foo", "summary_input_hash": "h1",
+        {"id": "a.py::foo", "summary": "does foo", "summary_input_hash": "h1", "summary_prompt_version": "2.ab",
          "summary_embedding": [0.1, 0.2], "summary_embedding_hash": "h1"},
         {"id": "a.py", "summary": "module a", "summary_input_hash": "h2",
          "summary_embedding": None, "summary_embedding_hash": None},
@@ -1199,7 +1199,7 @@ async def test_repository_get_stored_summaries_maps_by_node_id() -> None:
     # summary_embedding_hash comes along so the caller can tell a fresh vector from a stale
     # one (matching vs mismatched hash) when deciding whether to reuse it (finding 8a).
     assert stored["a.py::foo"] == {
-        "summary": "does foo", "summary_input_hash": "h1",
+        "summary": "does foo", "summary_input_hash": "h1", "summary_prompt_version": "2.ab",
         "summary_embedding": [0.1, 0.2], "summary_embedding_hash": "h1",
     }
     assert stored["a.py"]["summary_embedding"] is None
@@ -1226,8 +1226,9 @@ async def test_repository_light_summaries_carry_freshness_without_the_vectors() 
     stored = await repo.get_stored_summaries_light("project-id")
 
     assert conn.params == {"project": "project-id"}
+    # A row written before prompt versions were recorded reads as "" — unrecorded, not absent.
     assert stored["a.py::foo"] == {
-        "summary": "does foo", "summary_input_hash": "h1",
+        "summary": "does foo", "summary_input_hash": "h1", "summary_prompt_version": "",
         "summary_embedding_hash": "h1", "has_embedding": True,
     }
     assert stored["a.py"]["has_embedding"] is False

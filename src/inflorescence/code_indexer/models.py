@@ -99,6 +99,8 @@ class CodeNode(BaseModel):
     docstring: str = ""
     summary: str = ""
     summary_input_hash: str = ""
+    # Which prompts wrote ``summary`` (summarizer.SUMMARY_PROMPT_VERSION); "" = unrecorded.
+    summary_prompt_version: str = ""
     parent_id: str | None = None
     # Honest call accounting: "0 outgoing CALLS" must never read as "calls nothing"
     # (docs/calls-resolution.md). Calls bound to an import outside the project land in
