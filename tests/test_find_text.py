@@ -122,6 +122,27 @@ async def test_case_regex_tests_and_pagination(project) -> None:
 
 
 @pytest.mark.asyncio
+async def test_facets_count_every_match_not_just_the_page(project) -> None:
+    root, repo = project
+    repo.checksums["legacy/v1/old.css"] = _write(
+        root, "legacy/v1/old.css", ".x { color: var(--color-brand); }\n.y { color: var(--color-brand); }\n"
+    )
+
+    payload = await _call(repo, root, pattern="--color-brand", limit=1)
+
+    assert len(payload["items"]) == 1
+    facets = payload["meta"]["facets"]
+    assert facets["counted"] == payload["meta"]["total_matches"] == 6
+    assert facets["common_path"] == "./"
+    assert facets["by_directory"] == [{"path": "web/", "count": 4}, {"path": "legacy/", "count": 2}]
+    assert facets["tests"] == 1
+    narrowed = await _call(repo, root, pattern="--color-brand", exclude_paths=["legacy/"], include_tests=False)
+    assert narrowed["meta"]["facets"] == {
+        "counted": 3, "common_path": "web/", "by_directory": [{"path": "web/", "count": 3, "direct": True}],
+    }
+
+
+@pytest.mark.asyncio
 async def test_invalid_input_is_an_error_not_an_empty_page(project) -> None:
     root, repo = project
 
@@ -211,4 +232,4 @@ async def test_a_budget_stop_marks_the_page_truncated_and_says_so(project, monke
 
     assert payload["page"]["truncated"] is True
     assert payload["meta"]["files_not_searched"] >= 1
-    assert any("read budget" in hint for hint in payload["meta"]["hints"])
+    assert "hints" not in payload["meta"]

@@ -4147,8 +4147,7 @@ async def test_structure_of_a_directory_path_resolves_to_its_directory_node(tmp_
 
 
 @pytest.mark.asyncio
-async def test_listings_drop_tests_on_request_flag_archived_rows_and_return_whole_summaries(tmp_path: Path) -> None:
-    (tmp_path / ".inflorescencearchive").write_text("legacy/\n", encoding="utf-8")
+async def test_listings_drop_tests_on_request_and_return_whole_summaries(tmp_path: Path) -> None:
     long_summary = "Capabilities: sheet construction, candidate extraction. " * 10
 
     class InventoryRepository(FakeGraphRepositoryV2):
@@ -4170,8 +4169,7 @@ async def test_listings_drop_tests_on_request_flag_archived_rows_and_return_whol
 
     ids = [item["id"] for item in payload["items"]]
     assert ids == ["legacy/old.ts", "src/rules.ts", "src/rules.ts::R23"], "path order kept, tests dropped"
-    assert payload["items"][0]["archived"] is True
-    assert "archived" not in payload["items"][1]
+    assert all("archived" not in item for item in payload["items"])
     assert payload["items"][1]["summary"] == long_summary
     assert payload["meta"]["full_summaries"] is True and payload["meta"]["include_tests"] is False
     assert payload["page"]["limit"] == FULL_SUMMARY_MAX_LIMIT

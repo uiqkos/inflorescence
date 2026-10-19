@@ -49,37 +49,31 @@ PATH_FILTERS = (
 )
 
 IS_TEST = (
-    "A hit whose *path* looks like test code (``tests/``, ``spec/``, ``test_*.py``, "
-    "``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``\"is_test\": true``. That is a "
-    "heuristic over the path only — it never reads the file — so treat it as a hint, not a verdict."
+    "A hit whose *path* follows a common test naming convention (``tests/``, ``spec/``, "
+    "``test_*.py``, ``*_test.go``, ``conftest.py``, ``*.test.ts``, …) carries ``\"is_test\": true`` "
+    "— a heuristic over the path only, it never reads the file. ``include_tests=false`` drops those "
+    "paths before the page is cut, test files that sit next to the code included; a project that "
+    "keeps tests elsewhere (``e2e/``, ``*.cy.ts``, a harness under ``scripts/``) needs "
+    "``exclude_paths`` for them."
 )
 
 SCOPE = (
-    "STRONGLY RECOMMENDED — scope every query, and exclude what is not the answer, BEFORE you read "
-    "the results. A repository holds many copies of the vocabulary you search for that are not "
-    "the code you want: tests, mocks and fixtures, prototypes, sample data, reports, old copies of "
-    "a feature. They out-rank that code on exactly the queries used to find it — field reports "
-    "measured 11 of 15 hits from ``tests/`` while the runner named in the query never reached "
-    "page 1, and 9 of 12 hits from a mock tree and archived prototypes with the two real answers "
-    "7th and 8th. So, on every call: ``include_paths`` names the area you are asking about; "
-    "``exclude_paths`` names every tree that is not the answer; ``include_tests=false`` whenever "
-    "you are looking for an implementation (a test restates the vocabulary of the code it "
-    "exercises); ``node_types=[\"code\"]`` when the question is about code rather than notes. "
-    "Example: ``search_semantic(directory=\"/repo\", query=\"job runner start stop\", "
-    "include_paths=[\"backend/\"], exclude_paths=[\"backend/fixtures/\"], include_tests=false)``. "
-    "Keep tests in when the test IS what you want — a usage example, an expected behaviour, a "
-    "repro. A tree that is never the answer for anyone belongs in ``.inflorescenceignore`` (not "
-    "indexed at all), and a tree that is history in ``.inflorescencearchive`` (ranked last) — "
-    "said once in the repository instead of on every query."
+    "A SEARCH IS A FEW CALLS, NOT ONE. A repository holds many copies of the vocabulary you search "
+    "for that are not the code you want — tests, mocks and fixtures, prototypes, sample data, "
+    "reports, an old copy of a feature — and they can out-rank it. ``meta.facets`` counts every "
+    "candidate this page was drawn from, not just the page: ``counted``; ``common_path``, the "
+    "deepest directory they all share; ``by_directory``, candidates per directory one level below "
+    "it (``\"direct\": true`` = files right in it; ``other_directories`` sums the directories not "
+    "listed); ``by_node_type``; and ``tests``, the test-like paths among them (absent with "
+    "``include_tests=false``). Use it to scope the next call: ``exclude_paths`` for the trees that "
+    "are not your answer, ``include_paths`` for the one that is — the narrowed call's facets then "
+    "split that tree one level deeper. Example: ``search_semantic(directory=\"/repo\", "
+    "query=\"job runner start stop\")`` whose facets read ``mocks/: 41, backend/: 7`` is followed "
+    "by the same call with ``exclude_paths=[\"mocks/\"]``. When you already know the area, scope "
+    "the first call. A tree that is never anyone's answer belongs in the repository's "
+    "``.inflorescenceignore`` — then it is not indexed at all."
 )
 
-ARCHIVED = (
-    "A repository can list paths that are history — kept for reference, never the answer by "
-    "default: archived prototypes, a legacy tree — in ``.inflorescencearchive`` at its root "
-    "(gitignore syntax, committed with the code). A hit from such a path carries "
-    "``\"archived\": true`` and is listed after every live hit instead of interleaved with them; "
-    "nothing is dropped (``exclude_paths`` does that for one query)."
-)
 
 WORKTREE_FIRST_QUERY = (
     "A first query against a git worktree of an indexed checkout that is not indexed yet indexes it "
@@ -118,18 +112,11 @@ EMPTY_PAGE = (
     "statement about files, not about what the files say."
 )
 
-HINTS = (
-    "``meta.hints``, when present, is a list of sentences about the shape of this page and the "
-    "parameter that changes it — every hit weak, most hits tests, most hits documents, most hits "
-    "from one directory while the rest of the page is elsewhere (the ``exclude_paths`` that "
-    "frees the page is named), archived hits moved down, query words that matched nothing. Read "
-    "it before trusting the top hit."
-)
 
 WEAK = (
     "A vector search always returns its nearest neighbours, so low scores still look like results: "
     "a hit below the weak-similarity threshold carries ``\"weak\": true``, and ``meta.weak_results`` "
-    "(with a sentence in ``meta.hints``) is set when *every* hit on the page is weak — nothing "
+    "is set when *every* hit on the page is weak — nothing "
     "matched closely, so the code probably is not there, or is named differently; confirm with "
     "``search_text`` on exact terms or ``find_text`` for a literal. (This only labels; "
     "``min_score`` is the separate hard cut-off.)"
@@ -145,8 +132,7 @@ COMPLETE_POOL = (
 
 LISTING_FLAGS = (
     "Items are flagged the way search hits are — ``\"is_test\": true`` when the path looks like "
-    "test code (a path heuristic), ``\"archived\": true`` when ``.inflorescencearchive`` "
-    "declares the path history — but a listing keeps its order: nothing is moved. "
+    "test code (a path heuristic) — but a listing keeps its order: nothing is moved. "
     "``include_tests=false`` drops test paths before the page is cut, so a directory of "
     "``*.test.ts`` files no longer pushes the implementation off page 1; ``exclude_paths`` drops "
     "any other tree the same way."

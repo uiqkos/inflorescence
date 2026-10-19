@@ -35,11 +35,10 @@ from mcp.server.fastmcp import FastMCP
 from inflorescence.db.repository import GraphRepository
 from inflorescence.project_manager import ProjectManager
 from inflorescence.tools import descriptions as doc
-from inflorescence.tools.archive import flag_archived, load_archive
 from inflorescence.tools.coverage import note_coverage
+from inflorescence.tools.facets import directory_facets
 from inflorescence.tools.freshness import build_checker
 from inflorescence.tools.gates import ensure_indexed
-from inflorescence.tools.hints import add_hints, page_shape_hints
 from inflorescence.tools.path_filters import PathFilterConfig, is_test_path, path_is_allowed
 from inflorescence.tools.responses import clamp_limit, clamp_offset, error_response, paginated_response
 
@@ -64,6 +63,8 @@ class _Scan:
 
     kept: list[tuple[str, int, str]] = field(default_factory=list)
     total_matches: int = 0
+    # Every matching line counted per file, kept or not — the facets are exact.
+    per_file: dict[str, int] = field(default_factory=dict)
     files_matched: int = 0
     files_searched: int = 0
     binary_skipped: int = 0
@@ -141,6 +142,7 @@ def _scan_files(
                     continue
                 matched_here = True
                 scan.total_matches += 1
+                scan.per_file[rel] = scan.per_file.get(rel, 0) + 1
                 if len(scan.kept) < keep:
                     scan.kept.append((rel, number, _quote(line, match.start())))
         except TimeoutError:
@@ -210,13 +212,16 @@ found through the index, so a directory the index has never seen is not opened (
 block of an empty page says so). A file that changed since indexing is read as it is now, and
 its items carry ``"stale": true``: the text is current, the entity's line span may be older.
 Binary files are skipped. The read stops at {FIND_MAX_BYTES // (1024 * 1024)} MB or
-{FIND_TIME_BUDGET_S:g} s; if it stops, ``page.truncated`` is true, ``meta.files_not_searched``
-counts what was left, and a sentence in ``meta.hints`` says so — narrow with
-``include_paths``. Costs nothing: no model, no embedding.""",
-    """Scope it like a search: ``include_paths`` for the area you mean, ``exclude_paths`` for
-mocks, fixtures, copies of an old version, and ``include_tests=false`` unless the tests are part
-of the answer (for a rename they are). Example: ``find_text(directory="/repo",
-pattern="--color-brand", include_paths=["frontend/src/"])``.""",
+{FIND_TIME_BUDGET_S:g} s; if it stops, ``page.truncated`` is true and ``meta.files_not_searched``
+counts what was left — narrow with ``include_paths``. When more files are missing from the index
+than are read here, ``meta.files_not_in_index`` says how many. Costs nothing: no model, no
+embedding.""",
+    """``meta.facets`` counts every match, not just the page: ``counted`` (= total_matches),
+``common_path``, ``by_directory`` (matches per directory one level below it), and ``tests``
+(matches in test-like paths; absent with ``include_tests=false``). Scope the next call with it:
+``exclude_paths`` for mocks, fixtures, copies of an old version; ``include_paths`` for the area you
+mean; ``include_tests=false`` unless the tests are part of the answer (for a rename they are).
+Example: ``find_text(directory="/repo", pattern="--color-brand", include_paths=["frontend/src/"])``.""",
     doc.PATH_FILTERS,
     doc.LISTING_FLAGS,
     doc.WORKTREE_FIRST_QUERY,
@@ -307,37 +312,19 @@ def register_find_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphReposi
             meta["files_not_searched"] = scan.not_searched
         if scan.regex_timed_out_in is not None:
             meta["regex_timed_out_in"] = scan.regex_timed_out_in
-        payload = paginated_response(items, bounded_limit, bounded_offset, meta, truncated=truncated)
-        flag_archived(payload["items"], load_archive(root))
-        for item in payload["items"]:
-            checker.annotate(item)
-
-        hints: list[str] = []
-        if scan.regex_timed_out_in is not None:
-            hints.append(
-                f"The regex used up the whole {FIND_TIME_BUDGET_S:g} s budget inside a single line of "
-                f"{scan.regex_timed_out_in}: it backtracks catastrophically (nested quantifiers such as "
-                "(a+)+ or (x+x+)+). The totals cover only the files before it. Simplify the pattern, "
-                "or pass the literal with regex=false."
-            )
-        elif truncated:
-            hints.append(
-                f"The read budget ({FIND_MAX_BYTES // (1024 * 1024)} MB / {FIND_TIME_BUDGET_S:g} s) "
-                f"ran out with {scan.not_searched} of {len(universe)} files unread, so the totals "
-                "cover only what was read. Narrow with include_paths to make the answer complete."
-            )
         gap_total = int(gap.get("not_indexed_total") or 0)
         if gap.get("capped") or gap_total > FIND_MAX_UNINDEXED:
-            hints.append(
-                f"{gap_total} files on disk are not in this index"
-                f"{' (the check stopped early)' if gap.get('capped') else ''}, and at most "
-                f"{FIND_MAX_UNINDEXED} of them were read. Run index_directory to bring the rest "
-                "in, or narrow with include_paths."
-            )
-        if bounded_offset == 0:
-            hints.extend(page_shape_hints(
-                payload["items"], include_tests=include_tests, node_types=None,
-                include_paths=include_paths, documents=False,
-            ))
-        add_hints(payload, hints)
+            # Files the indexer would admit but the index lacks, beyond what this call reads.
+            meta["files_not_in_index"] = {
+                "count": gap_total, "read": len(unindexed), "count_is_lower_bound": bool(gap.get("capped")),
+            }
+        if scan.per_file:
+            meta["facets"] = {
+                "counted": scan.total_matches,
+                **directory_facets(scan.per_file),
+                **({"tests": sum(n for path, n in scan.per_file.items() if is_test_path(path))} if include_tests else {}),
+            }
+        payload = paginated_response(items, bounded_limit, bounded_offset, meta, truncated=truncated)
+        for item in payload["items"]:
+            checker.annotate(item)
         return await note_coverage(checker.stamp(payload), manager, directory, checker)

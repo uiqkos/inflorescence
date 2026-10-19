@@ -1,8 +1,8 @@
 """Field-report round 3: a search never silently loses hits, and says what its page means.
 
 Covers the repository's widening candidate window (INV-9), verbatim chunks for every line of a
-code file, quoted matching lines, unmatched query words with the fuzzy retry, page-shape hints,
-the ``"code"`` node-type group, archived paths, index drift and the price of a chunk-format
+code file, quoted matching lines, unmatched query words with the fuzzy retry, candidate facets,
+the ``"code"`` node-type group, index drift and the price of a chunk-format
 upgrade.
 """
 
@@ -20,11 +20,9 @@ from inflorescence.config import Settings
 from inflorescence.db import repository as repository_module
 from inflorescence.db.repository import GraphRepository, ProjectHits
 from inflorescence.rag.chunker import CHUNK_MARKER_SUFFIX, VERBATIM_CHUNK_KINDS, Chunker
-from inflorescence.tools import archive as archive_module
 from inflorescence.tools import freshness
-from inflorescence.tools.archive import demote_archived, load_archive
+from inflorescence.tools.facets import FACET_DIRECTORIES, directory_facets, hit_facets
 from inflorescence.tools.gates import NODE_TYPE_GROUPS, normalize_node_types
-from inflorescence.tools.hints import page_shape_hints
 from inflorescence.tools.search import register_search_tools
 from inflorescence.tools.text_terms import (
     fuzzy_distance_for,
@@ -313,7 +311,7 @@ async def test_search_text_names_words_the_index_does_not_know_and_retries_them_
     hit = payload["items"][0]
     assert hit["fuzzy"] is True
     assert hit["matches"][0]["lines"] == [{"line": 66, "text": "Переписывание — не выбрасывание."}]
-    assert any("no stemming" in hint for hint in payload["meta"]["hints"])
+    assert payload["meta"]["fuzzy_retried"] == {"выбрасывания": 2}
     # A fuzzy page is not an empty page, so no coverage block claims anything about absence.
     assert "index_coverage" not in payload["meta"]
 
@@ -330,59 +328,80 @@ async def test_search_text_says_when_known_words_were_filtered_out() -> None:
 
     assert payload["items"] == []
     assert "unmatched_terms" not in payload["meta"]
-    assert any("outside the scope" in hint for hint in payload["meta"]["hints"])
+    assert payload["meta"]["matched_outside_filters"] is True
 
 
 # ---------------------------------------------------------------------------
-# Page-shape hints and the "code" group
+# Candidate facets and the "code" group
 # ---------------------------------------------------------------------------
 
 
-def test_page_shape_hints_name_a_test_or_document_dominated_page() -> None:
-    tests_page = [{"entity": {"node_type": "function"}, "is_test": True}] * 3 + [{"entity": {"node_type": "function"}}]
-    docs_page = [{"entity": {"node_type": "document"}}] * 3 + [{"entity": {"node_type": "class"}}]
-
-    assert "include_tests=false" in page_shape_hints(tests_page, include_tests=True, node_types=None)[0]
-    assert page_shape_hints(tests_page, include_tests=False, node_types=None) == []
-    assert 'node_types=["code"]' in page_shape_hints(docs_page, include_tests=True, node_types=None)[0]
-    assert page_shape_hints(docs_page[:2], include_tests=True, node_types=None) == []
+def _hit_at(path: str, node_type: str = "function", is_test: bool = False) -> dict[str, object]:
+    hit: dict[str, object] = {"entity": {"node_type": node_type, "file_path": path}}
+    if is_test:
+        hit["is_test"] = True
+    return hit
 
 
-def _hit_at(path: str) -> dict[str, object]:
-    return {"entity": {"node_type": "function", "file_path": path}}
-
-
-def test_page_shape_hints_name_the_directory_that_buries_the_rest() -> None:
-    # A shape from a field report: most of the page is copies from one sample tree, the two
-    # real answers are elsewhere. The directory is read off the hits — nothing is predeclared.
-    page = [_hit_at(f"samples/v{i}/app.js") for i in range(4)] + [
+def test_facets_count_directories_below_the_common_path() -> None:
+    # A shape from a field report: most candidates are copies from one sample tree, the real
+    # answers elsewhere. Nothing is predeclared — the directories are read off the candidates.
+    hits = [_hit_at(f"samples/v{i}/app.js") for i in range(4)] + [
         _hit_at("backend/content/checker.go"),
-        _hit_at("frontend/components/renderers.tsx"),
+        _hit_at("frontend/components/renderers.tsx", is_test=True),
+        _hit_at("README.md", node_type="document"),
     ]
 
-    (hint,) = page_shape_hints(page, include_tests=True, node_types=None)
+    facets = hit_facets(hits, count_tests=True)
 
-    assert hint.startswith("4 of 6 hits come from samples/.")
-    assert 'exclude_paths=["samples/"]' in hint
+    assert facets["counted"] == 7 and facets["common_path"] == "./"
+    assert facets["by_directory"][0] == {"path": "samples/", "count": 4}
+    assert {"path": "./", "count": 1, "direct": True} in facets["by_directory"]
+    assert facets["by_node_type"] == {"function": 6, "document": 1}
+    assert facets["tests"] == 1
+    assert "tests" not in hit_facets(hits, count_tests=False)
 
 
-def test_dominant_directory_hint_picks_the_deepest_tree_and_respects_the_callers_scope() -> None:
-    page = [_hit_at(f"web/src/tasks/bank/t{i}.json") for i in range(3)] + [
-        _hit_at("web/src/engine/formula.ts"),
-        _hit_at("web/src/engine/rules.ts"),
+def test_facets_follow_the_scope_one_level_deeper() -> None:
+    # Scoped to web/src, every candidate shares it: the split is one level below.
+    facets = directory_facets({
+        "web/src/tasks/bank/t1.json": 3, "web/src/engine/formula.ts": 1, "web/src/engine/rules.ts": 1,
+    })
+
+    assert facets["common_path"] == "web/src/"
+    assert facets["by_directory"] == [
+        {"path": "web/src/tasks/", "count": 3}, {"path": "web/src/engine/", "count": 2},
     ]
 
-    # Scoped to web/src, the bank tree below it still buries the engine: name the bank.
-    (hint,) = page_shape_hints(page, include_tests=True, node_types=None, include_paths=["web/src"])
-    assert 'exclude_paths=["web/src/tasks/bank/"]' in hint
-    # The caller asked about that very tree: nothing to say.
-    assert page_shape_hints(page, include_tests=True, node_types=None, include_paths=["web/src/tasks/bank/**"]) == []
-    # A homogeneous page (every hit in one tree) buries nothing.
-    same = [_hit_at(f"web/src/engine/f{i}.ts") for i in range(5)]
-    assert page_shape_hints(same, include_tests=True, node_types=None) == []
+
+def test_facets_list_the_biggest_directories_and_sum_the_rest() -> None:
+    counts = {f"d{i}/f.py": i + 1 for i in range(FACET_DIRECTORIES + 3)}
+
+    facets = directory_facets(counts)
+
+    assert len(facets["by_directory"]) == FACET_DIRECTORIES
+    assert facets["by_directory"][0]["path"] == f"d{FACET_DIRECTORIES + 2}/"
+    assert facets["other_directories"] == {"directories": 3, "count": 1 + 2 + 3}
 
 
-def test_search_descriptions_lead_with_scoping_advice() -> None:
+@pytest.mark.asyncio
+async def test_search_facets_count_every_candidate_not_just_the_page() -> None:
+    mcp = FastMCP("test")
+    repo = _WordAwareTextRepo({"runner"})
+    repo.code_rows = [
+        _chunk_row(f"mocks/v{i}/app.js", f"mocks/v{i}/app.js", "runner()", 1, score=9.0 - i) for i in range(5)
+    ] + [_chunk_row("backend/run.go", "backend/run.go", "runner()", 1, score=1.0)]
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+
+    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/p", "query": "runner", "limit": 2}))
+
+    assert len(payload["items"]) == 2
+    facets = payload["meta"]["facets"]
+    assert facets["counted"] == 6
+    assert facets["by_directory"] == [{"path": "mocks/", "count": 5}, {"path": "backend/", "count": 1}]
+
+
+def test_search_descriptions_teach_the_scoping_loop() -> None:
     from inflorescence.tools.search import (
         SEARCH_CODE_DESCRIPTION,
         SEARCH_HYBRID_DESCRIPTION,
@@ -393,9 +412,11 @@ def test_search_descriptions_lead_with_scoping_advice() -> None:
     for description in (
         SEARCH_CODE_DESCRIPTION, SEARCH_SEMANTIC_DESCRIPTION, SEARCH_HYBRID_DESCRIPTION, SEARCH_TEXT_DESCRIPTION
     ):
-        scope_at = description.index("STRONGLY RECOMMENDED")
-        assert scope_at < description.index("``node_types`` values")
-        assert "exclude_paths" in description[scope_at : scope_at + 1500]
+        loop_at = description.index("A SEARCH IS A FEW CALLS")
+        assert loop_at < description.index("``node_types`` values")
+        window = description[loop_at : loop_at + 1800]
+        assert "meta.facets" in window and "exclude_paths" in window and "include_paths" in window
+        assert "hints" not in description
 
 
 def test_code_group_expands_to_every_type_but_documents_and_directories() -> None:
@@ -407,37 +428,6 @@ def test_code_group_expands_to_every_type_but_documents_and_directories() -> Non
     assert normalize_node_types(["Code", "function"]) == list(NODE_TYPE_GROUPS["code"])
     error = normalize_node_types(["codez"])
     assert isinstance(error, dict) and "'code'" in error["error"]["message"]
-
-
-# ---------------------------------------------------------------------------
-# Archived paths
-# ---------------------------------------------------------------------------
-
-
-def test_archived_hits_are_flagged_and_listed_after_live_ones(tmp_path: Path) -> None:
-    archive_module._cache.clear()
-    (tmp_path / ".inflorescencearchive").write_text("mocks/\ndocs/prototypes/**\n", encoding="utf-8")
-    hits = [
-        {"entity": {"file_path": "mocks/v4/app.js"}, "score": 0.9},
-        {"entity": {"file_path": "src/registry.ts"}, "score": 0.6},
-        {"entity": {"file_path": "docs/prototypes/step/app.js"}, "score": 0.5},
-        {"entity": {"file_path": "backend/checker.go"}, "score": 0.4},
-    ]
-
-    ordered, archived = demote_archived(hits, load_archive(tmp_path))
-
-    assert archived == 2
-    assert [h["entity"]["file_path"] for h in ordered] == [
-        "src/registry.ts", "backend/checker.go", "mocks/v4/app.js", "docs/prototypes/step/app.js",
-    ]
-    assert [h.get("archived") for h in ordered] == [None, None, True, True]
-
-
-def test_no_archive_file_changes_nothing(tmp_path: Path) -> None:
-    archive_module._cache.clear()
-    hits = [{"entity": {"file_path": "mocks/a.js"}}]
-
-    assert demote_archived(hits, load_archive(tmp_path)) == (hits, 0)
 
 
 # ---------------------------------------------------------------------------

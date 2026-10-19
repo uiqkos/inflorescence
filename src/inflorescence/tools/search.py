@@ -16,17 +16,10 @@ from inflorescence.project_manager import ProjectManager
 from inflorescence.rag.chunker import VERBATIM_CHUNK_KINDS
 from inflorescence.rag.embeddings import EmbeddingClient
 from inflorescence.tools import descriptions as doc
-from inflorescence.tools.archive import demote_archived, load_archive
 from inflorescence.tools.coverage import note_coverage
+from inflorescence.tools.facets import hit_facets
 from inflorescence.tools.freshness import build_checker, describe_origin, unchecked_empty_page
 from inflorescence.tools.gates import ensure_indexed, normalize_node_types
-from inflorescence.tools.hints import (
-    add_hints,
-    archived_hint,
-    page_shape_hints,
-    unmatched_terms_hint,
-    weak_page_hint,
-)
 from inflorescence.tools.path_filters import PathFilterConfig, filter_records_by_path, is_test_path
 from inflorescence.tools.responses import (
     MAX_SEARCH_LIMIT,
@@ -317,11 +310,10 @@ _TEXT_COVERAGE_CAVEAT = (
 _SEARCH_COMMON = (
     doc.PATH_FILTERS,
     doc.IS_TEST,
-    doc.ARCHIVED,
     doc.COMPLETE_POOL,
     doc.WORKTREE_FIRST_QUERY,
 )
-_SEARCH_TAIL = (doc.HINTS, doc.PROVENANCE, doc.EMPTY_PAGE)
+_SEARCH_TAIL = (doc.PROVENANCE, doc.EMPTY_PAGE)
 
 SEARCH_CODE_DESCRIPTION = doc.join(
     """Search code chunk embeddings and return entity hits.
@@ -407,9 +399,10 @@ phrase, so it matches only where those pieces are adjacent. A multi-word query m
 its words, so the top hit is usually right while the tail can be noise from a common word —
 narrow with the most distinctive single word, or add ``include_paths``. When a word matches
 nothing in this project at all, ``meta.unmatched_terms`` lists it (a guessed identifier, a
-different inflection, a typo) and a sentence in ``meta.hints`` says so; a word of five or more
-letters is then retried within one or two edits, and hits found only that way carry
-``"fuzzy": true`` and are listed after exact ones.
+different inflection, a typo); a word of five or more letters is then retried within one or two
+edits (``meta.fuzzy_retried`` names the words and distances), and hits found only that way carry
+``"fuzzy": true`` and are listed after exact ones. ``meta.matched_outside_filters: true`` on an
+empty page means every word does occur in this project, just not inside the scope you passed.
 
 While an index run is in progress, summary and raw-code fields cover only what has already
 landed; name/signature hits are complete as soon as the skeleton is stored.""",
@@ -441,34 +434,21 @@ def register_search_tools(
         meta: dict[str, object],
         truncated: bool,
         include_tests: bool,
-        node_types: list[str] | None,
-        include_paths: Sequence[str] | None = None,
         weak_threshold: float | None = None,
-        extra_hints: Sequence[str] = (),
         coverage_caveat: str = "",
     ) -> MutableMapping[str, Any]:
-        """Order, page, annotate and explain a ranked hit list — the same way for every search.
+        """Page, annotate and describe a ranked hit list — the same way for every search.
 
-        Archived hits are moved below live ones over the *whole* candidate list before paging,
-        so page 1 holds the best live answers and later pages stay consistent with it.
+        ``meta.facets`` counts the *whole* candidate list the page was cut from, so the caller
+        sees which trees the candidates come from and can re-scope the next call itself.
         """
-        ordered, archived = demote_archived(hits, load_archive(Path(directory).resolve()))
-        payload = paginated_response(ordered[offset : offset + limit + 1], limit, offset, meta, truncated=truncated)
+        if hits:
+            meta["facets"] = hit_facets(hits, count_tests=include_tests)
+        payload = paginated_response(hits[offset : offset + limit + 1], limit, offset, meta, truncated=truncated)
         checker = await build_checker(repo, project, directory)
         checker.stamp(payload)
-        hints = list(extra_hints)
         if weak_threshold is not None:
             _flag_weak(payload, weak_threshold)
-            if payload["meta"].get("weak_results"):
-                hints.append(weak_page_hint(weak_threshold))
-        hints.extend(
-            page_shape_hints(
-                payload["items"], include_tests=include_tests, node_types=node_types, include_paths=include_paths
-            )
-        )
-        if archived and offset == 0:
-            hints.append(archived_hint(archived))
-        add_hints(payload, hints)
         return await note_coverage(payload, manager, directory, checker, caveat=coverage_caveat)
 
     async def _prepare(
@@ -524,8 +504,7 @@ def register_search_tools(
             _code_hits(found.rows, min_score),
             directory=directory, project=project, limit=bounded_limit, offset=bounded_offset,
             meta=_meta(project, query, min_score, types, filters), truncated=not found.complete,
-            include_tests=include_tests, node_types=types, include_paths=include_paths,
-            weak_threshold=settings.semantic_weak_threshold,
+            include_tests=include_tests, weak_threshold=settings.semantic_weak_threshold,
         )
 
     @mcp.tool(description=SEARCH_SEMANTIC_DESCRIPTION)
@@ -559,8 +538,7 @@ def register_search_tools(
             _summary_hits(found.rows, min_score),
             directory=directory, project=project, limit=bounded_limit, offset=bounded_offset,
             meta=_meta(project, query, min_score, types, filters), truncated=not found.complete,
-            include_tests=include_tests, node_types=types, include_paths=include_paths,
-            weak_threshold=settings.semantic_weak_threshold,
+            include_tests=include_tests, weak_threshold=settings.semantic_weak_threshold,
         )
 
     @mcp.tool(description=SEARCH_HYBRID_DESCRIPTION)
@@ -617,8 +595,7 @@ def register_search_tools(
             directory=directory, project=project, limit=bounded_limit, offset=bounded_offset,
             meta=_meta(project, query, min_score, types, filters),
             truncated=not (code_found.complete and summary_found.complete),
-            include_tests=include_tests, node_types=types, include_paths=include_paths,
-            weak_threshold=settings.semantic_weak_threshold,
+            include_tests=include_tests, weak_threshold=settings.semantic_weak_threshold,
         )
 
     async def _word_is_indexed(project: str, word: str) -> bool | None:
@@ -701,7 +678,6 @@ def register_search_tools(
             if await _word_is_indexed(project, word) is False:
                 unmatched.append(word)
 
-        extra_hints: list[str] = []
         fuzzy_tried: dict[str, int] = {}
         if unmatched:
             meta["unmatched_terms"] = unmatched
@@ -720,18 +696,15 @@ def register_search_tools(
                 extra = _fuzzy_hits([r for r in fuzzy.rows if float(r.get("score", 0) or 0) >= min_score], word, distance, known)
                 known.update(str((hit["entity"] or {}).get("id", "")) for hit in extra)
                 hits.extend(extra)
-            extra_hints.append(unmatched_terms_hint(unmatched, fuzzy_tried))
+            if fuzzy_tried:
+                meta["fuzzy_retried"] = fuzzy_tried
         elif not hits and (include_paths or exclude_paths or types or not include_tests):
-            extra_hints.append(
-                "Every word of this query occurs somewhere in this project's index, but nothing "
-                "the filters keep matched it (include_paths / exclude_paths / node_types / "
-                "include_tests). The answer may live outside the scope you chose — an operational "
-                "procedure is often in reports or runbooks rather than in the config directory."
-            )
+            # Every word is known to this project's index; only the caller's scope kept it out.
+            meta["matched_outside_filters"] = True
 
         return await _respond(
             _cap_matches(hits),
             directory=directory, project=project, limit=bounded_limit, offset=bounded_offset,
-            meta=meta, truncated=truncated, include_tests=include_tests, node_types=types, include_paths=include_paths,
-            extra_hints=extra_hints, coverage_caveat=_TEXT_COVERAGE_CAVEAT,
+            meta=meta, truncated=truncated, include_tests=include_tests,
+            coverage_caveat=_TEXT_COVERAGE_CAVEAT,
         )

@@ -11,7 +11,6 @@ from mcp.server.fastmcp import FastMCP
 from inflorescence.db.repository import GraphRepository
 from inflorescence.project_manager import ProjectManager
 from inflorescence.tools import descriptions as doc
-from inflorescence.tools.archive import flag_archived, load_archive
 from inflorescence.tools.coverage import note_coverage
 from inflorescence.tools.freshness import build_checker
 from inflorescence.tools.gates import ensure_indexed, normalize_node_types
@@ -250,12 +249,11 @@ def _not_test(row: dict[str, object]) -> bool:
     return not is_test_path(record_path(row))
 
 
-def _flag_items(items: Sequence[MutableMapping[str, Any]], directory: str) -> None:
-    """Mark test and archived items in place, the way search hits are marked; order is kept."""
+def _flag_items(items: Sequence[MutableMapping[str, Any]]) -> None:
+    """Mark test items in place, the way search hits are marked; order is kept."""
     for item in items:
         if is_test_path(record_path(item)):
             item["is_test"] = True
-    flag_archived(items, load_archive(Path(directory).resolve()))
 
 
 def _page_bounds(limit: int, full_summaries: bool) -> tuple[int, int | None]:
@@ -398,7 +396,7 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             _listing_meta(project, filters, node_types, include_tests, full_summaries),
             truncated=truncated,
         )
-        _flag_items(payload["items"], directory)
+        _flag_items(payload["items"])
         checker = await build_checker(repo, project, directory)
         return await note_coverage(checker.stamp(payload), manager, directory, checker)
 
@@ -451,7 +449,7 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         meta = _listing_meta(project, filters, node_types, include_tests, full_summaries)
         meta.update({"depth": min(max(depth, 1), 3), "node_id": node_id, "file_path": file_path})
         payload = paginated_response(items, bounded_limit, bounded_offset, meta, truncated=truncated)
-        _flag_items(payload["items"], directory)
+        _flag_items(payload["items"])
         checker = await build_checker(repo, project, directory)
         # The root is annotated before ``stamp``, so its file counts in index_freshness.
         payload["root"] = checker.annotate(entity_ref(root))
@@ -573,7 +571,7 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
             meta,
             truncated=truncated,
         )
-        _flag_items(payload["items"], directory)
+        _flag_items(payload["items"])
         checker = await build_checker(repo, project, directory)
         return await note_coverage(checker.stamp(payload), manager, directory, checker)
 
@@ -609,7 +607,7 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         meta = _listing_meta(project, filters, node_types, include_tests, False)
         meta["query"] = query
         payload = paginated_response(items, bounded_limit, bounded_offset, meta, truncated=truncated)
-        _flag_items(payload["items"], directory)
+        _flag_items(payload["items"])
         checker = await build_checker(repo, project, directory)
         return await note_coverage(checker.stamp(payload), manager, directory, checker)
 
