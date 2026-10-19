@@ -322,7 +322,9 @@ spend: a first index, a re-index, each watcher flush, and the daemon's catch-up.
 any money is spent, and the refusal reports the estimate so you can raise the cap deliberately.
 
 A first index is priced over the whole tree; a re-index and a watcher update are priced over
-only the files whose content moved. So a routine refresh of a large repository is never rejected
+only the files whose content moved — and then, once the run has parsed the tree and before it
+writes anything or sends a request, over the summaries it will actually regenerate (below). So a
+routine refresh of a large repository is never rejected
 for work it is going to reuse — while an upgrade that widens what the indexer admits (one new
 `DOCUMENT_EXTENSIONS` entry can make thousands of files newly billable) still has to clear the
 cap before it spends. The estimate uses `LLM_PRICE_INPUT_USD_PER_MTOK`,
@@ -341,9 +343,13 @@ project's summaries. It is not a data wipe.
 
 Every update re-parses the whole tree, since one edit can change what another file is recorded as
 calling — so after a parser upgrade the *first* update of each project, a watcher flush or the
-watch daemon's catch-up, summarizes the same newly recognized entities. Its cost gate prices the
-changed files and the re-chunking, not those summaries yet: after upgrading, run `--force`
-deliberately rather than leaving that bill to the next background update.
+watch daemon's catch-up, summarizes the same newly recognized entities, in files whose bytes
+never moved. A price per changed file cannot see that, so every gated run also prices its
+**summary plan**: the summarization pass itself, run against a counting stand-in for the LLM
+right after the parse, which yields exactly which summaries would be regenerated and the prompts
+they would send. That price plus the code chunks is held against the cap; a refusal says how many
+summaries it counted and leaves the graph untouched. The plan adds about a second per 10k
+entities to a run. `--dry-run` prices files by size and does not count it.
 
 ### Narrowing a scope: `prune`
 

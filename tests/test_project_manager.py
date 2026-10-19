@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from inflorescence.code_indexer.graph_builder import BuildResult
+from inflorescence.code_indexer.summarizer import SummaryPlan
 from inflorescence.config import Settings
 from inflorescence.project_manager import ProjectManager
 
@@ -410,6 +411,81 @@ async def test_update_project_is_gated_by_the_cost_cap(tmp_path: Path) -> None:
         await manager.update_project(project, ["a.py", "b.py"])
 
     assert builder.updates == 0            # gated before build/summarize/embed
+
+
+def _plan(summaries: int, calls: int | None = None, prompt_chars: int = 2_000) -> SummaryPlan:
+    return SummaryPlan(
+        frozenset(f"n{i}" for i in range(summaries)), summaries if calls is None else calls,
+        prompt_chars * summaries,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_watcher_update_with_nothing_changed_still_pays_for_what_it_summarizes(tmp_path: Path) -> None:
+    """The file-level gate prices the files whose bytes moved; a run summarizes what it parses.
+
+    After a parser upgrade every update re-parses the tree and summarizes the entities the new
+    parser recognizes in files nobody touched — measured: 190 summaries, zero changed files,
+    spent by a daemon catch-up whose gate had priced nothing. The summary gate sees the plan.
+    """
+    from inflorescence.cost import IndexCostExceededError
+
+    repo = FakeProjectRepository({"nodes": 1, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder(update_result=([object()], [object()]))
+    builder.estimate_result = {"estimated_tokens": 10, "estimated_nodes": 1}   # one cheap file
+    builder.summary_plan = _plan(50_000)
+    rag = FakeRAGIndexer()
+    manager = ProjectManager(repo=repo, graph_builder=builder, rag_indexer=rag, settings=Settings(_env_file=None))
+    project = manager.get_project(str(tmp_path))
+
+    with pytest.raises(IndexCostExceededError) as caught:
+        await manager.update_project(project, ["a.py"])
+
+    assert caught.value.regenerated_summaries == 50_000
+    assert "50000 summar(ies) the run would regenerate" in str(caught.value)
+    assert rag.summary_indexes == 0 and rag.code_indexes == 0     # nothing paid for
+
+
+@pytest.mark.asyncio
+async def test_a_forced_reindex_is_priced_by_what_it_resummarizes(tmp_path: Path) -> None:
+    """``--force`` after cleared hashes changes no file, yet re-summarizes the whole project."""
+    from inflorescence.cost import IndexCostExceededError
+
+    repo = FakeProjectRepository({"nodes": 500, "edges": 900, "chunks": 40, "summaries": 400})
+    builder = FakeGraphBuilder(build_result=([object()], [object()]))
+    builder.summary_plan = _plan(50_000)
+    manager = ProjectManager(
+        repo=repo, graph_builder=builder, rag_indexer=FakeRAGIndexer(), settings=Settings(_env_file=None)
+    )
+
+    with pytest.raises(IndexCostExceededError) as caught:
+        await manager.index_directory(str(tmp_path), force_rebuild=True)
+    assert caught.value.changed_files == 0 and caught.value.regenerated_summaries == 50_000
+
+    builder.summary_plan = _plan(50_000)
+    await manager.index_directory(str(tmp_path), force_rebuild=True, max_cost_usd=1_000.0)
+    assert builder.summary_gate_seen
+
+
+@pytest.mark.asyncio
+async def test_a_plan_within_the_cap_proceeds_and_no_cap_means_no_plan(tmp_path: Path) -> None:
+    repo = FakeProjectRepository({"nodes": 1, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder(update_result=([object()], [object()]))
+    builder.estimate_result = {"estimated_tokens": 10, "estimated_nodes": 1}
+    builder.summary_plan = _plan(20)
+    rag = FakeRAGIndexer()
+    manager = ProjectManager(repo=repo, graph_builder=builder, rag_indexer=rag, settings=Settings(_env_file=None))
+    project = manager.get_project(str(tmp_path))
+
+    await manager.update_project(project, ["a.py"])
+    assert builder.summary_gate_seen and rag.summary_indexes == 1
+
+    uncapped = ProjectManager(
+        repo=repo, graph_builder=builder, rag_indexer=FakeRAGIndexer(),
+        settings=Settings(_env_file=None, max_index_cost_usd=None),
+    )
+    await uncapped.update_project(uncapped.get_project(str(tmp_path)), ["a.py"])
+    assert not builder.summary_gate_seen        # the plan is a gate; with no cap it is not run
 
 
 @pytest.mark.asyncio
@@ -1691,8 +1767,10 @@ class FakeGraphBuilder:
         exclude_patterns: list[str] | None = None,
         stored_summaries: dict[str, dict[str, object]] | None = None,
         progress: object | None = None,
+        summary_gate: object | None = None,
     ) -> BuildResult:
         self.builds += 1
+        await self._consult(summary_gate)
         self.build_filters.append((include_patterns, exclude_patterns))
         self.build_stored_summaries.append(stored_summaries)
         # Mirrors the real builder: whatever stored summaries came in are handed back on the
@@ -1712,8 +1790,10 @@ class FakeGraphBuilder:
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         progress: object | None = None,
+        summary_gate: object | None = None,
     ) -> BuildResult:
         self.updates += 1
+        await self._consult(summary_gate)
         if self.call_log is not None:
             self.call_log.append("update")
         self.update_filters.append((include_patterns, exclude_patterns))
@@ -1728,6 +1808,16 @@ class FakeGraphBuilder:
                 set(self.update_changed_files) if self.update_changed_files is not None else None
             ),
         )
+
+    # What the parse would have found to summarize; handed to the run's summary gate the way
+    # the real builder does, after the parse and before any write.
+    summary_plan: SummaryPlan | None = None
+    summary_gate_seen: bool = False
+
+    async def _consult(self, summary_gate: object | None) -> None:
+        self.summary_gate_seen = summary_gate is not None
+        if summary_gate is not None and self.summary_plan is not None:
+            await summary_gate(self.summary_plan)  # type: ignore[operator]
 
     async def repair_missing_summaries(self, project: str, root_path: Path) -> list[object]:
         self.repairs += 1

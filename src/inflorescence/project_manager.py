@@ -6,17 +6,19 @@ import asyncio
 import hashlib
 import logging
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
 from inflorescence.code_indexer.graph_builder import BuildResult, GraphBuilder
+from inflorescence.code_indexer.summarizer import SummaryPlan
 from inflorescence.config import Settings
 from inflorescence.cost import (
     IndexCostExceededError,
     estimate_index_cost,
     estimate_rechunk_cost,
+    estimate_summary_plan_cost,
     price_largest_files,
 )
 from inflorescence.db.connection import MemgraphConnection
@@ -50,6 +52,20 @@ class _DonorCoverage:
     uncovered: list[str]
     deleted: list[str]
     scanned: int
+
+
+@dataclass(frozen=True)
+class _ChunkPricing:
+    """What a gated run pays for code chunks, settled before the parse, and what it covers.
+
+    The summaries are priced afterwards, exactly, by the summary gate (see
+    ``ProjectManager._summary_gate``); this is the rest of the bill it adds them to.
+    ``changed_files`` is ``None`` for a first index, which covers the whole tree.
+    """
+
+    changed_files: int | None
+    rechunk_files: int
+    usd: float
 
 
 class IndexPreflightError(RuntimeError):
@@ -212,7 +228,9 @@ class ProjectManager:
         preview = self._builder.estimate_paths(root, backlog)
         return backlog, estimate_rechunk_cost(preview, self._settings)["usd"]
 
-    async def _gate_update_cost(self, project: str, root_path: Path, changed_files: list[str]) -> None:
+    async def _gate_update_cost(
+        self, project: str, root_path: Path, changed_files: list[str]
+    ) -> _ChunkPricing | None:
         """Abort a background watcher update whose changed set would exceed the cost cap.
 
         A ``git checkout`` touching thousands of files fires one debounced flush that would
@@ -220,10 +238,14 @@ class ProjectManager:
         more than an explicit index, so the same cap gates it — estimated over just the
         changed files (deletes cost nothing), plus the unchanged files whose chunks this run
         will re-cut (:meth:`_rechunk_backlog`). No cap configured (``None``) means no gate.
+
+        This is the early refusal, before anything is parsed. It cannot see summaries the run
+        redoes for files whose bytes did not move, so it returns the chunk side of the bill
+        for :meth:`_summary_gate` to complete once the parse knows the rest.
         """
         limit = self._settings.max_index_cost_usd
         if limit is None:
-            return
+            return None
         preview = self._builder.estimate_paths(root_path, changed_files)
         estimate = estimate_index_cost(preview, self._settings)["usd"]
         changed_rel = [_relative_to(p, root_path) for p in changed_files]
@@ -239,6 +261,10 @@ class ProjectManager:
             raise IndexCostExceededError(
                 total, limit, changed_files=len(changed_files), rechunk_files=len(backlog)
             )
+        return _ChunkPricing(
+            len(changed_files), len(backlog),
+            round(estimate_rechunk_cost(preview, self._settings)["usd"] + backlog_usd, 4),
+        )
 
     async def _gate_reindex_cost(
         self,
@@ -247,7 +273,7 @@ class ProjectManager:
         include_patterns: list[str] | None,
         exclude_patterns: list[str] | None,
         limit: float | None,
-    ) -> None:
+    ) -> _ChunkPricing | None:
         """Abort an incremental re-index whose changed set would exceed the cost cap.
 
         The gate on the first-time branch prices the whole tree; that is the wrong question
@@ -263,16 +289,20 @@ class ProjectManager:
         repo: adding data formats turned a re-index into an ungated ~$57 run.
 
         Costs one directory walk + MD5 pass that the build below repeats. That is the same
-        price the watcher path already pays, and it buys the only number worth gating on.
+        price the watcher path already pays, and it buys the only number worth gating on
+        before the parse. Like :meth:`_gate_update_cost` it returns the chunk side of the
+        bill; the summaries — including those of unchanged files an upgraded parser reads
+        differently, and all of them on a ``--force`` after hashes were cleared — are priced
+        by :meth:`_summary_gate` once the parse has run.
         """
         if limit is None:
-            return
+            return None
         changed = await self._builder.pending_change_paths(
             project, root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
         )
         backlog, backlog_usd = await self._rechunk_backlog(project, root, changed)
         if not changed and not backlog:
-            return
+            return _ChunkPricing(0, 0, 0.0)
         preview = self._builder.estimate_paths(root, changed) if changed else {}
         total = round(estimate_index_cost(preview, self._settings)["usd"] + backlog_usd, 4)
         logger.info(
@@ -284,6 +314,45 @@ class ProjectManager:
             raise IndexCostExceededError(
                 total, limit, changed_files=len(changed), rechunk_files=len(backlog)
             )
+        return _ChunkPricing(
+            len(changed), len(backlog),
+            round(estimate_rechunk_cost(preview, self._settings)["usd"] + backlog_usd, 4),
+        )
+
+    def _summary_gate(
+        self, project: str, limit: float | None, chunks: _ChunkPricing | None
+    ) -> Callable[[SummaryPlan], Awaitable[None]] | None:
+        """The gate a build awaits with its exact summary plan, before its first write.
+
+        The file-level gates above price summaries from the files whose checksum moved. What a
+        run actually summarizes is decided on the parsed graph: every update re-parses the
+        whole tree, so after a parser upgrade the first update of each project — a watcher
+        flush, a daemon catch-up — summarizes every entity the new parser recognizes in files
+        nobody touched, plus the containers above them. Measured after the upgrade that added
+        declarations: 190 summaries on a project with zero changed files, spent by a
+        background run whose gate had priced nothing (INV-10). The plan is that run, counted
+        instead of sent; its price plus the chunk side is what gets compared to the cap.
+        """
+        if limit is None or chunks is None:
+            return None
+
+        async def gate(plan: SummaryPlan) -> None:
+            summaries_usd = estimate_summary_plan_cost(plan, self._settings)["usd"]
+            total = round(chunks.usd + summaries_usd, 4)
+            logger.info(
+                "Summaries to regenerate for project=%s: %d (%d LLM call(s), ~$%.4f); with code "
+                "chunks ~$%.4f (limit $%.2f)",
+                project, len(plan.node_ids), plan.calls, summaries_usd, total, limit,
+            )
+            if total > limit:
+                raise IndexCostExceededError(
+                    total, limit,
+                    changed_files=chunks.changed_files,
+                    rechunk_files=chunks.rechunk_files,
+                    regenerated_summaries=len(plan.node_ids),
+                )
+
+        return gate
 
     # ------------------------------------------------------------------
     # Git worktrees: index as a separate project, pay only for what differs
@@ -449,6 +518,7 @@ class ProjectManager:
         include_patterns: list[str] | None,
         exclude_patterns: list[str] | None,
         progress: ProgressReporter | None,
+        summary_gate: Callable[[SummaryPlan], Awaitable[None]] | None = None,
     ) -> dict[str, object]:
         """Finish a first index that started as a server-side clone of the donor's graph.
 
@@ -486,6 +556,7 @@ class ProjectManager:
                 include_patterns=include_patterns,
                 exclude_patterns=exclude_patterns,
                 progress=progress,
+                summary_gate=summary_gate,
             )
             # Scope both paid phases to the files that actually differ. `reconcilable_files`
             # is intersected rather than replaced so a file the build failed to re-parse
@@ -809,13 +880,11 @@ class ProjectManager:
             if existing_stats["nodes"] > 0:
                 # INV-10 covers re-indexes too, not only a project's first one: price the
                 # files whose content moved before any of them is summarized or embedded.
-                await self._gate_reindex_cost(
-                    project,
-                    root,
-                    include_patterns,
-                    exclude_patterns,
-                    max_cost_usd if max_cost_usd is not None else self._settings.max_index_cost_usd,
+                limit = max_cost_usd if max_cost_usd is not None else self._settings.max_index_cost_usd
+                chunks = await self._gate_reindex_cost(
+                    project, root, include_patterns, exclude_patterns, limit
                 )
+                summary_gate = self._summary_gate(project, limit, chunks)
                 if force_rebuild:
                     logger.info("Force rebuild requested for project=%s", project)
                     # Same project, so the stored vectors stay where they are: only the
@@ -829,6 +898,7 @@ class ProjectManager:
                         exclude_patterns=exclude_patterns,
                         stored_summaries=stored_summaries,
                         progress=progress,
+                        summary_gate=summary_gate,
                     )
                 else:
                     result = await self._builder.update(
@@ -837,6 +907,7 @@ class ProjectManager:
                         include_patterns=include_patterns,
                         exclude_patterns=exclude_patterns,
                         progress=progress,
+                        summary_gate=summary_gate,
                     )
                 nodes, edges = result.nodes, result.edges
                 # Chunk vectors this project might reuse, read *after* the build so the read
@@ -899,6 +970,14 @@ class ProjectManager:
                     logger.info("Estimated first-time index cost: $%.4f (limit $%.2f)", estimate["usd"], limit)
                     if estimate["usd"] > limit:
                         raise IndexCostExceededError(estimate["usd"], limit)
+                    first_chunks = _ChunkPricing(
+                        len(coverage.uncovered) if coverage is not None else None,
+                        0,
+                        estimate_rechunk_cost(preview, self._settings)["usd"],
+                    )
+                else:
+                    first_chunks = None
+                summary_gate = self._summary_gate(project, limit, first_chunks)
                 if donor_project is not None and coverage is not None:
                     # The fast path: copy the donor's graph inside Memgraph, then pay only
                     # for the files this checkout differs on. `None` means the copy could not
@@ -908,7 +987,7 @@ class ProjectManager:
                     if clone_counts is not None:
                         return await self._index_cloned_worktree(
                             project, root, donor_project, main_root, clone_counts, coverage,
-                            include_patterns, exclude_patterns, progress,
+                            include_patterns, exclude_patterns, progress, summary_gate,
                         )
                 if donor_project is not None:
                     donor_summaries = await self._repo.get_stored_summaries(donor_project)
@@ -925,6 +1004,7 @@ class ProjectManager:
                     exclude_patterns=exclude_patterns,
                     stored_summaries=donor_summaries or None,
                     progress=progress,
+                    summary_gate=summary_gate,
                 )
                 nodes, edges = result.nodes, result.edges
                 if donor_project is not None:
@@ -1176,13 +1256,14 @@ class ProjectManager:
             # (finding 5c) as the explicit index that created the project: gate the changed set,
             # then reproduce the persisted include/exclude so vendor/** excluded at index time is
             # not silently re-scanned, parsed, summarized and embedded on the first file save.
-            await self._gate_update_cost(project, root_path, changed_files)
+            chunks = await self._gate_update_cost(project, root_path, changed_files)
             result = await self._builder.update(
                 project,
                 root_path,
                 changed_files,
                 include_patterns=include or None,
                 exclude_patterns=exclude or None,
+                summary_gate=self._summary_gate(project, self._settings.max_index_cost_usd, chunks),
             )
             nodes, edges = result.nodes, result.edges
 

@@ -108,11 +108,16 @@ Args:
         (returns an ``index_cost_exceeded`` error), overriding MAX_INDEX_COST_USD for this
         call. A first-time index is priced over the whole tree; a re-index of an already
         indexed project is priced over only the files whose content changed since the last
-        run — which includes every file a widened extension set newly admits.
+        run — which includes every file a widened extension set newly admits. Every run is
+        then priced again after its parse, before any write or LLM request, over the exact
+        summaries it will regenerate (entities an upgraded parser newly recognizes in
+        unchanged files included); the error says how many it counted.
     force_rebuild: Re-parse and re-resolve the whole project even when no file changed —
         needed to pick up indexer upgrades (e.g. new CALLS resolution / node properties)
         on an unchanged project, which the checksum-based incremental path would skip.
-        Summaries and embeddings are still reused; no LLM re-spend. NOT a data wipe.
+        Summaries and embeddings are reused by content hash; what it pays for is the
+        summaries of entities the upgrade newly recognizes or reads differently, and of the
+        containers above them — priced and capped like any run. NOT a data wipe.
 
 STAYING CURRENT AFTERWARDS. Indexing is a snapshot; nothing about it keeps the graph
 matching the code. Every response says who follows the tree from here in ``watching``,

@@ -1916,3 +1916,62 @@ async def test_summaries_record_their_prompt_version_without_it_entering_the_has
 
     assert llm.calls == 0, "a prompt change alone must not re-summarize"
     assert {n.summary_prompt_version for n in again} == {"1.old"}, "reuse keeps the version that wrote the text"
+
+
+@pytest.mark.asyncio
+async def test_a_summary_plan_is_the_run_it_predicts_and_leaves_the_nodes_alone(tmp_path: Path) -> None:
+    """The plan is summarize_hierarchy itself with the LLM counted, not a model of it.
+
+    Stored summaries cover the tree except one function — what an upgraded parser that now
+    recognizes it looks like. The plan must name that function and every container above it,
+    nothing else, and the real run must then regenerate exactly that set.
+    """
+    from inflorescence.code_indexer.summarizer import plan_summaries, summarize_hierarchy
+
+    nodes, edges = _two_module_tree(tmp_path)
+    await summarize_hierarchy(nodes, edges, tmp_path, CountingLLM())
+    stored = {
+        n.id: {"summary": n.summary, "summary_input_hash": n.summary_input_hash}
+        for n in nodes if n.id != "b.py::bar"
+    }
+    fresh, edges = _two_module_tree(tmp_path)
+
+    plan = await plan_summaries(fresh, edges, tmp_path, stored=stored, max_source_chars=12_000, placeholder_chars=360)
+
+    assert plan.node_ids == {"b.py::bar", "b.py", "dir:."}
+    assert plan.calls == 3 and plan.prompt_chars > 0
+    assert all(not n.summary and not n.summary_input_hash for n in fresh)   # restored
+
+    class RewordingLLM(CountingLLM):
+        # A real model rarely returns the old text; the plan assumes it never does.
+        async def generate(self, prompt: str, system_prompt: str = "") -> str:
+            return "reworded " + await super().generate(prompt, system_prompt)
+
+    llm = RewordingLLM()
+    assert await summarize_hierarchy(fresh, edges, tmp_path, llm, stored=stored) == plan.node_ids
+    assert llm.calls == plan.calls
+
+
+@pytest.mark.asyncio
+async def test_a_refusing_summary_gate_stops_the_build_before_any_write_or_llm_call(tmp_path: Path) -> None:
+    from inflorescence.code_indexer.summarizer import SummaryPlan
+    from inflorescence.cost import IndexCostExceededError
+
+    (tmp_path / "a.py").write_text("def foo():\n    return 1\n", encoding="utf-8")
+    repo = RebuildRepository({})
+    llm = CountingLLM()
+    builder = GraphBuilder(
+        repo=repo, llm=llm, config=IndexerConfig(use_llm_summaries=True, use_llm_fallback_parser=False)
+    )
+    plans: list[SummaryPlan] = []
+
+    async def refuse(plan: SummaryPlan) -> None:
+        plans.append(plan)
+        raise IndexCostExceededError(99.0, 1.0, regenerated_summaries=len(plan.node_ids))
+
+    with pytest.raises(IndexCostExceededError):
+        await builder.build("fixture", tmp_path, summary_gate=refuse)
+
+    assert plans and plans[0].node_ids >= {"a.py::foo", "a.py"}
+    assert llm.calls == 0
+    assert "upsert_nodes" not in repo.calls and repo.summaries_stored == []

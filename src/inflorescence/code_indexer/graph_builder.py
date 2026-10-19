@@ -8,7 +8,7 @@ import logging
 import os
 import posixpath
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
@@ -35,12 +35,15 @@ from inflorescence.code_indexer.parser.resolver import resolve_edges
 from inflorescence.code_indexer.scip_semantic import SemanticCalls, semantic_calls_pass
 from inflorescence.code_indexer.summarizer import (
     SUMMARY_PROMPT_VERSION,
+    SummaryPlan,
     node_source,
+    plan_summaries,
     summarize_hierarchy,
     summarize_single,
     summary_input_hash,
 )
 from inflorescence.config import LOCKFILE_NAMES, Settings
+from inflorescence.cost import SUMMARY_PLACEHOLDER_CHARS
 from inflorescence.db.repository import GraphRepository
 from inflorescence.llm_client import LLMClient
 from inflorescence.progress import ProgressReporter, resolve
@@ -413,8 +416,14 @@ class GraphBuilder:
         stored_summaries: dict[str, dict[str, object]] | None = None,
         progress: ProgressReporter | None = None,
         unchanged_files: set[str] | None = None,
+        summary_gate: Callable[[SummaryPlan], Awaitable[None]] | None = None,
     ) -> BuildResult:
         """Full build: scan -> parse -> resolve -> directories -> store skeleton -> summarize -> checksums.
+
+        *summary_gate*, when given, is awaited with the run's :class:`SummaryPlan` — exactly
+        which summaries it will regenerate and what it will send — after the parse and before
+        the store phase writes anything or the LLM sees a request. It refuses by raising
+        (``IndexCostExceededError``), which leaves the stored graph as it was.
 
         *unchanged_files* is the incremental path's contribution: root-relative paths whose
         on-disk checksum still equals the stored one. Everything is still parsed and resolved
@@ -500,6 +509,21 @@ class GraphBuilder:
                 len(external_refs),
                 dict(Counter(ref.kind for ref in external_refs)),
             )
+        resolved_stored = stored_summaries or {}
+        if summary_gate is not None and self._config.use_llm_summaries and self._llm:
+            # The callers price the files whose bytes moved; this prices what the run will
+            # really summarize. They differ whenever an unchanged file parses differently —
+            # after a parser upgrade every update (a watcher flush, a daemon catch-up)
+            # summarizes the newly recognized entities, which no file-level estimate sees
+            # (INV-10). Settled before the first write, so a refusal changes nothing.
+            summary_plan = await plan_summaries(
+                all_nodes, all_edges, root,
+                stored=resolved_stored,
+                max_source_chars=self._settings.summary_max_source_chars,
+                placeholder_chars=SUMMARY_PLACEHOLDER_CHARS,
+            )
+            await summary_gate(summary_plan)
+
         plan = await self._plan_reconcile(
             project, root, all_nodes, all_edges, current_paths, produced_ids
         )
@@ -543,7 +567,6 @@ class GraphBuilder:
         # mid-run. project_manager re-stamps it after the run — idempotent.
         await self._repo.set_project_root_path(project, str(root))
 
-        resolved_stored = stored_summaries or {}
         if self._config.use_llm_summaries and self._llm:
             # Every generated batch is persisted immediately: an interrupted run leaves
             # its spend in the DB, and the retry (which re-enters via update() because
@@ -998,6 +1021,7 @@ class GraphBuilder:
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         progress: ProgressReporter | None = None,
+        summary_gate: Callable[[SummaryPlan], Awaitable[None]] | None = None,
     ) -> BuildResult:
         """Update a project after detecting file changes.
 
@@ -1054,6 +1078,7 @@ class GraphBuilder:
             stored_summaries=stored_summaries,
             progress=progress,
             unchanged_files=unchanged,
+            summary_gate=summary_gate,
         )
         result.changed_files = {str(p.relative_to(root)) for p in changed} | set(deleted)
         return result

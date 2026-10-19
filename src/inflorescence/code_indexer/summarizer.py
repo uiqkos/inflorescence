@@ -7,6 +7,7 @@ import hashlib
 import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from inflorescence.code_indexer import prompts
@@ -131,11 +132,13 @@ async def summarize_hierarchy(
     stored: dict[str, dict[str, object]] | None = None,
     progress: ProgressReporter | None = None,
     on_batch: Callable[[Sequence[CodeNode]], Awaitable[None]] | None = None,
+    log_level: int = logging.INFO,
 ) -> set[str]:
     """Generate summaries bottom-up, reusing stored summaries whose input hash is unchanged.
 
     Returns the set of node ids whose summary was (re)generated. Mutates nodes in place,
-    setting both ``summary`` and ``summary_input_hash``.
+    setting both ``summary`` and ``summary_input_hash``. *log_level* is where the progress
+    lines go — :func:`plan_summaries` runs this same pass silently.
 
     ``on_batch`` is awaited after each *generated* batch (reused nodes never trigger it —
     they are already persisted). Exceptions from the callback propagate and abort the run:
@@ -174,7 +177,7 @@ async def summarize_hierarchy(
 
     total = len(nodes)
     if total == 0:
-        logger.info("No nodes require summarization")
+        logger.log(log_level, "No nodes require summarization")
         return set()
 
     dirty: set[str] = set()
@@ -238,7 +241,7 @@ async def summarize_hierarchy(
             if on_batch is not None:
                 await on_batch(batch)
             _advance(len(batch))
-            logger.info("Summarized %d/%d nodes (%s)", done, total, label)
+            logger.log(log_level, "Summarized %d/%d nodes (%s)", done, total, label)
 
     async def _drain_ready_containers() -> None:
         """Summarize every container whose children are all attempted, cascading upward.
@@ -313,7 +316,7 @@ async def summarize_hierarchy(
         if on_batch is not None:
             await on_batch(batch)
         _advance(len(batch))
-        logger.info("Summarized %d/%d nodes (leaves)", done, total)
+        logger.log(log_level, "Summarized %d/%d nodes (leaves)", done, total)
         await _drain_ready_containers()
 
     # Phase 2: safety net for containers the drain never reached (it shouldn't leave
@@ -346,8 +349,82 @@ async def summarize_hierarchy(
             "affected nodes keep their previous summary and will retry on the next index",
             failed, total,
         )
-    logger.info("Summarization complete: %d nodes, %d regenerated, %d reused", total, len(dirty), total - len(dirty))
+    logger.log(
+        log_level, "Summarization complete: %d nodes, %d regenerated, %d reused",
+        total, len(dirty), total - len(dirty),
+    )
     return dirty
+
+
+@dataclass(frozen=True)
+class SummaryPlan:
+    """What a :func:`summarize_hierarchy` run over the same inputs would send to the LLM.
+
+    ``node_ids`` are the nodes it would (re)generate, ``calls`` the LLM requests that takes
+    (a map-reduce container makes several) and ``prompt_chars`` their prompts and system
+    prompts, measured on the prompts themselves rather than guessed from file sizes.
+    """
+
+    node_ids: frozenset[str]
+    calls: int
+    prompt_chars: int
+
+
+class _CountingLLM:
+    """Stands in for the LLM in a plan: measures each request, answers a placeholder.
+
+    The placeholder is as long as a typical summary, because a container's prompt quotes its
+    children's summaries — a short stub would under-measure every container above a change.
+    """
+
+    def __init__(self, placeholder_chars: int) -> None:
+        self.calls = 0
+        self.prompt_chars = 0
+        self._placeholder = "x" * placeholder_chars
+
+    async def generate(self, prompt: str, system_prompt: str = "") -> str:
+        self.calls += 1
+        self.prompt_chars += len(prompt) + len(system_prompt)
+        return self._placeholder
+
+
+async def plan_summaries(
+    nodes: list[CodeNode],
+    edges: list[Edge],
+    root_path: Path,
+    *,
+    stored: dict[str, dict[str, object]] | None,
+    max_source_chars: int,
+    placeholder_chars: int,
+) -> SummaryPlan:
+    """Which summaries a run would regenerate and what it would send, before it sends anything.
+
+    Runs :func:`summarize_hierarchy` itself — same reuse-by-input-hash, same cascade to the
+    containers above a change, same prompts — against a counting stand-in for the LLM, then
+    puts the nodes back as they were. Because it is the real pass and not a model of it, it
+    sees every reason a summary is redone: a changed file, an entity the parser newly
+    recognizes, a cleared input hash, a prompt layout change. File-level estimates see only
+    the first.
+
+    One assumption makes it an upper bound rather than a replay: a regenerated summary is
+    taken to differ from the stored one, so every container above it is counted. A real
+    model virtually never returns the old text word for word, and a newly recognized entity
+    changes its parent's input whatever its summary says.
+    """
+    saved = [(n, n.summary, n.summary_input_hash, n.summary_prompt_version) for n in nodes]
+    counter = _CountingLLM(placeholder_chars)
+    try:
+        regenerated = await summarize_hierarchy(
+            nodes, edges, root_path, counter,  # type: ignore[arg-type]
+            batch_size=len(nodes) or 1,
+            max_source_chars=max_source_chars,
+            stored=stored,
+            log_level=logging.DEBUG,
+        )
+    finally:
+        for node, summary, input_hash, version in saved:
+            node.summary, node.summary_input_hash, node.summary_prompt_version = summary, input_hash, version
+    return SummaryPlan(frozenset(regenerated), counter.calls, counter.prompt_chars)
 
 
 async def summarize_single(

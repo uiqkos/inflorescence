@@ -9,7 +9,12 @@ The estimate is deliberately a slight over-estimate (it is a guard, not a billin
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from inflorescence.config import Settings
+
+if TYPE_CHECKING:
+    from inflorescence.code_indexer.summarizer import SummaryPlan
 
 # Per-node overheads for the estimate. A summary call sends the element's source plus a
 # system prompt + signature/docstring (leaves) or child descriptors (containers), and the
@@ -17,6 +22,10 @@ from inflorescence.config import Settings
 _PROMPT_TOKENS_PER_NODE = 250
 _OUTPUT_TOKENS_PER_NODE = 90
 _SUMMARY_EMBED_TOKENS_PER_NODE = 90
+# The usual ~4 characters per token, for prompts measured in characters.
+_CHARS_PER_TOKEN = 4
+# How long a summary is assumed to be when a plan stands one in (see plan_summaries).
+SUMMARY_PLACEHOLDER_CHARS = _OUTPUT_TOKENS_PER_NODE * _CHARS_PER_TOKEN
 
 
 class IndexCostExceededError(Exception):
@@ -27,7 +36,9 @@ class IndexCostExceededError(Exception):
     whose content moved). ``changed_files``, when set, says how many files the quoted
     estimate covers, so the message cannot be misread as the price of the whole project;
     ``rechunk_files`` adds the unchanged files whose chunks the run will redo because the
-    chunker changed (embedding cost only — see :func:`estimate_rechunk_cost`).
+    chunker changed (embedding cost only — see :func:`estimate_rechunk_cost`), and
+    ``regenerated_summaries`` is set when the refusal came from the exact summary plan
+    (:func:`estimate_summary_plan_cost`) rather than the file-level pre-flight.
     """
 
     def __init__(
@@ -37,22 +48,36 @@ class IndexCostExceededError(Exception):
         *,
         changed_files: int | None = None,
         rechunk_files: int = 0,
+        regenerated_summaries: int | None = None,
     ) -> None:
         self.estimated_usd = estimated_usd
         self.limit_usd = limit_usd
         self.changed_files = changed_files
         self.rechunk_files = rechunk_files
+        self.regenerated_summaries = regenerated_summaries
         scope = f" over {changed_files} changed file(s)" if changed_files is not None else ""
         if rechunk_files:
             scope += (
                 f"{' and' if scope else ' over'} {rechunk_files} unchanged file(s) whose chunks "
                 "predate the current chunk format (re-chunked and embedded, no LLM)"
             )
+        if regenerated_summaries is not None:
+            scope += (
+                f", including {regenerated_summaries} summar(ies) the run would regenerate "
+                "(counted on the parsed graph, so entities an upgraded parser newly recognizes "
+                "and the containers above them are in the price)"
+            )
+        look = (
+            # The plan is counted after a parse; a preview prices files by size and would
+            # quote a different number, so it is not the way to look at this one.
+            "The count above is the run's own summarization pass, made without calling the LLM."
+            if regenerated_summaries is not None
+            else "Or look first with --dry-run / preview=true."
+        )
         super().__init__(
             f"Estimated indexing cost ${estimated_usd:.4f}{scope} exceeds the limit "
             f"${limit_usd:.4f}. Raise the limit (max_index_cost_usd, --max-cost or the "
-            f"max_cost_usd argument), narrow scope with --exclude / exclude_patterns, or "
-            f"look first with --dry-run / preview=true."
+            f"max_cost_usd argument) or narrow scope with --exclude / exclude_patterns. {look}"
         )
 
 
@@ -124,4 +149,28 @@ def estimate_rechunk_cost(preview: dict[str, object], settings: Settings) -> dic
     return {
         "usd": round(tokens * settings.embedding_price_usd_per_mtok / 1_000_000, 4),
         "embedding_tokens": float(tokens),
+    }
+
+
+def estimate_summary_plan_cost(plan: SummaryPlan, settings: Settings) -> dict[str, float]:
+    """Price a :class:`~inflorescence.code_indexer.summarizer.SummaryPlan`: the summaries a run
+    would actually regenerate, with their prompts measured rather than estimated.
+
+    Input is the measured prompt text; output and the new summaries' embeddings use the same
+    per-summary allowances as :func:`estimate_index_cost`. Code chunks are not in it — they
+    are priced per file by the callers.
+    """
+    llm_input = plan.prompt_chars / _CHARS_PER_TOKEN
+    llm_output = plan.calls * _OUTPUT_TOKENS_PER_NODE
+    embedding = len(plan.node_ids) * _SUMMARY_EMBED_TOKENS_PER_NODE
+    usd = (
+        llm_input * settings.llm_price_input_usd_per_mtok
+        + llm_output * settings.llm_price_output_usd_per_mtok
+        + embedding * settings.embedding_price_usd_per_mtok
+    ) / 1_000_000
+    return {
+        "usd": round(usd, 4),
+        "llm_input_tokens": float(llm_input),
+        "llm_output_tokens": float(llm_output),
+        "embedding_tokens": float(embedding),
     }

@@ -115,7 +115,8 @@ def build_parser() -> argparse.ArgumentParser:
             "checksums, so a better indexer reaches an unchanged file only when a run re-parses "
             "the tree anyway. Summaries and embeddings are reused by content hash; what it pays "
             "for is the summaries of entities the upgrade newly recognizes (or now reads a "
-            "different signature or docstring for) and of the containers above them."
+            "different signature or docstring for) and of the containers above them, priced "
+            "after the parse and capped like any run."
         ),
     )
 
