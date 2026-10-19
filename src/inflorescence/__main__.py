@@ -111,9 +111,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "Re-parse and re-resolve even when no file changed. Needed after an upgrade that "
-            "improves edge resolution: the incremental path compares content checksums, so a "
-            "better indexer never reaches an unchanged project. Summaries are reused by "
-            "content hash, so this costs nothing."
+            "improves parsing or edge resolution: the incremental path compares content "
+            "checksums, so a better indexer reaches an unchanged file only when a run re-parses "
+            "the tree anyway. Summaries and embeddings are reused by content hash; what it pays "
+            "for is the summaries of entities the upgrade newly recognizes (or now reads a "
+            "different signature or docstring for) and of the containers above them."
         ),
     )
 

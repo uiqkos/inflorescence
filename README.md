@@ -332,9 +332,18 @@ An upgrade that changes how files are cut into chunks (`CHUNK_FORMAT`) re-chunks
 files on their next run too; that re-embedding is priced with the run, never spent unannounced.
 
 `--force` re-parses and re-resolves even when no file changed — needed after an upgrade that
-improves edge resolution, since the incremental path compares content checksums and a better
-indexer would otherwise never reach an unchanged project. Summaries and embeddings are still
-reused by content hash, so it costs nothing. It is not a data wipe.
+improves parsing or edge resolution, since the incremental path compares content checksums and a
+better indexer would otherwise reach an unchanged file only when some run re-parses the tree.
+Summaries and embeddings are still reused by content hash, so what it pays for is the summaries of
+entities the upgrade newly recognizes (or now reads a different signature or docstring for) and
+of the containers above them — after the upgrade that added `variable`/`type_alias`, 3–10% of a
+project's summaries. It is not a data wipe.
+
+Every update re-parses the whole tree, since one edit can change what another file is recorded as
+calling — so after a parser upgrade the *first* update of each project, a watcher flush or the
+watch daemon's catch-up, summarizes the same newly recognized entities. Its cost gate prices the
+changed files and the re-chunking, not those summaries yet: after upgrading, run `--force`
+deliberately rather than leaving that bill to the next background update.
 
 ### Narrowing a scope: `prune`
 
