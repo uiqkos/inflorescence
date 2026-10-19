@@ -18,7 +18,9 @@ it already knows. Both outcomes are worth saying, and both are said here —
 * files exist on disk that the index does not hold → the empty page is a coverage gap, and
   the block names the files and how to fix it;
 * nothing is missing under that scope → the empty page is real evidence of absence, which
-  is exactly the conclusion an agent could not safely draw before.
+  is exactly the conclusion an agent could not safely draw before — unless the page itself
+  says ``truncated``: then the search never saw every candidate, and the note says so
+  instead of licensing the conclusion.
 
 The check is deliberately not exhaustive, and says where it stops rather than implying it
 went everywhere: it opens only directories the index already knows (a brand-new *directory*
@@ -57,7 +59,7 @@ def _scope_patterns(meta: Mapping[str, Any]) -> list[str]:
     return []
 
 
-def _note(report: Mapping[str, Any], directory: str) -> str:
+def _note(report: Mapping[str, Any], directory: str, *, truncated: bool = False) -> str:
     """One sentence a reader can act on, whichever way the check came out.
 
     Written as prose rather than as counts because it is read mid-task by something deciding
@@ -87,6 +89,17 @@ def _note(report: Mapping[str, Any], directory: str) -> str:
         else ""
     )
     directories = "1 directory" if checked == 1 else f"{checked} directories"
+    if truncated:
+        # Coverage was fine, but the search never looked at everything: its candidate pool
+        # hit the ceiling before the filters ran. Calling that "evidence of absence" told an
+        # agent the project had no directories matching a query over 39 of them.
+        return (
+            f"This index holds {indexed} files and every file in the {directories} checked "
+            f"just now is one of them, so this is not a coverage gap — but page.truncated is "
+            f"true: the search stopped at its candidate ceiling before its filters were "
+            f"exhausted, so an empty page here is NOT evidence of absence. Narrow the query or "
+            f"filters, or enumerate instead (get_entity_structure, list_entities).{tail}"
+        )
     return (
         f"This index holds {indexed} files, and every file in the {directories} checked just "
         f"now is one of them — so an empty result here is evidence of absence rather than a "
@@ -95,11 +108,11 @@ def _note(report: Mapping[str, Any], directory: str) -> str:
     )
 
 
-def _block(report: Mapping[str, Any], directory: str) -> dict[str, Any]:
+def _block(report: Mapping[str, Any], directory: str, *, truncated: bool = False) -> dict[str, Any]:
     block: dict[str, Any] = {
         "files_indexed": report.get("files_indexed", 0),
         "dirs_checked": report.get("dirs_checked", 0),
-        "note": _note(report, directory),
+        "note": _note(report, directory, truncated=truncated),
     }
     missing = int(report.get("not_indexed_total") or 0)
     if missing:
@@ -146,5 +159,6 @@ async def note_coverage(
     except Exception:  # noqa: BLE001 — an annotation must never break the answer it annotates
         logger.debug("Coverage check failed for %s", directory, exc_info=True)
         return payload
-    meta["index_coverage"] = _block(report, directory)
+    truncated = isinstance(page, Mapping) and bool(page.get("truncated"))
+    meta["index_coverage"] = _block(report, directory, truncated=truncated)
     return payload

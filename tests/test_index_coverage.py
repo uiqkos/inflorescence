@@ -235,6 +235,30 @@ async def test_an_empty_page_over_a_complete_index_says_so_positively(tmp_path: 
 
 
 @pytest.mark.asyncio
+async def test_a_truncated_empty_page_is_never_called_evidence_of_absence(tmp_path: Path) -> None:
+    """Complete coverage, but the search stopped at its candidate ceiling.
+
+    Field case: search_semantic(node_types=["directory"]) came back empty and truncated over
+    a project with 39 directories — they never reached the shared index's global top-k — and
+    the note still said "evidence of absence". Coverage cannot vouch for a search that did
+    not look at everything.
+    """
+    _project(tmp_path)
+    checker = FreshnessChecker(
+        tmp_path, {"scripts/runner.py": "md5", "scripts/wave_queue.py": "md5"}
+    )
+    page = _empty_page()
+    page["page"]["truncated"] = True
+
+    payload = await note_coverage(page, _Manager(), str(tmp_path), checker)
+
+    note = payload["meta"]["index_coverage"]["note"]
+    assert "NOT evidence of absence" in note
+    assert "truncated" in note
+    assert "not a coverage gap" in note
+
+
+@pytest.mark.asyncio
 async def test_the_checkers_inventory_is_reused_rather_than_re_read(tmp_path: Path) -> None:
     """The freshness checker already loaded the checksums; the coverage check costs no round trip."""
     _project(tmp_path)

@@ -12,6 +12,7 @@ from typing import Any
 from inflorescence.code_indexer.models import CodeNode, Edge, ExternalRef, NodeType
 from inflorescence.db import lease, queries
 from inflorescence.db.connection import MemgraphConnection
+from inflorescence.db.schema import LEVEL_SUMMARY_INDEXES
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +131,10 @@ class ProjectCloneError(RuntimeError):
 # project's nodes, silently starving the query. Over-fetch and truncate post-filter.
 _VECTOR_OVERFETCH_FACTOR = 20
 _VECTOR_MIN_FETCH = 256
+# A label-scoped summary index (directories, modules) holds few nodes across every project,
+# so fetching nearly all of it costs little and keeps a big neighbour from starving a small
+# project the way the shared index can.
+_LEVEL_MIN_FETCH = 2048
 
 
 def _vector_fetch_k(top_k: int) -> int:
@@ -215,6 +220,19 @@ async def _vector_search_with_retry(
             )
             await asyncio.sleep(min(delay, remaining))
             delay = min(delay * 2, _VECTOR_RETRY_MAX_DELAY_S)
+
+
+def _relative_tree_path(path: str) -> str:
+    """Normalize a caller-typed project-relative path to the form the graph stores.
+
+    Directory nodes store ``src/pkg`` and the root stores ``.``; agents type ``src/pkg/``,
+    ``./src/pkg`` and ``./`` just as often, and each of those used to miss.
+    """
+    cleaned = path.strip().replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.rstrip("/")
+    return cleaned or "."
 
 
 def _written(rows: Sequence[Mapping[str, object]]) -> int:
@@ -1449,12 +1467,25 @@ class GraphRepository:
         project: str,
         embedding: list[float],
         top_k: int = 10,
+        *,
+        node_types: Sequence[str] | None = None,
     ) -> list[dict[str, object]]:
         """Search nodes by summary embedding similarity.
+
+        When every requested ``node_types`` value has a label-scoped index of its own
+        (``schema.LEVEL_SUMMARY_INDEXES`` — directories, modules), the search runs there, so
+        those few nodes compete only with each other instead of with every function of
+        every project in the shared index. Results are then already of those types. Any
+        other ``node_types`` (or none) uses the shared index, and the caller filters.
 
         Retries Memgraph's post-deletion vector-index lag (see
         :func:`_vector_search_with_retry`); any other failure propagates untouched.
         """
+        level_indexes = [LEVEL_SUMMARY_INDEXES.get(t) for t in node_types or ()]
+        if level_indexes and all(level_indexes):
+            rows = await self._search_level_summary_vectors(project, embedding, top_k, level_indexes)
+            if rows is not None:
+                return rows
         records = await _vector_search_with_retry(
             lambda: self._conn.execute_query(
                 queries.VECTOR_SEARCH_SUMMARY,
@@ -1465,6 +1496,47 @@ class GraphRepository:
             {**_serialize_entity(r), "score": r["score"]}
             for r in records[:top_k]
         ]
+
+    async def _search_level_summary_vectors(
+        self,
+        project: str,
+        embedding: list[float],
+        top_k: int,
+        indexes: Sequence[str],
+    ) -> list[dict[str, object]] | None:
+        """Search label-scoped summary indexes and merge them by score, best first.
+
+        Returns ``None`` when an index is not there (a database set up before these
+        indexes existed, until the next ``setup_schema``) so the caller falls back to the
+        shared index rather than failing a search that used to work.
+        """
+        merged: list[dict[str, object]] = []
+        for index in dict.fromkeys(indexes):
+            try:
+                records = await _vector_search_with_retry(
+                    lambda index=index: self._conn.execute_query(
+                        queries.VECTOR_SEARCH_SUMMARY_IN_INDEX,
+                        {
+                            "index": index,
+                            "embedding": embedding,
+                            "top_k": max(_vector_fetch_k(top_k), _LEVEL_MIN_FETCH),
+                            "project": project,
+                        },
+                    )
+                )
+            except StaleVectorIndexError:
+                raise
+            except Exception:  # noqa: BLE001 — a missing optional index degrades, never fails
+                logger.warning(
+                    "Summary index %s unavailable — falling back to the shared summary index "
+                    "(restart the server so setup_schema creates it)",
+                    index,
+                    exc_info=True,
+                )
+                return None
+            merged.extend({**_serialize_entity(r), "score": r["score"]} for r in records)
+        merged.sort(key=lambda row: float(row["score"] or 0.0), reverse=True)  # type: ignore[arg-type]
+        return merged[:top_k]
 
     async def search_summary_text(
         self,
@@ -1547,9 +1619,9 @@ class GraphRepository:
         if node_id:
             query = queries.GET_STRUCTURE_ROOT_BY_ID
             params = {"project": project, "node_id": node_id}
-        elif file_path:
+        elif file_path and (path := _relative_tree_path(file_path)) != ".":
             query = queries.GET_STRUCTURE_ROOT_BY_FILE
-            params = {"project": project, "file_path": file_path}
+            params = {"project": project, "file_path": path}
         else:
             query = queries.GET_PROJECT_ROOT
             params = {"project": project}

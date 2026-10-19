@@ -107,6 +107,15 @@ Every entity gets one LLM-written summary, and it is what `search_semantic` sear
 container's summary is written from its children's summaries, so the hierarchy reads
 bottom-up: method → class → module → directory.
 
+Written bottom-up, read top-down. Because each directory's summary describes its whole subtree,
+an agent that does not know where something lives can walk down to it one level per call —
+`get_entity_structure(dir)` for the root, `file_path="src/pkg"` for a directory,
+`file_path="src/pkg/client.py"` for a file's functions with line ranges — reading a short page of
+summaries at each step instead of listing every module at once. Or jump by meaning:
+`search_semantic(node_types=["directory"])` ranks directories against directories only (they
+and modules have vector indexes of their own, so a few dozen directories are not crowded out of
+the candidate pool by every function of every indexed project).
+
 Re-summarization is decided by a content hash, not by a timestamp. `summary_input_hash` is
 `H(source + signature + docstring)` for a leaf and `H(ordered child descriptors, each carrying
 that child's current summary)` for a container. A changed leaf therefore propagates exactly one
@@ -454,14 +463,18 @@ create, fails loudly on the pinned name — `Conflict. The container name
 nothing to do (`docker start inflorescence-memgraph` is the whole job; use compose only if you
 also want Lab, and then start from `docker compose down`).
 
-If you meet a spare anyway, stop it (`docker stop <name>`); to repair a container already
+If you meet a spare anyway, stop it (`docker stop -t 600 <name>`); to repair a container already
 orphaned off the network, recreate it — the graph is in the volume, not the container:
 
 ```bash
-docker rm -f inflorescence-memgraph && docker run -d --name inflorescence-memgraph \
-  --restart unless-stopped -p 127.0.0.1:7687:7687 \
+docker stop -t 600 inflorescence-memgraph
+docker rm inflorescence-memgraph
+docker run -d --name inflorescence-memgraph \
+  --restart unless-stopped --stop-timeout 600 -p 127.0.0.1:7687:7687 \
   -v inflorescence_mg_data:/var/lib/memgraph \
-  memgraph/memgraph-mage:latest
+  memgraph/memgraph-mage:latest \
+  --storage-snapshot-on-exit=true --storage-snapshot-interval-sec=21600 \
+  --storage-snapshot-retention-count=2
 ```
 
 Give it a couple of minutes on a populated graph: `memgraph-mage` loads its query modules and
@@ -469,6 +482,24 @@ replays the last snapshot before it opens bolt (~100s on a 187k-node graph), so 
 is merely starting looks exactly like one that is down. `docker logs -f inflorescence-memgraph`
 shows which it is.
 </details>
+
+**Stopping and memory.** Disabling MCP in one client does not stop the shared database or
+servers owned by other sessions. Each stdio session has its own Python process; Memgraph
+keeps the graph and vector indexes in RAM even without queries. To leave it off:
+
+1. Set `MEMGRAPH_AUTOSTART=false` in your per-user or checkout `.env`. New `serve` and
+   `watch` commands then leave Docker and a stopped local database alone. With the database
+   down, `serve` exits before loading its MCP/indexing stack (unless `--allow-degraded`).
+2. Disconnect Inflorescence in all MCP clients and close their existing server processes.
+   If installed, stop its independent watch daemon with `inflorescence watch uninstall`.
+3. Run `docker stop -t 600 inflorescence-memgraph` (and stop Lab if it is running).
+   The named volume and indexes are retained. The long grace period lets Memgraph finish
+   its exit snapshot; Docker's default 10 seconds can leave a truncated multi-GB snapshot.
+
+Resume with `docker start inflorescence-memgraph`, then reconnect the MCP clients. Set
+`MEMGRAPH_AUTOSTART=true` again if you want client sessions to start the database for you.
+Compose and newly created containers use a 600-second stop timeout; for an existing
+container, keep passing `-t 600` until it is recreated with the new configuration.
 
 ---
 
@@ -488,7 +519,7 @@ docstring as its description, so this is the index, not the text.
 | tool | |
 |---|---|
 | `list_entities` | Inventory in path order, unranked, with pagination and glob path filters — "what is in this package" |
-| `get_entity_structure` | The `CONTAINS` outline under a node, file or project root, one to three levels deep |
+| `get_entity_structure` | The `CONTAINS` outline under the project root, a directory, a file or a node, one to three levels deep — the top-down walk: root → directory → file → functions, a subtree summary at every step |
 | `get_entity_context` | One call, one known `node_id`: full summary plus parent, children, incoming and outgoing edges |
 | `get_related_entities` | Entities related by relationship and `direction` (`both` / `incoming` / `outgoing`), addressed by `node_id` **or** by a `name` substring the tool resolves itself — so "who calls X" is one call. An ambiguous name returns the candidates instead of guessing |
 | `search_entities` | Case-insensitive substring of an entity's name; answers before any summary exists |
@@ -871,6 +902,7 @@ both.
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | OpenRouter API key (**required**) |
 | `MEMGRAPH_URL` | `bolt://localhost:7687` | connection URL |
+| `MEMGRAPH_AUTOSTART` | `true` | allow MCP/watch commands to start local Docker and Memgraph; `false` respects a manual stop |
 | `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` | — | optional auth |
 | `LLM_MODEL` | `google/gemini-2.5-flash-lite` | summaries and the LLM parse fallback |
 | `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint |

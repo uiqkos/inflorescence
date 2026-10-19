@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
@@ -189,7 +190,12 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
 
         For inventory and orientation — "what is in this package", "how many classes are
         under src/" — not for finding code by meaning (``search_semantic``) or by name
-        (``search_entities``); this returns entities in path order, unranked. Combine
+        (``search_entities``); this returns entities in path order, unranked. It is flat and
+        exhaustive — every module of a big package on one page, summaries included, which
+        runs to tens of thousands of tokens — so to *find where something lives*, walk the
+        tree with ``get_entity_structure`` instead (one directory level per call, each with
+        its subtree summary) and come here for a complete inventory of a subtree you have
+        already chosen. Combine
         ``include_paths``/``exclude_paths`` globs with ``node_types`` to scope the listing.
         ``node_types`` values (case-insensitive): module, class, function, method,
         directory, interface, enum, struct, trait, document. Summaries are truncated to a
@@ -259,11 +265,24 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         limit: int = 50,
         offset: int = 0,
     ) -> dict:
-        """Return the CONTAINS hierarchy under a node, file module, or project root.
+        """Return the CONTAINS hierarchy under a directory, file, node, or the project root.
 
-        The outline view: what a file or class contains, one to three levels deep. Use it
-        after locating something ("show me this module's classes and methods"); for the
-        edges *between* entities — callers, callees, imports — use ``get_related_entities``
+        The top-down navigator, and the cheapest way to find where something lives. Every
+        directory carries a summary of its whole subtree (purpose, capabilities, entry
+        points), so walk down one level per call, reading summaries to pick the next branch:
+
+        1. ``get_entity_structure(directory)`` — no ``file_path``/``node_id``: the project
+           root's full summary in ``root``, its top-level files and directories in ``items``.
+        2. ``get_entity_structure(directory, file_path="src/pkg")`` — a directory path (or
+           its ``node_id``, ``"dir:src/pkg"``): that directory's summary and children.
+        3. ``get_entity_structure(directory, file_path="src/pkg/client.py")`` — a file: its
+           classes, functions and methods with line ranges; ``depth=2`` adds methods of
+           classes. Then read just those lines.
+
+        ``file_path`` is relative to the project root (``"./src/pkg/"`` and an absolute path
+        inside ``directory`` work too; ``"."`` is the root). One level is usually a short
+        page; ``depth`` goes up to 3 when you want a bigger slice at once. For the edges
+        *between* entities — callers, callees, imports — use ``get_related_entities``
         or ``get_entity_context`` instead. ``node_types`` filters the items only, never the
         root; valid values (case-insensitive): module, class, function, method, directory,
         interface, enum, struct, trait, document. Item summaries are truncated to a short
@@ -296,6 +315,10 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         project, not_indexed = await ensure_indexed(manager, directory)
         if not_indexed is not None:
             return not_indexed
+        if file_path and Path(file_path).is_absolute():
+            # An absolute path inside the project is the same place; the graph keys relative.
+            with contextlib.suppress(ValueError):
+                file_path = str(Path(file_path).relative_to(directory)) or "."
         root = await repo.get_structure_root(project, node_id=node_id, file_path=file_path)
         if root is None:
             return error_response("not_found", _structure_root_missing(directory, node_id, file_path))

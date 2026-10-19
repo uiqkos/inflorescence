@@ -356,6 +356,18 @@ async def test_setup_schema_creates_text_indexes_for_symbols_and_chunk_content()
     assert any("chunk_content_text ON :CodeChunk(content)" in query for query in text_index_writes)
 
 
+@pytest.mark.asyncio
+async def test_setup_schema_creates_vector_indexes_at_the_configured_dimension() -> None:
+    """EMBEDDING_DIMENSION used to be documented and ignored: every index was 1536 wide."""
+    conn = RecordingSchemaConnection()
+
+    await setup_schema(conn, dimension=64)
+
+    vector_writes = [query for query, _params in conn.writes if "CREATE VECTOR INDEX" in query]
+    assert vector_writes
+    assert all('"dimension": 64' in query for query in vector_writes)
+
+
 def test_property_indexes_include_node_type() -> None:
     from inflorescence.db.schema import PROPERTY_INDEXES
 
@@ -921,6 +933,22 @@ async def test_get_entity_structure_resolves_file_root_and_paginates_children() 
 
 
 @pytest.mark.asyncio
+async def test_get_entity_structure_takes_an_absolute_path_inside_the_project() -> None:
+    class Recording(FakeGraphRepositoryV2):
+        async def get_structure_root(self, project, node_id=None, file_path=None):
+            self.asked = file_path
+            return await super().get_structure_root(project, node_id=node_id, file_path=file_path)
+
+    mcp = FastMCP("test")
+    repo = Recording()
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    await mcp.call_tool("get_entity_structure", {"directory": "/tmp/project", "file_path": "/tmp/project/pkg"})
+
+    assert repo.asked == "pkg"
+
+
+@pytest.mark.asyncio
 async def test_get_entity_structure_returns_structured_not_found_error(tmp_path: Path) -> None:
     """A path that is in neither the index nor the filesystem says so — and says both halves.
 
@@ -1459,6 +1487,99 @@ async def test_repository_get_structure_root_serializes_root_prefixed_record() -
     result = await repo.get_structure_root("project-id", node_id="pkg/a.py")
 
     assert result == entity("pkg/a.py", "a", "module", "pkg/a.py", 1, 30, "Module a.")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("typed", "stored"),
+    [("src/pkg", "src/pkg"), ("src/pkg/", "src/pkg"), ("./src/pkg", "src/pkg"), ("pkg/a.py", "pkg/a.py")],
+)
+async def test_repository_structure_root_by_path_accepts_directories(typed: str, stored: str) -> None:
+    """A directory path is a structure root too — the natural first step of a top-down walk.
+
+    Field reports (14.09, 15.09): get_entity_structure(file_path="frontend/src/proto/engine")
+    answered "exists on disk but is NOT in this index, run index_directory" over a fully
+    indexed directory, because only modules and documents were looked up by path.
+    """
+    conn = RecordingQueryConnection([])
+    repo = GraphRepository(conn)
+
+    await repo.get_structure_root("project-id", file_path=typed)
+
+    assert conn.query == queries.GET_STRUCTURE_ROOT_BY_FILE
+    assert "root:Directory" in conn.query
+    assert conn.params == {"project": "project-id", "file_path": stored}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", [".", "./", " / ", ""])
+async def test_repository_structure_root_by_path_maps_the_root_spelling_to_the_project_root(typed: str) -> None:
+    conn = RecordingQueryConnection([])
+    repo = GraphRepository(conn)
+
+    await repo.get_structure_root("project-id", file_path=typed)
+
+    assert conn.query == queries.GET_PROJECT_ROOT
+
+
+@pytest.mark.asyncio
+async def test_repository_summary_search_ranks_directories_in_their_own_index() -> None:
+    """Directories must compete with directories, not with every function of every project."""
+    conn = RecordingQueryConnection([
+        {"id": "dir:src/a", "name": "a", "labels": ["Code", "Directory"], "file_path": "src/a",
+         "line_start": 0, "line_end": 0, "score": 0.4, "summary": "A."},
+    ])
+    repo = GraphRepository(conn)
+
+    rows = await repo.search_summary_vectors("project-id", [0.1], 5, node_types=["directory"])
+
+    assert conn.query == queries.VECTOR_SEARCH_SUMMARY_IN_INDEX
+    assert conn.params["index"] == "directory_summary_embeddings"
+    assert conn.params["top_k"] >= 2048  # a small index is fetched nearly whole
+    assert [row["id"] for row in rows] == ["dir:src/a"]
+
+
+@pytest.mark.asyncio
+async def test_repository_summary_search_merges_level_indexes_by_score() -> None:
+    class PerIndex(RecordingQueryConnection):
+        async def execute_query(self, query, params):
+            await super().execute_query(query, params)
+            node = "dir:src" if params["index"] == "directory_summary_embeddings" else "src/m.py"
+            score = 0.3 if node == "dir:src" else 0.7
+            return [{"id": node, "name": node, "labels": ["Code"], "file_path": node,
+                     "line_start": 0, "line_end": 0, "score": score, "summary": ""}]
+
+    repo = GraphRepository(PerIndex([]))
+
+    rows = await repo.search_summary_vectors("project-id", [0.1], 5, node_types=["directory", "module"])
+
+    assert [row["id"] for row in rows] == ["src/m.py", "dir:src"]
+
+
+@pytest.mark.asyncio
+async def test_repository_summary_search_uses_the_shared_index_for_other_types() -> None:
+    conn = RecordingQueryConnection([])
+    repo = GraphRepository(conn)
+
+    await repo.search_summary_vectors("project-id", [0.1], 5, node_types=["directory", "function"])
+
+    assert conn.query == queries.VECTOR_SEARCH_SUMMARY
+
+
+@pytest.mark.asyncio
+async def test_repository_summary_search_falls_back_when_a_level_index_is_missing() -> None:
+    """A database set up before the level indexes existed keeps answering, as before."""
+    class NoLevelIndex(RecordingQueryConnection):
+        async def execute_query(self, query, params):
+            if query == queries.VECTOR_SEARCH_SUMMARY_IN_INDEX:
+                raise RuntimeError("Vector index directory_summary_embeddings does not exist")
+            return await super().execute_query(query, params)
+
+    conn = NoLevelIndex([])
+    repo = GraphRepository(conn)
+
+    assert await repo.search_summary_vectors("project-id", [0.1], 5, node_types=["directory"]) == []
+    assert conn.query == queries.VECTOR_SEARCH_SUMMARY
 
 
 @pytest.mark.asyncio

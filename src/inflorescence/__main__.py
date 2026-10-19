@@ -370,16 +370,36 @@ def main() -> None:
         _serve(allow_degraded=getattr(args, "allow_degraded", False))
 
 
-def _serve(allow_degraded: bool = False) -> None:
-    from inflorescence.config import Settings
-    from inflorescence.docker_env import ensure_memgraph
-    from inflorescence.server import create_server, shutdown, startup
+def _ensure_service_database(settings: Settings, *, allow_degraded: bool = False) -> None:
+    """Honor a manual database stop before importing the MCP/indexing stack."""
+    from inflorescence.docker_env import ensure_memgraph, local_bolt_port
 
-    settings = Settings()
     # An MCP client launches this process directly — there is no shell in front of it where a
     # `docker compose up` could have been typed, and no way for the user to act on the error
     # below at the moment it appears. Bring the database up ourselves instead.
-    ensure_memgraph(settings.memgraph_url)
+    reachable = ensure_memgraph(settings.memgraph_url, auto_start=settings.memgraph_autostart)
+    if (
+        not settings.memgraph_autostart
+        and not reachable
+        and local_bolt_port(settings.memgraph_url) is not None
+        and not allow_degraded
+    ):
+        print(
+            "Memgraph is stopped or unreachable; MEMGRAPH_AUTOSTART=false leaves it stopped.\n"
+            "Start it explicitly with `docker start inflorescence-memgraph`, or set "
+            "MEMGRAPH_AUTOSTART=true to restore automatic startup.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+def _serve(allow_degraded: bool = False) -> None:
+    from inflorescence.config import Settings
+
+    settings = Settings()
+    _ensure_service_database(settings, allow_degraded=allow_degraded)
+
+    from inflorescence.server import create_server, shutdown, startup
 
     mcp, conn, llm, watcher = create_server()
 
@@ -415,11 +435,12 @@ def _serve(allow_degraded: bool = False) -> None:
 async def _watch_components():  # noqa: ANN201 — internal helper
     """Build the stack and verify Memgraph, or exit with the same diagnosis `serve` gives."""
     from inflorescence.config import Settings
-    from inflorescence.docker_env import ensure_memgraph
-    from inflorescence.server import create_components
 
     settings = Settings()
-    ensure_memgraph(settings.memgraph_url)
+    _ensure_service_database(settings)
+
+    from inflorescence.server import create_components
+
     components = create_components()
     if not await components.conn.health_check():
         print(
@@ -518,10 +539,11 @@ def _watch_status_line(
 
 async def _watch_status(path: str | None, show_stale: bool) -> int:
     """Report the registry, the daemon's actual grip on each project, and optionally drift."""
+    components = await _watch_components()
+
     from inflorescence.cost import estimate_index_cost
     from inflorescence.db.lease import daemon_claim_key, read_lease
 
-    components = await _watch_components()
     try:
         # The machine-level fact first: per-project lines answer "is this tree followed", and
         # every one of them says "no" for the same single reason when the daemon is simply not
@@ -578,11 +600,12 @@ async def _watch_run() -> int:
     """Run the daemon in the foreground until SIGINT/SIGTERM."""
     import signal
 
+    components = await _watch_components()
+
     from inflorescence.project_manager import IndexPreflightError
     from inflorescence.server import shutdown, startup
     from inflorescence.watch_daemon import WatchDaemon, claim_singleton
 
-    components = await _watch_components()
     singleton = None
     try:
         # One daemon per machine. Refusing exits non-zero on purpose: the launchd job is
@@ -927,6 +950,11 @@ def _memgraph_recovery_hint(settings: Settings) -> str:
     port = docker_env.local_bolt_port(settings.memgraph_url)
     if port is None:
         return f"{settings.memgraph_url} is not a local database; nothing here can start it"
+    if not settings.memgraph_autostart:
+        return (
+            "Automatic startup is disabled (MEMGRAPH_AUTOSTART=false). "
+            "Start Memgraph explicitly: docker start inflorescence-memgraph"
+        )
     if docker_env.container_state(docker_env.MEMGRAPH_CONTAINER) is None:
         return "Run `inflorescence init` to start it"
     return docker_env.recovery_hint(docker_env.MEMGRAPH_CONTAINER, port)
@@ -1464,7 +1492,7 @@ async def _index(
         await conn.close()
         sys.exit(1)
 
-    await setup_schema(conn)
+    await setup_schema(conn, dimension=settings.embedding_dimension)
 
     repo = GraphRepository(conn, batch_size=settings.db_write_batch_size)
     llm = LLMClient(settings)

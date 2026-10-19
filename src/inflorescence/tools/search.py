@@ -43,6 +43,24 @@ def _filters_narrow(filters: PathFilterConfig, node_types: list[str] | None, inc
     return bool(node_types) or not include_tests or not filters.include_all or bool(filters.exclude)
 
 
+async def _summary_vectors(
+    repo: GraphRepository,
+    project: str,
+    embedding: list[float],
+    top_k: int,
+    node_types: list[str] | None,
+) -> list[dict[str, object]]:
+    """Summary vector search that hands ``node_types`` down when there are any.
+
+    The repository can then rank directories or modules in their own index instead of
+    fishing them out of the global top-k afterwards (see ``schema.LEVEL_SUMMARY_INDEXES``);
+    the post-filter here still runs, so a backend that ignores the hint stays correct.
+    """
+    if node_types:
+        return await repo.search_summary_vectors(project, embedding, top_k, node_types=node_types)
+    return await repo.search_summary_vectors(project, embedding, top_k)
+
+
 # Tantivy query-syntax metacharacters. `search_text` accepts plain
 # keyword / identifier / error-text queries, so we neutralize these to spaces
 # rather than let Tantivy parse them as field separators / boolean operators
@@ -349,6 +367,13 @@ def register_search_tools(
         Use this to find code by *what it does* even when the wording differs. For exact
         identifier / string-literal / error-text matches, use ``search_text`` instead.
 
+        Coarse-to-fine: ``node_types=["directory"]`` answers "which part of this repository
+        handles X" by ranking directory summaries (each describes its whole subtree) against
+        each other only, and ``node_types=["module"]`` does the same for whole files — both
+        have search indexes of their own, so a handful of directories is not drowned out by
+        thousands of functions. Take the best subtree into ``include_paths`` for the precise
+        query, or walk it with ``get_entity_structure(file_path=<that path>)``.
+
         Summaries and their embeddings are English-only, so phrase ``query`` in English —
         a query in another language (e.g. Russian) embeds far from the English summary
         space and returns an irrelevant top result, not an error. For exact strings,
@@ -428,7 +453,7 @@ def register_search_tools(
 
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
         candidate_k = _overfetch(bounded_limit, bounded_offset)
-        raw_rows = await repo.search_summary_vectors(project, embedding, candidate_k)
+        raw_rows = await _summary_vectors(repo, project, embedding, candidate_k, node_types)
         truncated = len(raw_rows) >= candidate_k and _filters_narrow(filters, node_types, include_tests)
         rows = _drop_test_rows(_filter_node_types(filter_records_by_path(raw_rows, filters), node_types), include_tests)
         checker = await build_checker(repo, project, directory)
@@ -547,7 +572,7 @@ def register_search_tools(
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
         top_k = _overfetch(bounded_limit, bounded_offset)
         raw_code = await repo.search_code_vectors(project, code_embedding, top_k)
-        raw_summary = await repo.search_summary_vectors(project, summary_embedding, top_k)
+        raw_summary = await _summary_vectors(repo, project, summary_embedding, top_k, node_types)
         truncated = (
             (len(raw_code) >= top_k or len(raw_summary) >= top_k)
             and _filters_narrow(filters, node_types, include_tests)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -164,7 +165,7 @@ async def test_startup_returns_true_and_sets_up_schema_when_healthy(monkeypatch)
 
     called = {}
 
-    async def fake_setup(conn) -> None:
+    async def fake_setup(conn, **_kwargs) -> None:
         called["schema"] = True
 
     monkeypatch.setattr(server_mod, "setup_schema", fake_setup)
@@ -182,7 +183,7 @@ async def test_startup_returns_false_and_skips_schema_when_unhealthy(monkeypatch
 
     called = {}
 
-    async def fake_setup(conn) -> None:
+    async def fake_setup(conn, **_kwargs) -> None:
         called["schema"] = True
 
     monkeypatch.setattr(server_mod, "setup_schema", fake_setup)
@@ -258,7 +259,7 @@ async def test_startup_sweeps_worktrees_and_schedules_the_periodic_task(monkeypa
 
     monkeypatch.setattr(janitor, "sweep", fake_sweep)
 
-    async def fake_setup(conn) -> None:
+    async def fake_setup(conn, **_kwargs) -> None:
         return None
 
     monkeypatch.setattr(server_mod, "setup_schema", fake_setup)
@@ -287,7 +288,7 @@ async def test_startup_does_not_schedule_a_janitor_when_the_setting_is_off(monke
 
     monkeypatch.setattr(janitor, "sweep", fail_sweep)
 
-    async def fake_setup(conn) -> None:
+    async def fake_setup(conn, **_kwargs) -> None:
         return None
 
     monkeypatch.setattr(server_mod, "setup_schema", fake_setup)
@@ -310,7 +311,7 @@ async def test_a_failing_sweep_does_not_stop_the_server_from_starting(monkeypatc
 
     monkeypatch.setattr(janitor, "sweep", boom)
 
-    async def fake_setup(conn) -> None:
+    async def fake_setup(conn, **_kwargs) -> None:
         return None
 
     monkeypatch.setattr(server_mod, "setup_schema", fake_setup)
@@ -379,9 +380,13 @@ def test_dashboard_viewer_never_starts_a_janitor(monkeypatch) -> None:
 
 def test_serve_exits_1_when_memgraph_unreachable(monkeypatch) -> None:
     from inflorescence import __main__ as m
+    from inflorescence import docker_env
     from inflorescence import server as server_mod
 
     ran: dict = {}
+    monkeypatch.setenv("MEMGRAPH_AUTOSTART", "true")
+    monkeypatch.setattr(docker_env, "ensure_memgraph", lambda *a, **k: False)
+    monkeypatch.setattr(m, "_memgraph_recovery_hint", lambda settings: "test database is unavailable")
     monkeypatch.setattr(server_mod, "create_server", _fake_server_parts(healthy=False, ran=ran))
 
     with pytest.raises(SystemExit) as exc:
@@ -394,12 +399,59 @@ def test_serve_exits_1_when_memgraph_unreachable(monkeypatch) -> None:
 
 def test_serve_allow_degraded_starts_despite_unreachable(monkeypatch) -> None:
     from inflorescence import __main__ as m
+    from inflorescence import docker_env
     from inflorescence import server as server_mod
 
     ran: dict = {}
+    monkeypatch.setenv("MEMGRAPH_AUTOSTART", "true")
+    monkeypatch.setattr(docker_env, "ensure_memgraph", lambda *a, **k: False)
     monkeypatch.setattr(server_mod, "create_server", _fake_server_parts(healthy=False, ran=ran))
 
     m._serve(allow_degraded=True)  # must NOT raise
 
     assert ran.get("ran_server") is True
     assert ran.get("conn_closed") is True
+
+
+@pytest.mark.parametrize("command", ["serve", "watch"])
+def test_stopped_database_with_autostart_disabled_exits_before_loading_stack(monkeypatch, capsys, command) -> None:
+    import builtins
+
+    from inflorescence import __main__ as m
+    from inflorescence import docker_env
+
+    monkeypatch.setenv("MEMGRAPH_AUTOSTART", "false")
+    monkeypatch.setenv("MEMGRAPH_URL", "bolt://localhost:7687")
+    monkeypatch.setattr(docker_env, "port_open", lambda *a, **k: False)
+    original_import = builtins.__import__
+
+    def no_heavy_import(name, *args, **kwargs):
+        if name == "inflorescence.server":
+            raise AssertionError("a disabled service must exit before loading the MCP/indexing stack")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_heavy_import)
+    with pytest.raises(SystemExit) as exc:
+        if command == "serve":
+            m._serve()
+        else:
+            asyncio.run(m._watch_components())
+    assert exc.value.code == 1
+    assert "MEMGRAPH_AUTOSTART=false" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("url", ["bolt://localhost:7687", "bolt://db.example:7687"])
+def test_autostart_disabled_does_not_prevent_connecting_to_running_or_remote_database(monkeypatch, url) -> None:
+    from inflorescence import __main__ as m
+    from inflorescence import docker_env
+
+    monkeypatch.setattr(docker_env, "port_open", lambda *a, **k: True)
+    m._ensure_service_database(Settings(memgraph_url=url, memgraph_autostart=False))
+
+
+def test_explicit_degraded_mode_still_works_with_autostart_disabled(monkeypatch) -> None:
+    from inflorescence import __main__ as m
+    from inflorescence import docker_env
+
+    monkeypatch.setattr(docker_env, "port_open", lambda *a, **k: False)
+    m._ensure_service_database(Settings(memgraph_autostart=False), allow_degraded=True)

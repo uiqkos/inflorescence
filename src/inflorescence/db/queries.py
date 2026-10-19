@@ -434,10 +434,12 @@ MATCH (root:Code {project: $project, id: $node_id})
 RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary
 """
 
-# The node that stands for a whole file: its module, or its document node for a prose file.
+# The node that stands for a whole path: a file's module (or document node for a prose
+# file), or a directory's node — so an agent walking the tree down by path never has to know
+# the `dir:` id convention. A file and a directory never share a path.
 GET_STRUCTURE_ROOT_BY_FILE = """
 MATCH (root:Code {project: $project, file_path: $file_path})
-WHERE root:Module OR root:Document
+WHERE root:Module OR root:Document OR root:Directory
 RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary
 """
 
@@ -554,6 +556,18 @@ RETURN
 
 VECTOR_SEARCH_SUMMARY = """
 CALL vector_search.search('summary_embeddings', $top_k, $embedding)
+YIELD node, similarity
+WITH node, similarity
+WHERE node.project = $project
+RETURN node.id AS id, node.name AS name, labels(node) AS labels,
+       node.file_path AS file_path, node.line_start AS line_start,
+       node.line_end AS line_end, similarity AS score, node.summary AS summary
+"""
+
+# The same search over one label-scoped summary index (schema.LEVEL_SUMMARY_INDEXES) — the
+# index name is an argument of the procedure, so it can be a parameter.
+VECTOR_SEARCH_SUMMARY_IN_INDEX = """
+CALL vector_search.search($index, $top_k, $embedding)
 YIELD node, similarity
 WITH node, similarity
 WHERE node.project = $project

@@ -43,7 +43,27 @@ PROPERTY_INDEXES: list[tuple[str, str]] = [
 VECTOR_INDEXES: list[dict[str, str | int]] = [
     {"name": "code_embeddings", "label": "CodeChunk", "property": "embedding", "dimension": 1536, "metric": "cos", "capacity": 10000},
     {"name": "summary_embeddings", "label": "Code", "property": "summary_embedding", "dimension": 1536, "metric": "cos", "capacity": 10000},
+    # The coarse rungs of the CONTAINS ladder, each in an index of its own. The shared
+    # summary index holds every entity of every project (61k vectors on one real machine),
+    # and vector_search.search only filters AFTER its global top-k — so "which directory is
+    # about X" over 39 directories of one project came back empty: they never reached the
+    # candidate pool. A label-scoped index ranks directories against directories only.
+    # Optional (not in REQUIRED_SEARCH_VECTORS): without them search falls back to the
+    # shared index, which is worse at this question but still answers the others.
+    *(
+        {"name": index, "label": label, "property": "summary_embedding", "dimension": 1536, "metric": "cos", "capacity": 10000}
+        for index, label in (
+            ("directory_summary_embeddings", "Directory"),
+            ("module_summary_embeddings", "Module"),
+        )
+    ),
 ]
+
+# node_type → the label-scoped summary index that ranks that type on its own (see above).
+LEVEL_SUMMARY_INDEXES: dict[str, str] = {
+    "directory": "directory_summary_embeddings",
+    "module": "module_summary_embeddings",
+}
 
 TEXT_INDEXES: list[dict[str, str]] = [
     {"name": "summary_text", "label": "Code", "property": "summary"},
@@ -210,8 +230,14 @@ async def _ensure_index_lock_constraint(conn: MemgraphConnection) -> None:
         logger.debug("Uniqueness constraint on :IndexLock(project) already present or unsupported")
 
 
-async def setup_schema(conn: MemgraphConnection) -> list[str]:
+async def setup_schema(conn: MemgraphConnection, *, dimension: int | None = None) -> list[str]:
     """Create all required indexes in Memgraph, skipping any that already exist.
+
+    ``dimension`` is ``Settings.embedding_dimension`` — the width a new vector index is
+    created with. Every index used to be created at a hard-coded 1536 whatever
+    EMBEDDING_DIMENSION said, so a smaller model's vectors could never be stored. It only
+    shapes indexes created now: an existing index keeps its width (changing it means
+    dropping the index and re-indexing, as .env.example says).
 
     Returns the names of required vector search indexes that could NOT be created (empty on a
     healthy MAGE image). A non-empty result is logged at ERROR here and makes the indexing
@@ -242,7 +268,7 @@ async def setup_schema(conn: MemgraphConnection) -> list[str]:
         if (str(label), str(prop)) in existing_vectors:
             logger.info("Vector index %s already exists — skipped", name)
             continue
-        dim = vdef["dimension"]
+        dim = dimension or vdef["dimension"]
         metric = vdef["metric"]
         capacity = vdef.get("capacity", 10000)
         query = (

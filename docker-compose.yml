@@ -9,6 +9,9 @@ services:
     # the loser is left running but attached to no network, unreachable and unrepairable
     # by restart. One name makes the second path adopt the first path's container.
     container_name: inflorescence-memgraph
+    # Match docker_env.MEMGRAPH_STOP_TIMEOUT: a multi-GB exit snapshot needs more
+    # than Docker's default 10 seconds before SIGKILL.
+    stop_grace_period: 600s
     ports:
       # Loopback only: Memgraph runs without authentication and holds the source code of
       # every indexed repository; docker's default of binding 0.0.0.0 would hand both to
