@@ -241,6 +241,9 @@ class _NoopRepo:
     async def get_project_scope(self, project):
         return [], []
 
+    async def get_files_with_stale_chunks(self, project):
+        return []
+
 
 class _NoopRag:
     def preflight(self) -> None:

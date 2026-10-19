@@ -7,6 +7,9 @@ from typing import Any
 
 MAX_GRAPH_LIMIT = 500
 MAX_SEARCH_LIMIT = 100
+# The fewest entities a ranked search draws from each index: the pool a page is cut from and
+# ``meta.facets`` counts — wider than a page, so the facets show where the candidates lie.
+SEARCH_CANDIDATE_POOL = 100
 
 # Summary preview bound for navigation tools (list/structure/related): a page of
 # hundreds of entities each carrying a multi-paragraph summary overflows tool

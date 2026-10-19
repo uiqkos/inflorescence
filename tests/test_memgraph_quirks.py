@@ -42,6 +42,7 @@ import pytest
 from inflorescence.config import Settings
 from inflorescence.db import repository as repository_module
 from inflorescence.db.repository import GraphRepository
+from inflorescence.rag.chunker import CHUNK_MARKER_SUFFIX
 
 LIVE_URL = os.environ.get("INFLORESCENCE_TEST_MEMGRAPH_URL")
 live = pytest.mark.skipif(
@@ -140,7 +141,7 @@ async def test_mark_chunks_covered_stamps_every_row_of_the_batch() -> None:
             {"project": project},
         )
         assert {r["file_path"] for r in stamped} == set(every_file)
-        assert all(r["marker"] == f"sum-{r['file_path']}" for r in stamped)
+        assert all(r["marker"] == f"sum-{r['file_path']}{CHUNK_MARKER_SUFFIX}" for r in stamped)
 
         # The money consequence: nothing is re-chunked and re-embedded next run.
         assert await repo.get_files_with_stale_chunks(project) == []

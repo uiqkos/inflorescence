@@ -21,7 +21,7 @@ from inflorescence.code_indexer.models import (
 )
 from inflorescence.config import DEFAULT_DOCUMENT_FILENAMES, DOCUMENT_EXTENSION_GROUPS
 from inflorescence.tools.gates import NODE_TYPE_GROUPS
-from inflorescence.tools.responses import FULL_SUMMARY_MAX_LIMIT, NAV_SUMMARY_MAX_CHARS
+from inflorescence.tools.responses import FULL_SUMMARY_MAX_LIMIT, NAV_SUMMARY_MAX_CHARS, SEARCH_CANDIDATE_POOL
 
 
 def _node_type_values() -> str:
@@ -61,7 +61,10 @@ SCOPE = (
     "A SEARCH IS A FEW CALLS, NOT ONE. A repository holds many copies of the vocabulary you search "
     "for that are not the code you want — tests, mocks and fixtures, prototypes, sample data, "
     "reports, an old copy of a feature — and they can out-rank it. ``meta.facets`` counts every "
-    "candidate this page was drawn from, not just the page: ``counted``; ``common_path``, the "
+    "candidate this page was drawn from, not just the page — for a ranked search that is the best "
+    f"{SEARCH_CANDIDATE_POOL} entities (more when ``offset + limit`` reaches past them), so "
+    "``counted`` is the size of that pool, not a count of all matches: ``counted``; "
+    "``common_path``, the "
     "deepest directory they all share; ``by_directory``, candidates per directory one level below "
     "it (``\"direct\": true`` = files right in it; ``other_directories`` sums the directories not "
     "listed); ``by_node_type``; and ``tests``, the test-like paths among them (absent with "

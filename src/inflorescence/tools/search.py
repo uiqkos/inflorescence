@@ -23,6 +23,7 @@ from inflorescence.tools.gates import ensure_indexed, normalize_node_types
 from inflorescence.tools.path_filters import PathFilterConfig, filter_records_by_path, is_test_path
 from inflorescence.tools.responses import (
     MAX_SEARCH_LIMIT,
+    SEARCH_CANDIDATE_POOL,
     clamp_limit,
     clamp_offset,
     entity_ref,
@@ -44,9 +45,10 @@ Hit = dict[str, Any]
 
 def _overfetch(limit: int, offset: int) -> int:
     """How many entities a page asks each index for: every one up to the page's end plus one
-    (so ``has_more`` is known), and never fewer than 100, so a fusion of several indexes ranks
-    over more than the page itself. The repository counts entities, not chunks."""
-    return max(100, offset + limit + 1)
+    (so ``has_more`` is known), and never fewer than :data:`SEARCH_CANDIDATE_POOL`, so a fusion
+    of several indexes ranks over more than the page itself. The repository counts entities,
+    not chunks."""
+    return max(SEARCH_CANDIDATE_POOL, offset + limit + 1)
 
 
 def _row_filter(filters: PathFilterConfig, node_types: list[str] | None, include_tests: bool) -> RowFilter:

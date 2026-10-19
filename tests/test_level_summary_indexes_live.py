@@ -38,12 +38,14 @@ async def _connect():
 
 
 async def _seed(conn, project: str) -> None:
+    # Distinct vectors, all closer to the query than the directory: HNSW recall over hundreds
+    # of *identical* vectors is lossy and nondeterministic, which would test the engine, not us.
     await conn.execute_write(
-        "UNWIND range(1, $n) AS i "
+        "UNWIND range(1, size($near)) AS i "
         "CREATE (:Code:Function {id: $project + '::f' + toString(i), project: $project, "
         "name: 'f' + toString(i), node_type: 'function', file_path: 'src/pkg/m.py', "
-        "line_start: i, line_end: i, summary: 'crowd', summary_embedding: $near})",
-        {"n": _CROWD, "project": project, "near": _vec(0.0)},
+        "line_start: i, line_end: i, summary: 'crowd', summary_embedding: $near[i - 1]})",
+        {"project": project, "near": [_vec(i / 1000) for i in range(1, _CROWD + 1)]},
     )
     await conn.execute_write(
         "CREATE (:Code:Directory {id: 'dir:src/pkg', project: $project, name: 'pkg', "
