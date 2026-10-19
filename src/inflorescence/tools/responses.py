@@ -56,7 +56,7 @@ def entity_ref(raw: Mapping[str, Any] | None, summary_max_chars: int | None = No
         ref[field] = value
     # An entity with no summary — a top-level declaration (never summarized), or anything
     # before its first summary exists — would otherwise be a bare name. Its signature line
-    # (``export const AUTOPILOT = {``, ``def run(job: Job) -> None``) is what says what it is.
+    # (``export const RETRY_POLICY = {``, ``def run(job: Job) -> None``) is what says what it is.
     if not ref.get("summary") and raw.get("signature"):
         ref["signature"] = raw["signature"]
     return ref

@@ -3,7 +3,7 @@
 Three field reports in a row (17.09.2026) asked the graph "which import statements lead into
 this directory, and are they static or dynamic?" and got "module A imports module B" — the
 fact that collapses exactly what a refactor turns on: which spelling (``'../tasks'`` vs
-``'../tasks/read-show'``), whether it is a lazy ``import()`` chunk or a static dependency of the
+``'../tasks/list-view'``), whether it is a lazy ``import()`` chunk or a static dependency of the
 bundle, whether it is type-only. And "who reads the constant TASKS" had no answer at all.
 """
 

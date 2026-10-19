@@ -1285,7 +1285,10 @@ async def test_repository_list_entities_passes_pagination_and_returns_compact_re
     assert conn.params["node_types"] == ["function"]
     assert conn.params["limit"] == 11
     assert conn.params["offset"] == 7
-    assert "n.node_type" not in conn.query
+    # Filtered on the canonical node_type property (a label lowercased is "typealias", never
+    # "type_alias"); the compact ref itself still carries no node_type column.
+    assert "n.node_type IN $node_types" in conn.query
+    assert "node_type" not in conn.query.split("RETURN", 1)[1]
     assert "labels(n) AS `n.labels`" in conn.query
 
 
@@ -1352,7 +1355,10 @@ async def test_repository_get_entity_structure_formats_depth_without_touching_cy
     assert result == [entity("pkg/a.py::Worker", "Worker", "class", "pkg/a.py", 5, 20, "Worker.")]
     assert "[:CONTAINS*1..2]" in conn.query
     assert "{project: $project, id: $root_id}" in conn.query
-    assert "n.node_type" not in conn.query
+    # Filtered on the canonical node_type property (a label lowercased is "typealias", never
+    # "type_alias"); the compact ref itself still carries no node_type column.
+    assert "n.node_type IN $node_types" in conn.query
+    assert "node_type" not in conn.query.split("RETURN", 1)[1]
     assert conn.params == {"project": "project-id", "root_id": "pkg/a.py", "node_types": None, "limit": 11, "offset": 7}
 
 

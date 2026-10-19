@@ -50,8 +50,10 @@ Hit = dict[str, Any]
 
 
 def _overfetch(limit: int, offset: int) -> int:
-    """How many candidates a page asks the index for: enough to rank, merge and page over."""
-    return max(100, min((offset + limit + 1) * 5, 500))
+    """How many entities a page asks each index for: every one up to the page's end plus one
+    (so ``has_more`` is known), and never fewer than 100, so a fusion of several indexes ranks
+    over more than the page itself. The repository counts entities, not chunks."""
+    return max(100, offset + limit + 1)
 
 
 def _row_filter(filters: PathFilterConfig, node_types: list[str] | None, include_tests: bool) -> RowFilter:
@@ -400,7 +402,7 @@ HOW WORDS MATCH. Query metacharacters (``:``, ``[]``, ``+``, ``-``, ``*``, …) 
 so ``ValueError: invalid literal`` or ``arr[0]`` match as plain keywords. Each word is matched
 whole and exactly, case-insensitively — there is NO stemming in any language: ``running`` does
 not match ``run``, and Russian ``выбрасывания`` does not match ``выбрасывание``. A word with
-punctuation inside (``solver_linear``, ``task.start``) is split at it and searched as a
+punctuation inside (``parser_strict``, ``task.start``) is split at it and searched as a
 phrase, so it matches only where those pieces are adjacent. A multi-word query matches ANY of
 its words, so the top hit is usually right while the tail can be noise from a common word —
 narrow with the most distinctive single word, or add ``include_paths``. When a word matches

@@ -57,15 +57,15 @@ class FileEntities(FakeGraphRepositoryV2):
 @pytest.fixture
 def project(tmp_path: Path) -> tuple[Path, FileEntities]:
     checksums = {
-        "web/theme.css": _write(tmp_path, "web/theme.css", ":root {\n  --color-forest: #0a3;\n}\n.a { color: var(--color-forest); }\n"),
+        "web/theme.css": _write(tmp_path, "web/theme.css", ":root {\n  --color-brand: #0a3;\n}\n.a { color: var(--color-brand); }\n"),
         "web/board.ts": _write(
             tmp_path,
             "web/board.ts",
-            "export const PALETTE = {\n  bg: 'var(--color-forest)',\n}\n\nexport function paint() {\n"
-            "  return 'var(--color-Forest)'\n}\n",
+            "export const PALETTE = {\n  bg: 'var(--color-brand)',\n}\n\nexport function paint() {\n"
+            "  return 'var(--color-Brand)'\n}\n",
         ),
-        "web/board.test.ts": _write(tmp_path, "web/board.test.ts", "expect(css).toContain('--color-forest')\n"),
-        "web/logo.png": _write(tmp_path, "web/logo.png", "\0PNG--color-forest"),
+        "web/board.test.ts": _write(tmp_path, "web/board.test.ts", "expect(css).toContain('--color-brand')\n"),
+        "web/logo.png": _write(tmp_path, "web/logo.png", "\0PNG--color-brand"),
     }
     repo = FileEntities([
         entity("web/board.ts", "board", "module", "web/board.ts", 1, 7, "Board."),
@@ -86,7 +86,7 @@ async def _call(repo, root: Path, **arguments) -> dict:
 @pytest.mark.asyncio
 async def test_every_occurrence_in_path_and_line_order_with_its_owner(project) -> None:
     root, repo = project
-    payload = await _call(repo, root, pattern="--color-forest")
+    payload = await _call(repo, root, pattern="--color-brand")
 
     assert [(i["file_path"], i["line"]) for i in payload["items"]] == [
         ("web/board.test.ts", 1),
@@ -96,7 +96,7 @@ async def test_every_occurrence_in_path_and_line_order_with_its_owner(project) -
     ]
     by_line = {(i["file_path"], i["line"]): i for i in payload["items"]}
     assert by_line[("web/board.ts", 2)]["entity"]["id"] == "web/board.ts::PALETTE"  # innermost span
-    assert by_line[("web/board.ts", 2)]["text"] == "  bg: 'var(--color-forest)',"
+    assert by_line[("web/board.ts", 2)]["text"] == "  bg: 'var(--color-brand)',"
     assert by_line[("web/board.test.ts", 1)]["is_test"] is True
     assert payload["meta"]["total_matches"] == 4 and payload["meta"]["files_matched"] == 3
     assert payload["meta"]["files_searched"] == 3, "the binary file is skipped, not searched"
@@ -106,8 +106,8 @@ async def test_every_occurrence_in_path_and_line_order_with_its_owner(project) -
 async def test_case_regex_tests_and_pagination(project) -> None:
     root, repo = project
 
-    folded = await _call(repo, root, pattern="--COLOR-FOREST", case_sensitive=False, include_tests=False)
-    assert folded["meta"]["total_matches"] == 4  # the `--color-Forest` line joins, the test file leaves
+    folded = await _call(repo, root, pattern="--COLOR-BRAND", case_sensitive=False, include_tests=False)
+    assert folded["meta"]["total_matches"] == 4  # the `--color-Brand` line joins, the test file leaves
     assert all("is_test" not in item for item in folded["items"])
 
     anchored = await _call(repo, root, pattern=r"^\s+return", regex=True)
@@ -115,9 +115,9 @@ async def test_case_regex_tests_and_pagination(project) -> None:
         ("web/board.ts", 6, "web/board.ts::paint")
     ]
 
-    first = await _call(repo, root, pattern="forest", limit=2)
+    first = await _call(repo, root, pattern="brand", limit=2)
     assert first["page"]["has_more"] is True and first["meta"]["total_matches"] == 4
-    rest = await _call(repo, root, pattern="forest", limit=2, offset=2)
+    rest = await _call(repo, root, pattern="brand", limit=2, offset=2)
     assert [(i["file_path"], i["line"]) for i in rest["items"]] == [("web/theme.css", 2), ("web/theme.css", 4)]
 
 
@@ -136,12 +136,12 @@ async def test_invalid_input_is_an_error_not_an_empty_page(project) -> None:
 @pytest.mark.asyncio
 async def test_files_not_yet_indexed_are_read_and_flagged(project) -> None:
     root, repo = project
-    _write(root, "web/new_panel.ts", "const x = 'var(--color-forest)'\n")
+    _write(root, "web/new_panel.ts", "const x = 'var(--color-brand)'\n")
 
-    payload = await _call(repo, root, pattern="--color-forest", include_paths=["web/"])
+    payload = await _call(repo, root, pattern="--color-brand", include_paths=["web/"])
 
     new = [i for i in payload["items"] if i["file_path"] == "web/new_panel.ts"]
-    assert new == [{"file_path": "web/new_panel.ts", "line": 1, "text": "const x = 'var(--color-forest)'", "indexed": False}]
+    assert new == [{"file_path": "web/new_panel.ts", "line": 1, "text": "const x = 'var(--color-brand)'", "indexed": False}]
     assert payload["meta"]["unindexed_files_searched"] == 1
     assert "web/new_panel.ts" not in sum(repo.asked, []), "no graph lookup for a file the graph does not hold"
 
@@ -149,12 +149,12 @@ async def test_files_not_yet_indexed_are_read_and_flagged(project) -> None:
 @pytest.mark.asyncio
 async def test_a_changed_file_is_read_as_it_is_now_and_flagged_stale(project) -> None:
     root, repo = project
-    (root / "web/theme.css").write_text("/* moved */\n:root { --color-forest: #0a3; }\n", encoding="utf-8")
+    (root / "web/theme.css").write_text("/* moved */\n:root { --color-brand: #0a3; }\n", encoding="utf-8")
 
-    payload = await _call(repo, root, pattern="--color-forest", include_paths=["web/theme.css"])
+    payload = await _call(repo, root, pattern="--color-brand", include_paths=["web/theme.css"])
 
     assert payload["items"] == [
-        {"file_path": "web/theme.css", "line": 2, "text": ":root { --color-forest: #0a3; }",
+        {"file_path": "web/theme.css", "line": 2, "text": ":root { --color-brand: #0a3; }",
          "entity": {"id": "web/theme.css", "name": "theme", "node_type": "document", "line_start": 1, "line_end": 4},
          "stale": True},
     ]
@@ -164,14 +164,38 @@ async def test_a_changed_file_is_read_as_it_is_now_and_flagged_stale(project) ->
 def test_long_lines_are_quoted_around_the_match_and_budgets_are_reported(tmp_path: Path) -> None:
     (tmp_path / "bundle.js").write_text("x" * 5000 + "NEEDLE" + "y" * 5000 + "\n", encoding="utf-8")
     (tmp_path / "b.js").write_text("NEEDLE\n", encoding="utf-8")
-    compiled = find_module._compile("NEEDLE", regex=False, case_sensitive=True)
+    compiled = find_module._compile("NEEDLE", is_regex=False, case_sensitive=True)
 
     scan = _scan_files(tmp_path, ["bundle.js", "b.js"], compiled, keep=10)
     text = scan.kept[0][2]
     assert "NEEDLE" in text and len(text) <= FIND_MAX_LINE_CHARS + 2
 
-    stopped = _scan_files(tmp_path, ["bundle.js", "b.js"], compiled, keep=10, byte_budget=100)
+    # The budget is checked against a file's size before it is read: bundle.js (10 007 bytes)
+    # fits, b.js no longer does.
+    stopped = _scan_files(tmp_path, ["bundle.js", "b.js"], compiled, keep=10, byte_budget=10_010)
     assert stopped.files_searched == 1 and stopped.not_searched == 1
+    # A file bigger than the whole budget is never read into memory at all.
+    assert _scan_files(tmp_path, ["bundle.js"], compiled, keep=10, byte_budget=100).files_searched == 0
+
+
+def test_a_catastrophic_regex_is_stopped_inside_the_line_and_named(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("ok\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("x" * 5000 + "\n", encoding="utf-8")
+    (tmp_path / "c.txt").write_text("ok\n", encoding="utf-8")
+    compiled = find_module._compile(r"(x+x+)+y", is_regex=True, case_sensitive=True)
+
+    scan = _scan_files(tmp_path, ["a.txt", "b.txt", "c.txt"], compiled, keep=10, time_budget=0.3)
+
+    assert scan.regex_timed_out_in == "b.txt"
+    assert scan.files_searched == 2 and scan.not_searched == 2
+
+
+def test_line_numbers_count_newlines_only_like_grep(tmp_path: Path) -> None:
+    # Form feed and U+2028 are line breaks to str.splitlines, not to grep or an editor.
+    (tmp_path / "a.py").write_text("one\x0ctwo\nthree \u2028 four\nNEEDLE\n", encoding="utf-8")
+    compiled = find_module._compile("NEEDLE", is_regex=False, case_sensitive=True)
+
+    assert [line for _, line, _ in _scan_files(tmp_path, ["a.py"], compiled, keep=10).kept] == [3]
 
 
 @pytest.mark.asyncio
@@ -183,7 +207,7 @@ async def test_a_budget_stop_marks_the_page_truncated_and_says_so(project, monke
         find_module, "_scan_files", lambda *a, **k: original(*a, **{**k, "byte_budget": 1})
     )
 
-    payload = await _call(repo, root, pattern="forest")
+    payload = await _call(repo, root, pattern="brand")
 
     assert payload["page"]["truncated"] is True
     assert payload["meta"]["files_not_searched"] >= 1

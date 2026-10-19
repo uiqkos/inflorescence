@@ -134,6 +134,21 @@ async def test_widening_applies_the_callers_filters_inside_the_loop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_window_counts_entities_not_chunks() -> None:
+    # 1500 chunks of one long function of ours out-rank our other functions: counted as rows,
+    # the first window "had" the page and the answer was one entity marked complete.
+    big = [{**_row("mine", 0), "chunk_id": f"c{i}"} for i in range(1500)]
+    rest = [_row("mine", i) for i in range(1, 6)]
+    conn = _GlobalIndexConn(big + rest)
+    repo = GraphRepository(conn)  # type: ignore[arg-type]
+
+    hits = await repo.text_hits("code", "mine", "run", 4)
+
+    assert len({row["id"] for row in hits.rows}) == 4 and hits.complete is True
+    assert conn.fetches[-1] > 1500
+
+
+@pytest.mark.asyncio
 async def test_vector_search_widens_the_same_way() -> None:
     rows = [_row("clone", i) for i in range(1000)] + [_row("mine", i) for i in range(1000, 1010)]
     for row in rows:
@@ -156,8 +171,8 @@ def test_module_level_rule_table_past_line_80_is_in_a_verbatim_chunk(tmp_path: P
     body = "\n".join(f"def f{i}():\n    return {i}\n" for i in range(40))
     source = tmp_path / "triage.py"
     source.write_text(
-        f'"""Triage rules."""\n\n{body}\n\nRULES = (\n    Rule("capture.spa_no_xhr", LAYER2),\n'
-        '    Rule("derive.model_no_list", TERMINAL),\n)\n\nMIN_VISIBLE_TEXT = 400\n',
+        f'"""Triage rules."""\n\n{body}\n\nRULES = (\n    Rule("cache.stale_no_etag", LAYER2),\n'
+        '    Rule("fetch.empty_page", TERMINAL),\n)\n\nMIN_BATCH_SIZE = 400\n',
         encoding="utf-8",
     )
     nodes, _ = PythonAstParser().parse_file(source, tmp_path)
@@ -165,10 +180,10 @@ def test_module_level_rule_table_past_line_80_is_in_a_verbatim_chunk(tmp_path: P
     chunks = Chunker().chunk_repository(tmp_path, nodes)
 
     module_body = [c for c in chunks if c.chunk_kind == "module_body"]
-    assert any("capture.spa_no_xhr" in c.content for c in module_body)
-    assert any("MIN_VISIBLE_TEXT = 400" in c.content for c in module_body)
-    rules_line = source.read_text().splitlines().index('    Rule("capture.spa_no_xhr", LAYER2),') + 1
-    holder = next(c for c in module_body if "capture.spa_no_xhr" in c.content)
+    assert any("cache.stale_no_etag" in c.content for c in module_body)
+    assert any("MIN_BATCH_SIZE = 400" in c.content for c in module_body)
+    rules_line = source.read_text().splitlines().index('    Rule("cache.stale_no_etag", LAYER2),') + 1
+    holder = next(c for c in module_body if "cache.stale_no_etag" in c.content)
     assert holder.start_line <= rules_line <= holder.end_line
     assert holder.content.splitlines()[rules_line - holder.start_line].strip().startswith("Rule(")
     # A function's lines stay in its own body chunk and are not duplicated as module code.
@@ -179,8 +194,8 @@ def test_type_bodies_and_exported_constants_are_verbatim(tmp_path: Path) -> None
     source = tmp_path / "bank.ts"
     source.write_text(
         "export interface Row {\n  op: string;\n  sides: number[];\n}\n\n"
-        "export const NO_PASS: Record<string, string> = {\n  t09: 'needs a drag step',\n};\n\n"
-        "export function bankTasks() {\n  return Object.keys(NO_PASS);\n}\n",
+        "export const NO_REFUND: Record<string, string> = {\n  t09: 'needs a drag step',\n};\n\n"
+        "export function bankTasks() {\n  return Object.keys(NO_REFUND);\n}\n",
         encoding="utf-8",
     )
     nodes, _ = JavaScriptParser().parse_file(source, tmp_path)
@@ -210,27 +225,27 @@ def test_blank_runs_between_members_make_no_chunk(tmp_path: Path) -> None:
 
 
 def test_tokens_mirror_the_index_tokenizer() -> None:
-    assert tokens("solver_linear task.start R19 Выбрасывание") == [
-        "solver", "linear", "task", "start", "r19", "выбрасывание",
+    assert tokens("parser_strict task.start R19 Выбрасывание") == [
+        "parser", "strict", "task", "start", "r19", "выбрасывание",
     ]
-    assert query_words("spa_no_xhr spa_no_xhr ::") == [("spa_no_xhr", ["spa", "no", "xhr"])]
+    assert query_words("stale_no_etag stale_no_etag ::") == [("stale_no_etag", ["stale", "no", "etag"])]
 
 
 def test_matching_lines_quote_file_lines_best_first() -> None:
-    content = "x = 1\nRule('capture.spa_no_xhr', LAYER2)\nspa = 2\n# spa no xhr here too\n"
+    content = "x = 1\nRule('cache.stale_no_etag', LAYER2)\nstale = 2\n# stale no etag here too\n"
 
-    lines = matching_lines(content, 390, query_words("spa_no_xhr layer2"))
+    lines = matching_lines(content, 390, query_words("stale_no_etag layer2"))
 
-    assert lines[0] == {"line": 391, "text": "Rule('capture.spa_no_xhr', LAYER2)"}
-    assert {"line": 393, "text": "# spa no xhr here too"} in lines
-    assert all(item["line"] != 392 for item in lines)  # "spa" alone is not the phrase
+    assert lines[0] == {"line": 391, "text": "Rule('cache.stale_no_etag', LAYER2)"}
+    assert {"line": 393, "text": "# stale no etag here too"} in lines
+    assert all(item["line"] != 392 for item in lines)  # "stale" alone is not the phrase
 
 
 def test_fuzzy_distance_grows_with_the_word_and_never_applies_to_phrases() -> None:
     assert fuzzy_distance_for("доск") == 0
-    assert fuzzy_distance_for("keepsRoot") == 2
+    assert fuzzy_distance_for("keepsOrder") == 2
     assert fuzzy_distance_for("print") == 1
-    assert fuzzy_distance_for("solver_linear") == 0
+    assert fuzzy_distance_for("parser_strict") == 0
     assert within_edits("выбрасывание", "выбрасывания", 1)
     assert not within_edits("выбросить", "выбрасывания", 2)
 
@@ -271,14 +286,14 @@ def _chunk_row(node_id: str, path: str, content: str, start: int, score: float =
 @pytest.mark.asyncio
 async def test_search_text_quotes_the_matching_lines_and_never_leaks_chunk_text() -> None:
     mcp = FastMCP("test")
-    repo = _WordAwareTextRepo({"spa", "no", "xhr"})
-    repo.code_rows = [_chunk_row("src/triage.py", "src/triage.py", "RULES = (\n    Rule('capture.spa_no_xhr', L2),\n)", 389)]
+    repo = _WordAwareTextRepo({"stale", "no", "etag"})
+    repo.code_rows = [_chunk_row("src/triage.py", "src/triage.py", "RULES = (\n    Rule('cache.stale_no_etag', L2),\n)", 389)]
     register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
 
-    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/p", "query": "spa_no_xhr"}))
+    payload = _payload(await mcp.call_tool("search_text", {"directory": "/tmp/p", "query": "stale_no_etag"}))
 
     match = payload["items"][0]["matches"][0]
-    assert match["lines"] == [{"line": 390, "text": "Rule('capture.spa_no_xhr', L2),"}]
+    assert match["lines"] == [{"line": 390, "text": "Rule('cache.stale_no_etag', L2),"}]
     assert "chunk_content" not in str(payload)
     assert "unmatched_terms" not in payload["meta"]
 
@@ -450,6 +465,38 @@ def test_drift_counts_indexed_files_that_differ_after_head_moved(tmp_path: Path)
     head_now = git("-C", str(repo_dir), "rev-parse", "HEAD").strip()
     assert freshness.measure_drift(repo_dir, stored, head_now) is None
     assert freshness.measure_drift(repo_dir, stored, None) is None
+
+
+def test_drift_cache_sees_a_reindex_that_kept_the_file_count(tmp_path: Path) -> None:
+    freshness._drift_cache.clear()
+    repo_dir = make_repo(tmp_path / "repo")
+    indexed_head = git("-C", str(repo_dir), "rev-parse", "HEAD").strip()
+    tracked = sorted(p.name for p in repo_dir.iterdir() if p.is_file())
+    stale = {name: "0" * 32 for name in tracked}  # an index older than every file
+    (repo_dir / tracked[0]).write_text("moved on\n", encoding="utf-8")
+    git("-C", str(repo_dir), "commit", "-am", "move")
+    assert freshness.measure_drift(repo_dir, stale, indexed_head)[0] == len(tracked)
+
+    # The watcher re-indexes every file without moving HEAD: same count, new checksums.
+    caught_up = {
+        name: freshness.FileChecksum.compute(repo_dir / name, repo_dir).md5 for name in tracked
+    }
+    assert freshness.measure_drift(repo_dir, caught_up, indexed_head) is None
+
+
+def test_a_partial_drift_measurement_is_not_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    freshness._drift_cache.clear()
+    repo_dir = make_repo(tmp_path / "repo")
+    indexed_head = git("-C", str(repo_dir), "rev-parse", "HEAD").strip()
+    (repo_dir / "new.txt").write_text("x\n", encoding="utf-8")
+    git("-C", str(repo_dir), "add", "new.txt")
+    git("-C", str(repo_dir), "commit", "-m", "add")
+    monkeypatch.setattr(freshness, "DRIFT_TIME_BUDGET_S", -1.0)
+
+    # Nothing was hashed: that is "unknown", not "no drift".
+    assert freshness.measure_drift(repo_dir, {"new.txt": "0" * 32}, indexed_head) == (0, [], True)
+    assert freshness._drift_cache == {}
+    assert "unknown" in freshness._drift_notice(repo_dir, indexed_head, (0, [], True))
 
 
 def test_drift_notice_names_the_commits_the_files_and_the_command(tmp_path: Path) -> None:

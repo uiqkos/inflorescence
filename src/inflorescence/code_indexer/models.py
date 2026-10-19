@@ -34,12 +34,12 @@ class NodeType(StrEnum):
     # for modules doesn't return documentation and vice versa.
     DOCUMENT = "document"
     # A top-level binding that is not a function: `export const RULES = [...]`, a module-level
-    # `MIN_VISIBLE_TEXT = 400`, a Go `var checkers = map[...]...`, a Rust `static`. Rule tables,
+    # `MIN_BATCH_SIZE = 400`, a Go `var checkers = map[...]...`, a Rust `static`. Rule tables,
     # tuning constants and registries live here, and agents look them up by name ("who reads
-    # TASKS", "where is AUTOPILOT defined") — before this type they had no node at all.
+    # TASKS", "where is RETRY_POLICY defined") — before this type they had no node at all.
     VARIABLE = "variable"
     # A named type that is neither a class, an interface, an enum nor a struct: a TypeScript
-    # `type PassFacts = {...}`, a Go `type Status string`, a Rust or Python type alias.
+    # `type OrderTotals = {...}`, a Go `type Status string`, a Rust or Python type alias.
     TYPE_ALIAS = "type_alias"
 
 
@@ -124,11 +124,11 @@ class Edge(BaseModel):
     # and for upgrading heuristic edges when a semantic pass later covers the file.
     callee_text: str = ""
     # IMPORTS provenance: the statement as written. "Who imports X" is asked in the shape a
-    # refactor needs — which spelling (``'../tasks'`` vs ``'../tasks/read-show'``), which
+    # refactor needs — which spelling (``'../tasks'`` vs ``'../tasks/list-view'``), which
     # names, and whether the import is a lazy ``import()`` chunk or a static dependency of the
     # bundle (field reports, 17.09.2026). An edge that only says "A imports B" collapses all
     # of that, and the agents went back to grep. Empty/False on every other edge type.
-    specifier: str = ""  # the module string as written: "../tasks/read-show", "net/http", "pkg.mod"
+    specifier: str = ""  # the module string as written: "../tasks/list-view", "net/http", "pkg.mod"
     line: int = 0  # 1-based line of the (first) statement
     names: list[str] = Field(default_factory=list)  # imported names; "default", "*" for those forms
     dynamic: bool = False  # only ever reached through import() — a lazy chunk

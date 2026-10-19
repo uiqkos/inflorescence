@@ -78,6 +78,7 @@ small reads under ``.git``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
@@ -272,11 +273,14 @@ def count_live_worktrees(root: Path) -> int:
         return 0
 
 
-# Drift is measured once per (tree, HEAD, index state): re-hashing every indexed file is
-# seconds on a large repository, and nothing about the answer changes until one of the three
-# does. Keyed by the stored checksums' identity too, so a re-index that did not move HEAD
-# (a watcher catching up on uncommitted work) is seen on the next call.
-_drift_cache: dict[tuple[str, str, str, int], tuple[int, list[str], bool]] = {}
+# Drift is measured once per (tree, HEAD, indexed commit, stored checksums): re-hashing every
+# indexed file is seconds on a large repository. The key holds a digest of the stored checksums
+# themselves, so any re-index — including one that did not move HEAD (a watcher catching up on
+# uncommitted work) or that kept the file count — is seen on the next call. Edits on disk that
+# neither move HEAD nor reach the index are not: per-item ``stale`` flags cover those. A partial
+# measurement (time budget hit) is never cached, so the next call continues to try for the
+# exact count.
+_drift_cache: dict[tuple[str, str, str, str], tuple[int, list[str], bool]] = {}
 _DRIFT_CACHE_MAX = 64
 # The re-hash runs on a read tool's path, so it is bounded; a partial count says so.
 DRIFT_TIME_BUDGET_S = 4.0
@@ -307,7 +311,7 @@ def measure_drift(
     current = head_sha(root)
     if not current or current == indexed_head:
         return None
-    key = (str(root), current, indexed_head, len(stored))
+    key = (str(root), current, indexed_head, _checksums_digest(stored))
     cached = _drift_cache.get(key)
     if cached is not None:
         return cached if cached[0] else None
@@ -322,16 +326,33 @@ def measure_drift(
         if checksum is None or checksum.md5 != md5:
             differing.append(rel_path)
     result = (len(differing), differing[:_DRIFT_EXAMPLES], partial)
-    if len(_drift_cache) >= _DRIFT_CACHE_MAX:
-        _drift_cache.clear()
-    _drift_cache[key] = result
-    return result if differing else None
+    if not partial:
+        if len(_drift_cache) >= _DRIFT_CACHE_MAX:
+            _drift_cache.clear()
+        _drift_cache[key] = result
+    return result if differing or partial else None
+
+
+def _checksums_digest(stored: Mapping[str, str]) -> str:
+    """One digest of every (path, checksum) pair the index holds — the index state's identity."""
+    digest = hashlib.sha1(usedforsecurity=False)
+    for rel_path, md5 in sorted(stored.items()):
+        digest.update(f"{rel_path}\0{md5}\n".encode())
+    return digest.hexdigest()
 
 
 def _drift_notice(root: Path, indexed_head: str, drift: tuple[int, list[str], bool]) -> str:
     """Phrase a drift measurement as the warning it is, with the command that clears it."""
     count, examples, partial = drift
     now = head_description(root) or "a different commit"
+    if not count:
+        return (
+            f"the checkout moved on since this index was last brought up to date at "
+            f"{indexed_head[:7]}; HEAD is now {now}, and re-hashing the indexed files did not finish "
+            f"within {DRIFT_TIME_BUDGET_S:g} s, so how many of them differ from the index is unknown. "
+            f"Read files from disk before trusting line numbers, or run index_directory({str(root)!r}) "
+            f"to catch up (preview=true prices it first)"
+        )
     amount = f"at least {count}" if partial else str(count)
     noun = "file differs" if count == 1 else "files differ"
     shown = ", ".join(examples)

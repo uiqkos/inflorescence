@@ -4,7 +4,7 @@ The BM25 indexes behind ``search_text`` tokenize with Tantivy's default tokenize
 at every character that is not a letter or a digit, and each piece is lower-cased. There is no
 stemming, in any language — ``выбрасывания`` and ``выбрасывание`` are two unrelated terms to the
 index, and so are ``run`` and ``running``. A query word that the tokenizer cuts into several
-pieces (``solver_linear``, ``task.start``) is searched as a *phrase*: the pieces must be
+pieces (``parser_strict``, ``task.start``) is searched as a *phrase*: the pieces must be
 adjacent, in order.
 
 Everything here mirrors that behaviour, so that what the tools say about a query — which of
@@ -87,7 +87,7 @@ def fuzzy_distance_for(word: str) -> int:
     Proportional to length, because an edit is a large share of a short word: one edit away
     from a four-letter word is most of the vocabulary, while one or two edits away from a long
     one is almost always an inflection or a typo of *that* word — a Russian case ending
-    (``выбрасывания`` → ``выбрасывание``), a plural (``keepsRoot`` → ``keepsRoots``). Tantivy
+    (``выбрасывания`` → ``выбрасывание``), a plural (``keepsOrder`` → ``keepsOrder``). Tantivy
     caps the distance at 2.
     """
     parts = tokens(word)

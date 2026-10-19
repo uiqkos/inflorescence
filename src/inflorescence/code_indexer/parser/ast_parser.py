@@ -11,6 +11,13 @@ from inflorescence.code_indexer.parser.base_parser import BaseParser
 
 logger = logging.getLogger(__name__)
 
+# ``type X = ...`` is 3.12 syntax: ``ast.TypeAlias`` does not exist on 3.11, where such a file
+# fails ``ast.parse`` anyway, so the statement class is only looked for when it exists.
+_TYPE_ALIAS_STMT: type[ast.stmt] | None = getattr(ast, "TypeAlias", None)
+_DECLARATION_STMTS: tuple[type[ast.stmt], ...] = (
+    (ast.Assign, ast.AnnAssign) if _TYPE_ALIAS_STMT is None else (ast.Assign, ast.AnnAssign, _TYPE_ALIAS_STMT)
+)
+
 
 class PythonAstParser(BaseParser):
     """Parser for Python files using the built-in ast module."""
@@ -81,7 +88,7 @@ def parse_file_with_facts(
     # Walk top-level statements
     body = tree.body
     for position, stmt in enumerate(body):
-        if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.TypeAlias)):
+        if isinstance(stmt, _DECLARATION_STMTS):
             following = body[position + 1] if position + 1 < len(body) else None
             _handle_declaration(stmt, following, mod_id, rel, lines, nodes, edges)
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
@@ -144,7 +151,7 @@ def _handle_declaration(
     A plain or annotated assignment is a VARIABLE; ``type X = ...`` (3.12) and an assignment
     annotated ``TypeAlias`` are a TYPE_ALIAS. Calls in the initializer stay with the module.
     """
-    if isinstance(stmt, ast.TypeAlias):
+    if _TYPE_ALIAS_STMT is not None and isinstance(stmt, _TYPE_ALIAS_STMT):
         names, node_type = _bound_names(stmt.name), NodeType.TYPE_ALIAS
     elif isinstance(stmt, ast.AnnAssign):
         names = _bound_names(stmt.target)

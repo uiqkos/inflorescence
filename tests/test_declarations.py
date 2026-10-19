@@ -1,7 +1,7 @@
 """Top-level constants, variables and type aliases as graph entities.
 
 Field reports kept asking for a rule table, a tuning object or a registry by its name ("who
-reads TASKS", "where is AUTOPILOT defined", `type PassFacts`) and getting nothing: only
+reads TASKS", "where is RETRY_POLICY defined", `type OrderTotals`) and getting nothing: only
 functions, classes and their kin had nodes. These tests pin down the three promises that make
 declarations nodes without making them expensive:
 
@@ -13,6 +13,7 @@ declarations nodes without making them expensive:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -43,11 +44,11 @@ def test_typescript_declarations_carry_their_first_line_and_jsdoc(tmp_path: Path
     (tmp_path / "engine.ts").write_text(
         "import { list } from './bank'\n"
         "/** Search tuning. */\n"
-        "export const AUTOPILOT = {\n"
+        "export const RETRY_POLICY = {\n"
         "  depth: 3,\n"
         "}\n"
         "const helper = (a: number) => a + 1\n"
-        "export type PassFacts = { ok: boolean }\n"
+        "export type OrderTotals = { ok: boolean }\n"
         "let a = 1, b = 2\n"
         "const { p, q } = list\n",
         encoding="utf-8",
@@ -56,17 +57,17 @@ def test_typescript_declarations_carry_their_first_line_and_jsdoc(tmp_path: Path
     nodes, edges = JavaScriptParser().parse_file(tmp_path / "engine.ts", tmp_path)
     named = _by_name(nodes)
 
-    autopilot = named["AUTOPILOT"]
-    assert autopilot.node_type == NodeType.VARIABLE
-    assert (autopilot.line_start, autopilot.line_end) == (3, 5)
-    assert autopilot.signature == "export const AUTOPILOT = {"
-    assert autopilot.docstring == "Search tuning."
-    assert named["PassFacts"].node_type == NodeType.TYPE_ALIAS
+    retry_policy = named["RETRY_POLICY"]
+    assert retry_policy.node_type == NodeType.VARIABLE
+    assert (retry_policy.line_start, retry_policy.line_end) == (3, 5)
+    assert retry_policy.signature == "export const RETRY_POLICY = {"
+    assert retry_policy.docstring == "Search tuning."
+    assert named["OrderTotals"].node_type == NodeType.TYPE_ALIAS
     assert named["helper"].node_type == NodeType.FUNCTION  # an arrow function stays a function
     assert named["a"].signature == "let a = 1" and named["b"].signature == "let b = 2"
     assert "p" not in named and "list" not in named  # a destructuring pattern names no one binding
     contains = {e.target for e in edges if e.edge_type == EdgeType.CONTAINS}
-    assert {"engine.ts::AUTOPILOT", "engine.ts::PassFacts"} <= contains
+    assert {"engine.ts::RETRY_POLICY", "engine.ts::OrderTotals"} <= contains
 
 
 def test_go_values_and_named_types(tmp_path: Path) -> None:
@@ -76,7 +77,7 @@ def test_go_values_and_named_types(tmp_path: Path) -> None:
         "type Status string\n\n"
         "// checkers maps a task type to its checker.\n"
         "var checkers = map[string]int{\n"
-        '\t"solver_linear": 1,\n'
+        '\t"parser_strict": 1,\n'
         "}\n\n"
         "const (\n"
         "\t// MaxRetries bounds retries.\n"
@@ -102,11 +103,10 @@ def test_go_values_and_named_types(tmp_path: Path) -> None:
 def test_python_assignments_type_aliases_and_attribute_docstrings(tmp_path: Path) -> None:
     (tmp_path / "page_health.py").write_text(
         '"""Page health."""\n'
-        "MIN_VISIBLE_TEXT = 400\n"
+        "MIN_BATCH_SIZE = 400\n"
         '"""Below this many visible characters a page is treated as empty."""\n'
         "A, B = 1, 2\n"
         "Json: TypeAlias = dict\n"
-        "type Pair = tuple[int, int]\n"
         "obj.attr = 3\n"
         "foo = None\n"
         "def foo():\n"
@@ -118,16 +118,24 @@ def test_python_assignments_type_aliases_and_attribute_docstrings(tmp_path: Path
     nodes, edges = _definitions_win(nodes, edges)
     named = _by_name(nodes)
 
-    assert named["MIN_VISIBLE_TEXT"].node_type == NodeType.VARIABLE
-    assert named["MIN_VISIBLE_TEXT"].docstring.startswith("Below this many")
+    assert named["MIN_BATCH_SIZE"].node_type == NodeType.VARIABLE
+    assert named["MIN_BATCH_SIZE"].docstring.startswith("Below this many")
     assert {"A", "B"} <= named.keys()
     assert named["Json"].node_type == NodeType.TYPE_ALIAS
-    assert named["Pair"].node_type == NodeType.TYPE_ALIAS
     assert "attr" not in named
     # `foo = None` above `def foo()`: one id, and the definition keeps it.
     assert [n.node_type for n in nodes if n.id == "page_health.py::foo"] == [NodeType.FUNCTION]
     contains = [e for e in edges if e.edge_type == EdgeType.CONTAINS and e.target == "page_health.py::foo"]
     assert len(contains) == 1
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="`type X = ...` is Python 3.12 syntax")
+def test_python_type_statement(tmp_path: Path) -> None:
+    (tmp_path / "pairs.py").write_text("type Pair = tuple[int, int]\n", encoding="utf-8")
+
+    nodes, _ = PythonAstParser().parse_file(tmp_path / "pairs.py", tmp_path)
+
+    assert _by_name(nodes)["Pair"].node_type == NodeType.TYPE_ALIAS
 
 
 def test_rust_const_static_and_type_items(tmp_path: Path) -> None:
@@ -169,20 +177,20 @@ async def test_declarations_are_never_summarized_and_leave_their_module_hash_alo
 
 
 def test_declaration_lines_stay_in_the_module_chunk(tmp_path: Path) -> None:
-    (tmp_path / "autopilot.ts").write_text(
-        "export const AUTOPILOT = {\n  depth: 3,\n  width: 5,\n}\n\nexport function run() {\n  return AUTOPILOT\n}\n",
+    (tmp_path / "retry_policy.ts").write_text(
+        "export const RETRY_POLICY = {\n  depth: 3,\n  width: 5,\n}\n\nexport function run() {\n  return RETRY_POLICY\n}\n",
         encoding="utf-8",
     )
-    nodes, _ = JavaScriptParser().parse_file(tmp_path / "autopilot.ts", tmp_path)
+    nodes, _ = JavaScriptParser().parse_file(tmp_path / "retry_policy.ts", tmp_path)
 
     chunks = Chunker().chunk_repository(tmp_path, nodes)
 
     module_body = [c for c in chunks if c.chunk_kind == "module_body"]
     assert len(module_body) == 1
-    assert module_body[0].node_id == "autopilot.ts"
+    assert module_body[0].node_id == "retry_policy.ts"
     assert "width: 5" in module_body[0].content
     module_context = next(c for c in chunks if c.chunk_kind == "module_context")
-    assert "variable AUTOPILOT lines 1-4" in module_context.content
+    assert "variable RETRY_POLICY lines 1-4" in module_context.content
 
 
 def test_labels_are_derived_for_every_type_and_every_label_is_cleared_on_upsert() -> None:

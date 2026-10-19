@@ -196,6 +196,25 @@ def _keep_all(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     return rows
 
 
+def _take_entities(rows: list[dict[str, object]], needed: int) -> tuple[list[dict[str, object]], bool]:
+    """The best rows of the first *needed* distinct entities, and whether that many were there.
+
+    Rows are best first. Every row of an entity already taken is kept (a function's second
+    matching chunk still says where in it the match is); a row of a new entity is kept only
+    while fewer than *needed* entities have been taken.
+    """
+    taken: set[object] = set()
+    out: list[dict[str, object]] = []
+    for row in rows:
+        key = row.get("id")
+        if key not in taken:
+            if len(taken) >= needed:
+                continue
+            taken.add(key)
+        out.append(row)
+    return out, len(taken) >= needed
+
+
 # ---------------------------------------------------------------------------
 # Vector search: surviving Memgraph's post-deletion index lag
 # ---------------------------------------------------------------------------
@@ -1582,16 +1601,19 @@ class GraphRepository:
         start: int,
         keep: RowFilter,
     ) -> ProjectHits:
-        """Ask a global index for wider and wider windows until this project's rows suffice.
+        """Ask a global index for wider and wider windows until this project's entities suffice.
 
         *run_rows(fetch)* returns this project's rows from a global window of *fetch*
         candidates, best first; *keep* applies whatever else the caller filters on (paths,
         node types, tests) — applied here rather than after, because a filter that removes
         rows is exactly what can leave a page unfilled while matches remain outside the
-        window. The loop stops as soon as one of three things is true:
+        window. *needed* counts distinct entities, not rows: a chunk index returns several
+        rows for one long function, and the caller pages over entities, so a hundred chunks
+        of one file are one result, not a full page (see :func:`_take_entities`). The loop
+        stops as soon as one of three things is true:
 
-        * *needed* rows survived — they are this project's best, since any better one would
-          rank inside the same window;
+        * *needed* entities survived — they are this project's best, since any better one
+          would rank inside the same window;
         * the window came back short of *fetch* (*run_count*), so the index has nothing more
           to offer and a short answer is the whole answer;
         * the window reached :data:`_SEARCH_WINDOW_CEILING` still full — then the answer is
@@ -1602,14 +1624,14 @@ class GraphRepository:
         """
         fetch = max(1, start)
         while True:
-            kept = keep([serialize(r) for r in await run_rows(fetch)])
-            if len(kept) >= needed:
-                return ProjectHits(kept[:needed], complete=True)
+            kept, enough = _take_entities(keep([serialize(r) for r in await run_rows(fetch)]), needed)
+            if enough:
+                return ProjectHits(kept, complete=True)
             if await run_count(fetch) < fetch:
                 return ProjectHits(kept, complete=True)
             if fetch >= _SEARCH_WINDOW_CEILING:
                 logger.info(
-                    "Search window reached its ceiling of %d candidates with %d/%d rows kept",
+                    "Search window reached its ceiling of %d candidates with %d rows of fewer than %d entities",
                     fetch, len(kept), needed,
                 )
                 return ProjectHits(kept, complete=False)

@@ -612,9 +612,9 @@ class Chunker:
         else in the file — imports, module-level constants, the rule table a whole subsystem
         is written as, an exported config object, a struct's fields, an enum's members — was
         in no chunk at all, so no search could find a literal written there: three agents of
-        one field report (11.09.2026) independently failed to find ``Rule("capture.spa_no_xhr",
+        one field report (11.09.2026) independently failed to find ``Rule("cache.stale_no_etag",
         …)`` in a module-level tuple that ``grep`` found instantly, and later reports hit the
-        same wall with ``export const NO_PASS = {…}`` and ``var checkers = map[…]{…}``.
+        same wall with ``export const NO_REFUND = {…}`` and ``var checkers = map[…]{…}``.
 
         Each line of the file goes to the innermost node whose span contains it. Lines owned
         by a function or method are already in that body's chunks; lines owned by a class,

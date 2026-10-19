@@ -27,7 +27,7 @@ _ENUM_TYPES = {"enum_declaration"}
 _IMPORT_TYPES = {"import_statement"}
 _TYPE_ALIAS_TYPES = {"type_alias_declaration"}
 # A declaration's signature is its first source line, cut here — enough to show `export const
-# RULES: Rule[] = [` or `type PassFacts = {`, never a whole object literal.
+# RULES: Rule[] = [` or `type OrderTotals = {`, never a whole object literal.
 _DECLARATION_SIGNATURE_CHARS = 200
 # Top-level node types fully consumed by the structural handlers; anything else is a
 # plain statement whose calls belong to the module node.
@@ -466,7 +466,7 @@ class JavaScriptParser(BaseParser):
         nodes: list[CodeNode],
         edges: list[Edge],
     ) -> None:
-        """`type PassFacts = {...}` / `export type Mode = 'a' | 'b'` -> a TYPE_ALIAS node."""
+        """`type OrderTotals = {...}` / `export type Mode = 'a' | 'b'` -> a TYPE_ALIAS node."""
         name_node = node.child_by_field_name("name")
         if name_node is None:
             return

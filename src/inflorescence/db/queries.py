@@ -435,7 +435,7 @@ RETURN {_NODE_FIELDS}
 
 LIST_ENTITIES = """
 MATCH (n:Code {project: $project})
-WHERE ($node_types IS NULL OR ANY(label IN labels(n) WHERE toLower(label) IN $node_types))
+WHERE ($node_types IS NULL OR n.node_type IN $node_types)
 RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end, n.summary, n.signature
 ORDER BY n.file_path, n.line_start, n.name
 SKIP $offset
@@ -461,7 +461,7 @@ RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.l
 
 GET_ENTITY_STRUCTURE = """
 MATCH (root:Code {{project: $project, id: $root_id}})-[:CONTAINS*1..{depth}]->(n:Code)
-WHERE ($node_types IS NULL OR ANY(label IN labels(n) WHERE toLower(label) IN $node_types))
+WHERE ($node_types IS NULL OR n.node_type IN $node_types)
 RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end, n.summary, n.signature
 ORDER BY n.file_path, n.line_start, n.name
 SKIP $offset
@@ -545,7 +545,7 @@ SEARCH_ENTITIES = """
 MATCH (n:Code {project: $project})
 WHERE
   toLower(n.name) CONTAINS toLower($query)
-  AND ($node_types IS NULL OR ANY(label IN labels(n) WHERE toLower(label) IN $node_types))
+  AND ($node_types IS NULL OR n.node_type IN $node_types)
 RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end, n.summary, n.signature
 ORDER BY
   CASE WHEN n.name = $query THEN 0 WHEN toLower(n.name) = toLower($query) THEN 1 ELSE 2 END,
