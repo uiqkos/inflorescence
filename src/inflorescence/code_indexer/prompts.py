@@ -29,7 +29,10 @@ LEAF_SYSTEM_PROMPT = (
     "4. its return value and the errors it can raise, when non-obvious.\n\n"
     "Plain prose, present tense, lead with the action. Do not begin with \"This function/method\", "
     "\"The purpose\", \"A helper that\", \"Responsible for\", or \"Handles\"; do not repeat the element's "
-    "name or restate the raw signature; no markdown or code fences. Return only the summary."
+    "name or restate the raw signature; no markdown or code fences. Name only libraries, services, "
+    "protocols and types that appear in the code or context you are given: when the implementation is "
+    "not shown (an interface, an abstract method, a declaration), say what it is for, not which "
+    "provider might implement it. Return only the summary."
 )
 
 # A file/module/package/directory, summarized from its children's summaries.
@@ -44,7 +47,8 @@ CONTAINER_SYSTEM_PROMPT = (
     "Uses: <external systems, libraries, packages, datastores, and APIs it depends on>\n"
     "Side effects: <persistent writes, network/AI calls, filesystem, events — or 'none' if pure>\n"
     "Entry points: <the primary public functions/types an agent would call first>\n\n"
-    "Use the real names from the children. Group related children rather than listing every one. "
+    "Use the real names from the children, and name no library, service or protocol that no child "
+    "mentions. Group related children rather than listing every one. "
     "No markdown, no bullets, no preamble, no repetition of the module name. Keep each line tight."
 )
 
