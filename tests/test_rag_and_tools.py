@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -355,6 +356,18 @@ async def test_setup_schema_creates_text_indexes_for_symbols_and_chunk_content()
     text_index_writes = [query for query, _params in conn.writes if "CREATE TEXT INDEX" in query]
     assert any("code_symbols_text ON :Code(name, signature)" in query for query in text_index_writes)
     assert any("chunk_content_text ON :CodeChunk(content)" in query for query in text_index_writes)
+
+
+@pytest.mark.asyncio
+async def test_setup_schema_creates_vector_indexes_at_the_configured_dimension() -> None:
+    """EMBEDDING_DIMENSION used to be documented and ignored: every index was 1536 wide."""
+    conn = RecordingSchemaConnection()
+
+    await setup_schema(conn, dimension=64)
+
+    vector_writes = [query for query, _params in conn.writes if "CREATE VECTOR INDEX" in query]
+    assert vector_writes
+    assert all('"dimension": 64' in query for query in vector_writes)
 
 
 def test_property_indexes_include_node_type() -> None:
@@ -925,6 +938,22 @@ async def test_get_entity_structure_resolves_file_root_and_paginates_children() 
 
 
 @pytest.mark.asyncio
+async def test_get_entity_structure_takes_an_absolute_path_inside_the_project() -> None:
+    class Recording(FakeGraphRepositoryV2):
+        async def get_structure_root(self, project, node_id=None, file_path=None):
+            self.asked = file_path
+            return await super().get_structure_root(project, node_id=node_id, file_path=file_path)
+
+    mcp = FastMCP("test")
+    repo = Recording()
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    await mcp.call_tool("get_entity_structure", {"directory": "/tmp/project", "file_path": "/tmp/project/pkg"})
+
+    assert repo.asked == "pkg"
+
+
+@pytest.mark.asyncio
 async def test_get_entity_structure_returns_structured_not_found_error(tmp_path: Path) -> None:
     """A path that is in neither the index nor the filesystem says so — and says both halves.
 
@@ -1473,6 +1502,163 @@ async def test_repository_get_structure_root_serializes_root_prefixed_record() -
 
 
 @pytest.mark.asyncio
+async def test_repository_structure_root_by_path_accepts_directories() -> None:
+    """A directory path is a structure root too — the natural first step of a top-down walk.
+
+    Field reports (14.09, 15.09): get_entity_structure(file_path="frontend/src/proto/engine")
+    answered "exists on disk but is NOT in this index, run index_directory" over a fully
+    indexed directory, because only modules and documents were looked up by path.
+    """
+    conn = RecordingQueryConnection([])
+    repo = GraphRepository(conn)
+
+    await repo.get_structure_root("project-id", file_path="src/pkg")
+    assert conn.query == queries.GET_STRUCTURE_ROOT_BY_FILE
+    assert "root:Directory" in conn.query
+    assert conn.params == {"project": "project-id", "file_path": "src/pkg"}
+
+    await repo.get_structure_root("project-id", file_path=".")
+    assert conn.query == queries.GET_PROJECT_ROOT
+
+
+@pytest.mark.parametrize(
+    ("typed", "stored"),
+    [
+        ("src/pkg", "src/pkg"), ("src/pkg/", "src/pkg"), ("./src/pkg", "src/pkg"), ("pkg/a.py", "pkg/a.py"),
+        (".", "."), ("./", "."), (" ./ ", "."), ("src\\pkg", "src/pkg"),
+    ],
+)
+def test_structure_paths_are_normalized_once_to_the_stored_form(tmp_path: Path, typed: str, stored: str) -> None:
+    from inflorescence.tools.graph import _tree_path
+
+    assert _tree_path(str(tmp_path), typed) == stored
+
+
+def test_an_absolute_structure_path_inside_the_project_is_relative_and_outside_is_refused(tmp_path: Path) -> None:
+    from inflorescence.tools.graph import _tree_path
+
+    project = tmp_path / "repo"
+    (project / "src").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(project)
+
+    assert _tree_path(str(project), str(project / "src")) == "src"
+    assert _tree_path(str(project), str(project)) == "."
+    assert _tree_path(str(link), str(project / "src")) == "src", "a symlinked project root still matches"
+    assert _tree_path(str(project), str(tmp_path / "elsewhere")) is None
+
+
+class _IndexInfo(dict):
+    def data(self) -> dict[str, object]:
+        return dict(self)
+
+
+class LevelIndexConnection:
+    """A Memgraph stand-in with named vector indexes: SHOW INDEX INFO lists *present* (by label),
+    and each index answers with its own rows."""
+
+    def __init__(self, present_labels: set[str], rows_by_index: dict[str, list[dict[str, object]]]) -> None:
+        self.present_labels = present_labels
+        self.rows_by_index = rows_by_index
+        self.searched: list[str] = []
+
+    async def execute_query(self, query: str, params: dict[str, object] | None = None) -> list[object]:
+        if query.startswith("SHOW INDEX INFO"):
+            return [
+                _IndexInfo({"index type": "label+property_vector", "label": label, "property": "summary_embedding"})
+                for label in sorted(self.present_labels)
+            ]
+        index = re.search(r"vector_search\.search\('([^']+)'", query).group(1)
+        rows = self.rows_by_index.get(index, [])
+        if "AS scanned" in query:
+            return [{"scanned": len(rows)}]
+        self.searched.append(index)
+        return rows
+
+
+def _summary_row(node_id: str, node_type: str, score: float) -> dict[str, object]:
+    return {"id": node_id, "name": node_id, "labels": ["Code", node_type.capitalize()], "file_path": node_id,
+            "line_start": 0, "line_end": 0, "score": score, "summary": ""}
+
+
+@pytest.mark.asyncio
+async def test_summary_search_ranks_directories_in_their_own_index() -> None:
+    """Directories compete with directories, not with every function of every project."""
+    conn = LevelIndexConnection(
+        {"Code", "Directory", "Module"},
+        {"directory_summary_embeddings": [_summary_row("dir:src/a", "directory", 0.4)]},
+    )
+
+    found = await GraphRepository(conn).vector_hits("summary", "project-id", [0.1], 5, node_types=["directory"])
+
+    assert conn.searched == ["directory_summary_embeddings"]
+    assert [row["id"] for row in found.rows] == ["dir:src/a"]
+    assert found.complete and found.fallback_from == ()
+
+
+@pytest.mark.asyncio
+async def test_summary_search_merges_level_indexes_by_score() -> None:
+    conn = LevelIndexConnection({"Directory", "Module"}, {
+        "directory_summary_embeddings": [_summary_row("dir:src", "directory", 0.3)],
+        "module_summary_embeddings": [_summary_row("src/m.py", "module", 0.7)],
+    })
+
+    found = await GraphRepository(conn).vector_hits(
+        "summary", "project-id", [0.1], 5, node_types=["directory", "module"]
+    )
+
+    assert sorted(conn.searched) == ["directory_summary_embeddings", "module_summary_embeddings"]
+    assert [row["id"] for row in found.rows] == ["src/m.py", "dir:src"]
+
+
+@pytest.mark.asyncio
+async def test_summary_search_uses_the_shared_index_for_other_types() -> None:
+    conn = LevelIndexConnection({"Code", "Directory"}, {"summary_embeddings": []})
+
+    found = await GraphRepository(conn).vector_hits(
+        "summary", "project-id", [0.1], 5, node_types=["directory", "function"]
+    )
+
+    assert conn.searched == ["summary_embeddings"]
+    assert found.fallback_from == (), "no narrower index was asked for, so nothing fell back"
+
+
+@pytest.mark.asyncio
+async def test_summary_search_says_so_when_a_level_index_is_missing() -> None:
+    """A database set up before the level indexes existed keeps answering — and says how."""
+    conn = LevelIndexConnection({"Code"}, {"summary_embeddings": [_summary_row("dir:src", "directory", 0.5)]})
+
+    found = await GraphRepository(conn).vector_hits("summary", "project-id", [0.1], 5, node_types=["directory"])
+
+    assert conn.searched == ["summary_embeddings"]
+    assert [row["id"] for row in found.rows] == ["dir:src"]
+    assert found.fallback_from == ("directory_summary_embeddings",)
+
+
+@pytest.mark.asyncio
+async def test_search_semantic_hands_node_types_down_and_reports_a_fallback(tmp_path: Path, monkeypatch) -> None:
+    class FallbackRepository(FakeGraphRepositoryV2):
+        async def vector_hits(self, kind, project, embedding, needed, keep=lambda rows: rows, node_types=None):  # noqa: ANN001, ANN201
+            self.vector_node_types = node_types
+            return ProjectHits([], complete=True, fallback_from=("directory_summary_embeddings",))
+
+    repo = FallbackRepository()
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+    tool = mcp._tool_manager.get_tool("search_semantic")
+    monkeypatch.setattr(_closure_cell_with_attr(tool.fn, "model"), "embed", lambda texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(
+        "search_semantic", {"directory": str(tmp_path), "query": "auth", "node_types": ["directory"]}
+    ))
+
+    assert repo.vector_node_types == ["directory"]
+    assert payload["meta"]["summary_index_fallback"] == {
+        "missing": ["directory_summary_embeddings"], "searched": "summary_embeddings",
+    }
+
+
+@pytest.mark.asyncio
 async def test_repository_get_related_entities_serializes_related_prefixed_record() -> None:
     conn = RecordingQueryConnection([
         {
@@ -1613,7 +1799,8 @@ class StoredChecksums:
     # A fake cannot widen its window, so it reports what the real repository would report at
     # its ceiling: a window that came back full while the filters left the request unfilled is
     # an incomplete answer; anything else is the whole answer.
-    async def vector_hits(self, kind, project, embedding, needed, keep=lambda rows: rows):  # noqa: ANN001, ANN201
+    async def vector_hits(self, kind, project, embedding, needed, keep=lambda rows: rows, node_types=None):  # noqa: ANN001, ANN201
+        self.vector_node_types = node_types
         method = self.search_code_vectors if kind == "code" else self.search_summary_vectors
         raw = [dict(row) for row in await method(project, embedding, needed)]
         kept = keep(raw)
@@ -4127,7 +4314,7 @@ async def test_structure_of_a_directory_path_resolves_to_its_directory_node(tmp_
     class DirectoryRepository(FakeGraphRepositoryV2):
         async def get_structure_root(self, project, node_id=None, file_path=None):
             seen.append({"node_id": node_id, "file_path": file_path})
-            if node_id == "dir:src/lib":
+            if file_path == "src/lib":
                 return entity("dir:src/lib", "lib", "directory", "src/lib", None, None, "Lib.")
             return None
 
@@ -4139,7 +4326,12 @@ async def test_structure_of_a_directory_path_resolves_to_its_directory_node(tmp_
     ))
 
     assert payload["root"]["id"] == "dir:src/lib"
-    assert seen == [{"node_id": None, "file_path": "./src/lib/"}, {"node_id": "dir:src/lib", "file_path": None}]
+    assert seen == [{"node_id": None, "file_path": "src/lib"}], "one lookup, by the normalized path"
+
+    outside = _payload(await mcp.call_tool(
+        "get_entity_structure", {"directory": str(tmp_path / "src"), "file_path": str(tmp_path / "other")}
+    ))
+    assert outside["error"]["code"] == "invalid_argument"
 
     (tmp_path / "empty").mkdir()
     missing = _payload(await mcp.call_tool("get_entity_structure", {"directory": str(tmp_path), "file_path": "empty"}))

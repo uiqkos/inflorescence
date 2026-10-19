@@ -344,6 +344,15 @@ Summaries and their embeddings are English-only, so phrase ``query`` in English 
 another language (e.g. Russian) embeds far from the English summary space and returns an
 irrelevant top result, not an error. For non-English text use ``search_text``.
 
+Coarse-to-fine: ``node_types=["directory"]`` answers "which part of this repository handles X" by
+ranking directory summaries (each describes its whole subtree) against each other only, and
+``node_types=["module"]`` does the same for whole files — both have search indexes of their own,
+so a few hundred directories are not ranked behind thousands of functions. Take the best subtree
+into ``include_paths`` for the precise query, or walk it with
+``get_entity_structure(file_path=<that path>)``. On a database set up before those indexes
+existed, ``meta.summary_index_fallback`` names the missing ones: the shared index answered, so
+the hits are still of the requested types, just found the slow way.
+
 While an index run is in progress, only nodes whose summaries already landed are searchable —
 fewer hits then means "not summarized yet", not "no matches".""",
     doc.SCOPE,
@@ -365,7 +374,10 @@ While an index run is in progress, coverage is partial: summary vectors exist on
 already-summarized nodes, and code-chunk vectors land in the run's final phase.
 
 A hit lists at most 3 chunk ``matches`` — the highest-scoring ones. ``matches_total`` gives the
-real count and is present only when the list was trimmed.""",
+real count and is present only when the list was trimmed.
+
+With ``node_types=["directory"]`` / ``["module"]`` the summary half ranks in those types' own
+indexes, as ``search_semantic`` does; ``meta.summary_index_fallback`` names any that were missing.""",
     doc.SCOPE,
     doc.NODE_TYPES,
     *_SEARCH_COMMON,
@@ -464,6 +476,11 @@ def register_search_tools(
             return not_indexed
         return project, normalized
 
+    def _note_fallback(meta: dict[str, object], found: ProjectHits) -> dict[str, object]:
+        if found.fallback_from:
+            meta["summary_index_fallback"] = {"missing": list(found.fallback_from), "searched": "summary_embeddings"}
+        return meta
+
     def _meta(project: str, query: str, min_score: float, node_types: list[str] | None, filters: PathFilterConfig) -> dict[str, object]:
         return {
             "project": project,
@@ -532,12 +549,13 @@ def register_search_tools(
         filters = PathFilterConfig.from_paths(include_paths, exclude_paths)
         found = await repo.vector_hits(
             "summary", project, embedding, _overfetch(bounded_limit, bounded_offset),
-            _row_filter(filters, types, include_tests),
+            _row_filter(filters, types, include_tests), node_types=types,
         )
         return await _respond(
             _summary_hits(found.rows, min_score),
             directory=directory, project=project, limit=bounded_limit, offset=bounded_offset,
-            meta=_meta(project, query, min_score, types, filters), truncated=not found.complete,
+            meta=_note_fallback(_meta(project, query, min_score, types, filters), found),
+            truncated=not found.complete,
             include_tests=include_tests, weak_threshold=settings.semantic_weak_threshold,
         )
 
@@ -571,7 +589,7 @@ def register_search_tools(
         keep = _row_filter(filters, types, include_tests)
         needed = _overfetch(bounded_limit, bounded_offset)
         code_found = await repo.vector_hits("code", project, code_embedding, needed, keep)
-        summary_found = await repo.vector_hits("summary", project, summary_embedding, needed, keep)
+        summary_found = await repo.vector_hits("summary", project, summary_embedding, needed, keep, node_types=types)
 
         merged: dict[str, Hit] = {}
         for hit in [*_code_hits(code_found.rows, min_score), *_summary_hits(summary_found.rows, min_score)]:
@@ -593,7 +611,7 @@ def register_search_tools(
         return await _respond(
             _cap_matches(hits),
             directory=directory, project=project, limit=bounded_limit, offset=bounded_offset,
-            meta=_meta(project, query, min_score, types, filters),
+            meta=_note_fallback(_meta(project, query, min_score, types, filters), summary_found),
             truncated=not (code_found.complete and summary_found.complete),
             include_tests=include_tests, weak_threshold=settings.semantic_weak_threshold,
         )

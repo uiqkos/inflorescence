@@ -166,6 +166,22 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
             "dynamic/type_only/reexport when true), and a named JS/TS import also points at "
             "the symbol itself, so incoming IMPORTS on a constant answer \"who reads it\" "
             "and \"which imports are lazy import() chunks\" needs no file reading.\n\n"
+            "WHEN YOU DO NOT KNOW WHERE SOMETHING LIVES, WALK DOWN THE SUMMARIES instead of "
+            "searching blind or listing everything. Every directory has an LLM summary of what "
+            "its subtree is for — purpose, capabilities, entry points — written from the "
+            "summaries of what it contains, so a few cheap calls narrow a repository to one "
+            "file: get_entity_structure(directory) shows the root's summary and its top-level "
+            "files and directories; get_entity_structure(directory, file_path=\"src/pkg\") "
+            "does the same one level down (file_path takes a directory as well as a file); "
+            "get_entity_structure(directory, file_path=\"src/pkg/providers/openai.py\") lists "
+            "that file's classes and functions with line ranges and one-line summaries — then "
+            "read only those lines. Each step is one small page, where "
+            "list_entities(node_types=[\"module\"]) over a big package is one page of every "
+            "file at once (a field report measured ~17k tokens for 56 modules). When the tree "
+            "is too wide to read, jump by meaning instead: search_semantic(query, "
+            "node_types=[\"directory\"]) ranks directories against directories (\"which "
+            "part of this repo handles X\"), node_types=[\"module\"] ranks whole files; then "
+            "scope the fine-grained search to that subtree with include_paths=[\"<path>\"].\n\n"
             "A SEARCH IS A FEW CALLS, NOT ONE. A repository holds many copies of the "
             "vocabulary you search for that are not the code you want — tests, mocks and "
             "fixtures, prototypes, sample data, reports, an old copy of a feature, a second app "
@@ -319,7 +335,7 @@ async def startup(
     healthy = await conn.health_check()
     if healthy:
         logger.info("Memgraph connection OK")
-        await setup_schema(conn)
+        await setup_schema(conn, dimension=(settings or Settings()).embedding_dimension)
         if enable_janitor:
             await start_worktree_janitor(conn, repo=repo, settings=settings)
     elif allow_degraded:

@@ -452,10 +452,12 @@ MATCH (root:Code {project: $project, id: $node_id})
 RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary, root.signature
 """
 
-# The node that stands for a whole file: its module, or its document node for a prose file.
+# The node that stands for a whole path: a file's module (or document node for a prose
+# file), or a directory's node — so an agent walking the tree down by path never has to know
+# the `dir:` id convention. A file and a directory never share a path.
 GET_STRUCTURE_ROOT_BY_FILE = """
 MATCH (root:Code {project: $project, file_path: $file_path})
-WHERE root:Module OR root:Document
+WHERE root:Module OR root:Document OR root:Directory
 RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary, root.signature
 """
 
@@ -595,8 +597,10 @@ RETURN
 ORDER BY score DESC
 """
 
-VECTOR_SEARCH_SUMMARY = """
-CALL vector_search.search('summary_embeddings', $fetch, $embedding)
+# `{index}` is summary_embeddings, or one of the label-scoped summary indexes
+# (schema.LEVEL_SUMMARY_INDEXES) when every requested node type has one.
+VECTOR_SEARCH_SUMMARY_TEMPLATE = """
+CALL vector_search.search('{index}', $fetch, $embedding)
 YIELD node, similarity
 WITH node, similarity
 WHERE node.project = $project

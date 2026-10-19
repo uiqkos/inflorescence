@@ -23,6 +23,7 @@ from inflorescence.code_indexer.models import (
 )
 from inflorescence.db import lease, queries
 from inflorescence.db.connection import MemgraphConnection
+from inflorescence.db.schema import LEVEL_SUMMARY_INDEXES, present_vector_indexes
 from inflorescence.rag.chunker import CHUNK_MARKER_SUFFIX
 
 logger = logging.getLogger(__name__)
@@ -190,6 +191,9 @@ class ProjectHits:
 
     rows: list[dict[str, object]]
     complete: bool
+    # Set when a narrower index was asked for but absent and the shared one answered instead:
+    # the indexes that were missing. The rows are still right, only ranked against more.
+    fallback_from: tuple[str, ...] = ()
 
 
 def _keep_all(rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -1648,15 +1652,63 @@ class GraphRepository:
         embedding: list[float],
         needed: int,
         keep: RowFilter = _keep_all,
+        node_types: Sequence[str] | None = None,
     ) -> ProjectHits:
         """This project's nearest *needed* rows by vector similarity (*kind*: code | summary).
 
         Code hits are chunks joined to their owning entity; summary hits are entities. Every
         round is retried through Memgraph's post-deletion vector-index lag (see
         :func:`_vector_search_with_retry`); any other failure propagates untouched.
+
+        A summary search whose *node_types* all have a label-scoped index of their own
+        (``schema.LEVEL_SUMMARY_INDEXES`` — directories, modules) runs in those indexes, so a
+        few hundred directories are ranked against each other instead of behind every function
+        of every project. Each index widens on its own exactly like the shared one, and their
+        rows merge by score. *keep* still applies the type filter, so the answer is the same
+        set either way — only the work to reach it differs. When one of those indexes is
+        absent (a database set up before they existed), the shared index answers and
+        ``fallback_from`` names what was missing.
         """
-        query = queries.VECTOR_SEARCH_CODE if kind == "code" else queries.VECTOR_SEARCH_SUMMARY
-        probe = queries.VECTOR_SEARCH_WINDOW_TEMPLATE.format(index=_VECTOR_INDEXES[kind])
+        level = [LEVEL_SUMMARY_INDEXES.get(t) for t in node_types or ()] if kind == "summary" else []
+        if level and all(level):
+            wanted = sorted({str(index) for index in level})
+            present = await present_vector_indexes(self._conn)
+            missing = tuple(index for index in wanted if index not in present)
+            if not missing:
+                per_index = [
+                    await self._vector_hits_in(index, kind, project, embedding, needed, keep) for index in wanted
+                ]
+                if len(per_index) == 1:
+                    return per_index[0]
+                merged = sorted(
+                    (row for hits in per_index for row in hits.rows),
+                    key=lambda row: float(row.get("score") or 0.0),  # type: ignore[arg-type]
+                    reverse=True,
+                )
+                rows, _ = _take_entities(merged, needed)
+                return ProjectHits(rows, complete=all(hits.complete for hits in per_index))
+            found = await self._vector_hits_in(_VECTOR_INDEXES[kind], kind, project, embedding, needed, keep)
+            logger.warning(
+                "Summary indexes %s are missing — searched the shared summary index instead "
+                "(the server creates them in setup_schema on its next start)", ", ".join(missing),
+            )
+            return ProjectHits(found.rows, found.complete, fallback_from=missing)
+        return await self._vector_hits_in(_VECTOR_INDEXES[kind], kind, project, embedding, needed, keep)
+
+    async def _vector_hits_in(
+        self,
+        index: str,
+        kind: str,
+        project: str,
+        embedding: list[float],
+        needed: int,
+        keep: RowFilter,
+    ) -> ProjectHits:
+        """One vector index, widened until this project's *needed* entities are in the window."""
+        query = (
+            queries.VECTOR_SEARCH_CODE if kind == "code" else queries.VECTOR_SEARCH_SUMMARY_TEMPLATE.format(index=index)
+        )
+        probe = queries.VECTOR_SEARCH_WINDOW_TEMPLATE.format(index=index)
 
         async def run_rows(fetch: int) -> list[Mapping[str, object]]:
             return await _vector_search_with_retry(
@@ -1794,7 +1846,7 @@ class GraphRepository:
         if node_id:
             query = queries.GET_STRUCTURE_ROOT_BY_ID
             params = {"project": project, "node_id": node_id}
-        elif file_path:
+        elif file_path and file_path != ".":
             query = queries.GET_STRUCTURE_ROOT_BY_FILE
             params = {"project": project, "file_path": file_path}
         else:

@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from inflorescence.code_indexer.models import EdgeType, NodeType
 from inflorescence.db.connection import MemgraphConnection
+from inflorescence.db.schema import VECTOR_INDEXES
 from inflorescence.project_manager import ProjectManager
 from inflorescence.tools.responses import clamp_limit, clamp_offset, error_response, paginated_response
 
@@ -379,7 +380,7 @@ def register_cypher_tools(mcp: FastMCP, manager: ProjectManager, conn: MemgraphC
                 "language", "chunk_kind", "embedding", "project",
             ],
             "indexes": {
-                "vector": ["code_embeddings", "summary_embeddings"],
+                "vector": [str(index["name"]) for index in VECTOR_INDEXES],
                 "text": ["summary_text", "code_symbols_text", "chunk_content_text"],
             },
             "query_rules": [

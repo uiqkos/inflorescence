@@ -22,7 +22,7 @@ from inflorescence.cost import (
 from inflorescence.db.connection import MemgraphConnection
 from inflorescence.db.lease import project_lease
 from inflorescence.db.repository import GraphRepository
-from inflorescence.db.schema import missing_search_indexes
+from inflorescence.db.schema import REQUIRED_SEARCH_VECTORS, mismatched_vector_dimensions, missing_search_indexes
 from inflorescence.progress import ProgressReporter
 from inflorescence.rag.indexer import RAGIndexer
 from inflorescence.worktree import head_sha, worktree_main_root
@@ -169,6 +169,18 @@ class ProjectManager:
                 "because embeddings would be paid for but never searchable. Use the Memgraph "
                 "MAGE image, or set REQUIRE_SEARCH_INDEXES=false to index anyway (search stays "
                 "degraded and the missing indexes are logged at ERROR)."
+            )
+        mismatched = await mismatched_vector_dimensions(self._conn, self._settings.embedding_dimension)
+        required = {name for _label, _prop, name in REQUIRED_SEARCH_VECTORS}
+        wrong = {name: width for name, width in mismatched.items() if name in required}
+        if wrong:
+            listed = ", ".join(f"{name} is {width} wide" for name, width in sorted(wrong.items()))
+            raise SearchUnavailableError(
+                f"Vector indexes do not match EMBEDDING_DIMENSION={self._settings.embedding_dimension} "
+                f"({listed}) — refusing to index because every embedding would be paid for and then "
+                "rejected by the index. Set EMBEDDING_DIMENSION to the index width, or drop those "
+                "indexes (the server recreates them at the configured width on its next start) and "
+                "re-index."
             )
 
     async def _persist_scope(

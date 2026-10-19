@@ -454,6 +454,27 @@ async def test_preflight_refuses_to_index_when_vector_search_indexes_are_missing
 
 
 @pytest.mark.asyncio
+async def test_preflight_refuses_to_index_into_vector_indexes_of_another_width(tmp_path: Path) -> None:
+    from inflorescence.db.schema import mismatched_vector_dimensions
+    from inflorescence.project_manager import SearchUnavailableError
+
+    conn = FakeConnNarrowVectorIndexes()
+    assert await mismatched_vector_dimensions(conn, 768) == {}
+    assert await mismatched_vector_dimensions(conn, 1536) == {"code_embeddings": 768, "summary_embeddings": 768}
+
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    manager = ProjectManager(
+        repo=repo, graph_builder=builder, rag_indexer=FakeRAGIndexer(),
+        settings=Settings(_env_file=None, embedding_dimension=1536), conn=conn,
+    )
+
+    with pytest.raises(SearchUnavailableError, match="EMBEDDING_DIMENSION=1536"):
+        await manager.index_directory(str(tmp_path))
+    assert builder.builds == 0, "nothing is paid for before the refusal"
+
+
+@pytest.mark.asyncio
 async def test_preflight_allows_indexing_without_search_when_opted_out(tmp_path: Path) -> None:
     # The gate is overridable for graph-only use on a search-less DB.
     repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
@@ -1834,4 +1855,20 @@ class FakeConnMissingSearchIndexes:
         return [
             _FakeRecord({"index type": "label+property", "label": "Code", "property": ["id"], "name": ""}),
             _FakeRecord({"index type": "label+property", "label": "Code", "property": ["project"], "name": ""}),
+        ]
+
+
+class FakeConnNarrowVectorIndexes(FakeConnMissingSearchIndexes):
+    """Both vector indexes exist, but were created 768 wide — before EMBEDDING_DIMENSION changed."""
+
+    async def execute_query(self, query: str, params: dict[str, object] | None = None) -> list[object]:
+        if "show_index_info" in query:
+            return [
+                {"index_name": "code_embeddings", "label": ":CodeChunk", "property": "embedding", "dimension": 768},
+                {"index_name": "summary_embeddings", "label": ":Code", "property": "summary_embedding",
+                 "dimension": 768},
+            ]
+        return [
+            _FakeRecord({"index type": "label+property_vector", "label": ":CodeChunk", "property": "embedding"}),
+            _FakeRecord({"index type": "label+property_vector", "label": ":Code", "property": "summary_embedding"}),
         ]

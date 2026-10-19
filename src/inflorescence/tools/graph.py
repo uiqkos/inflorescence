@@ -83,12 +83,33 @@ def _describe_candidate(row: dict[str, object]) -> str:
     return f"{row.get('id')} ({row.get('node_type')}, {row.get('file_path')})"
 
 
-def _directory_node_id(file_path: str) -> str:
-    """The id of the directory node for *file_path* (``"src/lib/"`` → ``"dir:src/lib"``)."""
-    path = file_path.replace("\\", "/").strip().strip("/")
+def _relative_inside(path: Path, root: Path) -> str | None:
+    """*path* relative to *root* as typed, else with symlinks resolved; None when outside."""
+    for candidate, base in ((path, root), (path.resolve(), root.resolve())):
+        try:
+            return candidate.relative_to(base).as_posix()
+        except ValueError:
+            continue
+    return None
+
+
+def _tree_path(directory: str, file_path: str) -> str | None:
+    """*file_path* in the form the graph keys files and directories by, or None if outside.
+
+    The graph stores project-relative paths (``src/pkg``, a file's ``src/pkg/a.py``) and the
+    root as ``.``; callers type ``src/pkg/``, ``./src/pkg``, ``./`` or an absolute path inside
+    the project just as often, and each used to miss. An absolute path outside the project is
+    not a place in it, so it is refused rather than looked up as a relative name.
+    """
+    path = file_path.strip().replace("\\", "/")
+    if Path(path).is_absolute():
+        inside = _relative_inside(Path(path), Path(directory))
+        if inside is None:
+            return None
+        path = inside
     while path.startswith("./"):
-        path = path[2:].lstrip("/")
-    return f"dir:{path or '.'}"
+        path = path[2:]
+    return path.strip("/") or "."
 
 
 def _structure_root_missing(directory: str, node_id: str | None, file_path: str | None) -> str:
@@ -98,8 +119,8 @@ def _structure_root_missing(directory: str, node_id: str | None, file_path: str 
     readings of "not found" are worlds apart: a typo'd path, or a real file that was never
     indexed. Answering both with the same three words let an agent conclude a 174-line
     module did not exist (field report, 10.09.2026) — one ``exists()`` call tells them apart.
-    A directory is looked up as its ``dir:`` node before this runs, so a directory that gets
-    here holds no indexed file at all.
+    A directory is looked up by its path like a file, so a directory that gets here holds no
+    indexed file at all.
     """
     if not file_path:
         return (
@@ -270,8 +291,12 @@ LIST_ENTITIES_DESCRIPTION = doc.join(
 
 For inventory and orientation — "what is in this package", "how many classes are under src/" —
 not for finding code by meaning (``search_semantic``) or by name (``search_entities``); this
-returns entities in path order, unranked. Combine ``include_paths``/``exclude_paths`` globs with
-``node_types`` to scope the listing.""",
+returns entities in path order, unranked. It is flat and exhaustive — every module of a big
+package on one page, summaries included, which runs to tens of thousands of tokens — so to *find
+where something lives*, walk the tree with ``get_entity_structure`` instead (one directory level
+per call, each with its subtree summary) and come here for a complete inventory of a subtree you
+have already chosen. Combine ``include_paths``/``exclude_paths`` globs with ``node_types`` to
+scope the listing.""",
     doc.NODE_TYPES,
     doc.LISTING_FLAGS,
     doc.FULL_SUMMARIES,
@@ -281,15 +306,27 @@ returns entities in path order, unranked. Combine ``include_paths``/``exclude_pa
 )
 
 GET_ENTITY_STRUCTURE_DESCRIPTION = doc.join(
-    """Return the CONTAINS hierarchy under a node, a file, a directory, or the project root.
+    """Return the CONTAINS hierarchy under a directory, a file, a node, or the project root.
 
-The outline view: what a directory, file or class contains, one to three levels deep
-(``depth``). Use it after locating something ("show me this module's classes and methods",
-"what is under src/lib/solver"); for the edges *between* entities — callers, callees, imports —
-use ``get_related_entities`` or ``get_entity_context`` instead. Address the root with
-``node_id`` (an id from any tool, e.g. ``"dir:src/lib"``) or ``file_path`` — a file, or a
-directory (resolved to its ``dir:`` node); with neither, the root is the project directory.
-``node_types`` and the path filters apply to the items only, never the root.""",
+The top-down navigator, and the cheapest way to find where something lives. Every directory
+carries a summary of its whole subtree (purpose, capabilities, entry points), so walk down one
+level per call, reading summaries to pick the next branch:
+
+1. ``get_entity_structure(directory)`` — no ``file_path``/``node_id``: the project root's full
+   summary in ``root``, its top-level files and directories in ``items``.
+2. ``get_entity_structure(directory, file_path="src/pkg")`` — a directory: its summary and
+   children.
+3. ``get_entity_structure(directory, file_path="src/pkg/client.py")`` — a file: its classes,
+   functions and methods with line ranges; ``depth=2`` adds methods of classes. Then read just
+   those lines.
+
+``file_path`` is relative to the project root; ``"./src/pkg/"``, ``"."`` (the root) and an
+absolute path inside ``directory`` work too — an absolute path outside it is an
+``invalid_argument`` error. ``node_id`` (an id from any tool, e.g. ``"dir:src/lib"``) addresses
+the root directly. ``depth`` goes up to 3 when you want a bigger slice at once. For the edges
+*between* entities — callers, callees, imports — use ``get_related_entities`` or
+``get_entity_context`` instead. ``node_types`` and the path filters apply to the items only,
+never the root.""",
     doc.NODE_TYPES,
     doc.LISTING_FLAGS,
     doc.FULL_SUMMARIES,
@@ -421,11 +458,16 @@ def register_graph_tools(mcp: FastMCP, manager: ProjectManager, repo: GraphRepos
         project, not_indexed = await ensure_indexed(manager, directory)
         if not_indexed is not None:
             return not_indexed
-        root = await repo.get_structure_root(project, node_id=node_id, file_path=file_path)
-        if root is None and file_path and not node_id:
-            # A directory has no file of its own: its node is ``dir:<path>`` (field report,
-            # 14.09.2026 — the error sent the caller to re-index a directory that was indexed).
-            root = await repo.get_structure_root(project, node_id=_directory_node_id(file_path))
+        tree_path = _tree_path(directory, file_path) if file_path and not node_id else None
+        if file_path and not node_id and tree_path is None:
+            return error_response(
+                "invalid_argument",
+                f"file_path {file_path!r} is an absolute path outside {directory!r}; pass a path "
+                "relative to the project root (or an absolute path inside it).",
+            )
+        # A directory is found by its path like a file (field report, 14.09.2026 — the error
+        # sent the caller to re-index a directory that was indexed).
+        root = await repo.get_structure_root(project, node_id=node_id, file_path=tree_path)
         if root is None:
             return error_response("not_found", _structure_root_missing(directory, node_id, file_path))
         bounded_limit, summary_chars = _page_bounds(limit, full_summaries)

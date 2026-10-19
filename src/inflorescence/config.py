@@ -189,6 +189,7 @@ class Settings(BaseSettings):
 
     # Memgraph
     memgraph_url: str = "bolt://localhost:7687"
+    memgraph_autostart: bool = True
     memgraph_user: str | None = None
     memgraph_password: str | None = None
 
