@@ -584,6 +584,23 @@ def resolve_edges(
             )
         )
 
+    def emit_import(e: Edge, module_id: str) -> None:
+        """A resolved IMPORTS edge, plus one per named JS/TS import that is a node of that module.
+
+        ``import { TASKS } from '../tasks'`` depends on the module *and* reads one symbol of
+        it. The symbol edge is what makes "who reads TASKS" a graph question — incoming
+        IMPORTS on the constant itself — the way Python's ``from m import X`` already
+        resolves to ``X``'s node. ``default`` and ``*`` name no single symbol, so they stay
+        module-level.
+        """
+        resolved.append(e.model_copy(update={"target": module_id}))
+        if _detect_language(e.source.split("::")[0]) not in ("javascript", "typescript"):
+            return
+        for name in e.names:
+            symbol = f"{module_id}::{name}"
+            if name not in ("*", "default") and symbol in node_ids:
+                resolved.append(e.model_copy(update={"target": symbol, "names": [name]}))
+
     for e in edges:
         target = e.target
 
@@ -611,7 +628,7 @@ def resolve_edges(
         # Try module resolution for imports
         if e.edge_type == EdgeType.IMPORTS:
             if target in module_to_id:
-                resolved.append(Edge(source=e.source, target=module_to_id[target], edge_type=e.edge_type))
+                emit_import(e, module_to_id[target])
                 continue
 
             source_file = e.source.split("::")[0]
@@ -627,34 +644,34 @@ def resolve_edges(
                 if resolved_target is None:
                     resolved_target = module_to_id.get(python_target)
                 if resolved_target is not None:
-                    resolved.append(Edge(source=e.source, target=resolved_target, edge_type=e.edge_type))
+                    resolved.append(e.model_copy(update={"target": resolved_target}))
                     continue
 
             # JS relative import resolution
             if lang in ("javascript", "typescript") and target.startswith("."):
                 resolved_target = _try_resolve_js_relative_import(source_file, target, module_to_id)
                 if resolved_target is not None:
-                    resolved.append(Edge(source=e.source, target=resolved_target, edge_type=e.edge_type))
+                    emit_import(e, resolved_target)
                     continue
 
         # Legacy name-based resolution for non-CALLS edges (INHERITS/IMPLEMENTS/…)
         candidates = name_to_ids.get(target, [])
         if len(candidates) == 1:
-            resolved.append(Edge(source=e.source, target=candidates[0], edge_type=e.edge_type))
+            resolved.append(e.model_copy(update={"target": candidates[0]}))
         elif len(candidates) > 1:
             # Prefer node in same file
             source_file = e.source.split("::")[0]
             same_file = [c for c in candidates if c.startswith(source_file)]
             if same_file:
-                resolved.append(Edge(source=e.source, target=same_file[0], edge_type=e.edge_type))
+                resolved.append(e.model_copy(update={"target": same_file[0]}))
             else:
-                resolved.append(Edge(source=e.source, target=candidates[0], edge_type=e.edge_type))
+                resolved.append(e.model_copy(update={"target": candidates[0]}))
         else:
             # Keep unresolved edge as-is (target stays as name string)
             resolved.append(e)
 
     return ResolutionResult(
-        edges=resolved,
+        edges=merge_import_edges(resolved),
         external_calls={
             k: sorted(v)[:_MAX_RECORDED_CALLS] for k, v in external_calls.items()
         },
@@ -662,3 +679,39 @@ def resolve_edges(
             k: sorted(v)[:_MAX_RECORDED_CALLS] for k, v in unresolved_calls.items()
         },
     )
+
+
+def merge_import_edges(edges: list[Edge]) -> list[Edge]:
+    """Fold IMPORTS edges with the same (source, target) into one, keeping every statement's facts.
+
+    The store holds one relationship per (source, TYPE, target), so two statements importing
+    the same module (``import type {A}`` and ``import {B}``, or a static import next to a lazy
+    ``import()``) would otherwise overwrite each other's properties in write order. Merged:
+    ``names`` in first-seen order; ``line``/``specifier`` of the first statement; ``dynamic``
+    and ``type_only`` only when EVERY statement is (one static import makes the dependency
+    static); ``reexport`` when any statement re-exports. Other edge types pass through.
+    """
+    position: dict[tuple[str, str], int] = {}
+    out: list[Edge] = []
+    for edge in edges:
+        if edge.edge_type is not EdgeType.IMPORTS:
+            out.append(edge)
+            continue
+        key = (edge.source, edge.target)
+        at = position.get(key)
+        if at is None:
+            position[key] = len(out)
+            out.append(edge)
+            continue
+        first = out[at]
+        earlier, later = (first, edge) if (first.line or 10**9) <= (edge.line or 10**9) else (edge, first)
+        combined = earlier.model_copy(update={
+            "names": list(dict.fromkeys([*first.names, *edge.names])),
+            "dynamic": first.dynamic and edge.dynamic,
+            "type_only": first.type_only and edge.type_only,
+            "reexport": first.reexport or edge.reexport,
+            "specifier": earlier.specifier or later.specifier,
+            "line": earlier.line or later.line,
+        })
+        out[at] = combined
+    return out

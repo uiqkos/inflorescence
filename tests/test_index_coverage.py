@@ -214,13 +214,13 @@ async def test_an_empty_page_names_the_file_it_could_not_have_found(tmp_path: Pa
     coverage = payload["meta"]["index_coverage"]
     assert coverage["not_indexed"] == ["scripts/wave_queue.py"]
     assert coverage["not_indexed_total"] == 1
-    assert "NOT evidence of absence" in coverage["note"]
+    assert "may be a coverage gap" in coverage["note"]
     assert "index_directory" in coverage["note"]
 
 
 @pytest.mark.asyncio
-async def test_an_empty_page_over_a_complete_index_says_so_positively(tmp_path: Path) -> None:
-    """"Nothing matched" becomes a usable conclusion only once coverage is checked."""
+async def test_an_empty_page_over_a_complete_index_rules_out_a_gap_and_nothing_more(tmp_path: Path) -> None:
+    """It says the files are all indexed — never that what was searched for is absent."""
     _project(tmp_path)
     checker = FreshnessChecker(
         tmp_path, {"scripts/runner.py": "md5", "scripts/wave_queue.py": "md5"}
@@ -230,8 +230,26 @@ async def test_an_empty_page_over_a_complete_index_says_so_positively(tmp_path: 
 
     coverage = payload["meta"]["index_coverage"]
     assert "not_indexed" not in coverage
-    assert "evidence of absence" in coverage["note"]
+    assert "not a coverage gap" in coverage["note"]
+    assert "statement about files" in coverage["note"]
+    assert "evidence of absence" not in coverage["note"]
     assert coverage["files_indexed"] == 2
+
+
+@pytest.mark.asyncio
+async def test_the_note_carries_the_callers_caveat_and_a_truncated_window(tmp_path: Path) -> None:
+    _project(tmp_path)
+    checker = FreshnessChecker(
+        tmp_path, {"scripts/runner.py": "md5", "scripts/wave_queue.py": "md5"}
+    )
+    page = _empty_page()
+    page["page"]["truncated"] = True
+
+    payload = await note_coverage(page, _Manager(), str(tmp_path), checker, caveat="Words match whole.")
+
+    note = payload["meta"]["index_coverage"]["note"]
+    assert "not conclusive" in note
+    assert note.endswith("Words match whole.")
 
 
 @pytest.mark.asyncio
@@ -368,3 +386,16 @@ def test_the_watcher_follows_saves_of_name_routed_documents() -> None:
     assert handler._is_excluded("/repo/deploy/Dockerfile") is False
     assert handler._is_excluded("/repo/app.py") is False
     assert handler._is_excluded("/repo/image.png") is True
+
+
+def test_scan_counts_unadmitted_text_types_and_skips_binaries_by_content(tmp_path: Path) -> None:
+    """A text type no parser admits is named per suffix; a binary is recognised by its bytes."""
+    _project(tmp_path)
+    (tmp_path / "scripts" / "schema.weird").write_text("message Job { string id = 1; }\n", encoding="utf-8")
+    (tmp_path / "scripts" / "other.weird").write_text("message Run {}\n", encoding="utf-8")
+    (tmp_path / "scripts" / "blob.weird2").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00")
+    builder = GraphBuilder(repo=None, llm=None, config=_NO_LLM)
+
+    report = builder.scan_uncovered(tmp_path, ["scripts/runner.py", "scripts/wave_queue.py"])
+
+    assert report["not_admitted"] == {".weird": 2}

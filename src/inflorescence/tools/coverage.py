@@ -17,8 +17,14 @@ it already knows. Both outcomes are worth saying, and both are said here —
 
 * files exist on disk that the index does not hold → the empty page is a coverage gap, and
   the block names the files and how to fix it;
-* nothing is missing under that scope → the empty page is real evidence of absence, which
-  is exactly the conclusion an agent could not safely draw before.
+* files of a type the index does not admit at all sit in those directories → the block
+  counts them per type, because nothing in them was ever searchable either;
+* nothing is missing under that scope → the empty page is not a coverage gap. That is all it
+  licenses: a statement about *files*, not about what the files say. An earlier wording called
+  it "evidence of absence", and an agent quoted it as proof that a phrase was nowhere in the
+  docs — while the phrase sat there in another inflection (field report, 17.09.2026). The
+  query can still miss what is there: a different word form, a guessed name, a candidate
+  window that stopped early — so the note says which of those the calling tool knows about.
 
 The check is deliberately not exhaustive, and says where it stops rather than implying it
 went everywhere: it opens only directories the index already knows (a brand-new *directory*
@@ -57,17 +63,43 @@ def _scope_patterns(meta: Mapping[str, Any]) -> list[str]:
     return []
 
 
-def _note(report: Mapping[str, Any], directory: str) -> str:
-    """One sentence a reader can act on, whichever way the check came out.
+def _plural(count: int, noun: str, plural: str) -> str:
+    return f"1 {noun}" if count == 1 else f"{count} {plural}"
+
+
+def _not_admitted_sentence(report: Mapping[str, Any]) -> str:
+    kinds = report.get("not_admitted")
+    if not isinstance(kinds, Mapping) or not kinds:
+        return ""
+    listed = ", ".join(f"{count} {kind}" for kind, count in list(kinds.items())[:6])
+    more = f" and {len(kinds) - 6} more type(s)" if len(kinds) > 6 else ""
+    return (
+        f" Those directories also hold files of types this index does not admit at all ({listed}"
+        f"{more}): nothing in them is searchable — read them directly, or add the type to "
+        "DOCUMENT_EXTENSIONS / DOCUMENT_FILENAMES and re-index to make it queryable."
+    )
+
+
+def _note(report: Mapping[str, Any], directory: str, *, truncated: bool = False, caveat: str = "") -> str:
+    """One paragraph a reader can act on, whichever way the check came out.
 
     Written as prose rather than as counts because it is read mid-task by something deciding
     what to do next, often without the tool description in context: the conclusion the
-    numbers license has to be *in* the sentence, along with the command that closes the gap.
+    numbers license — and *only* that conclusion — has to be in the text, along with the
+    command that closes the gap.
     """
     missing = int(report.get("not_indexed_total") or 0)
     examples = list(report.get("not_indexed") or [])
     indexed = int(report.get("files_indexed") or 0)
     checked = int(report.get("dirs_checked") or 0)
+    unadmitted = _not_admitted_sentence(report)
+    window = (
+        " The search stopped at its widest candidate window before this project's page filled "
+        "(page.truncated), so the empty page is not conclusive even for indexed files."
+        if truncated
+        else ""
+    )
+    extra = f" {caveat.strip()}" if caveat.strip() else ""
 
     if missing:
         shown = ", ".join(str(path) for path in examples)
@@ -75,31 +107,32 @@ def _note(report: Mapping[str, Any], directory: str) -> str:
         subject = "1 file is" if missing == 1 else f"{missing} files are"
         them = "it" if missing == 1 else "them"
         return (
-            f"An empty result here is NOT evidence of absence: {subject} on disk in the "
-            f"directories checked and absent from this index, so nothing about {them} is "
-            f"searchable — {shown}{more}. Read {them} from the filesystem, and run "
-            f"index_directory({directory!r}) to make {them} queryable."
+            f"This empty result may be a coverage gap: {subject} on disk in the directories "
+            f"checked and absent from this index, so nothing about {them} is searchable — "
+            f"{shown}{more}. Read {them} from the filesystem, and run "
+            f"index_directory({directory!r}) to make {them} queryable.{unadmitted}{window}{extra}"
         )
     tail = (
-        " The check stopped at its bound before covering every directory it knows, so it is "
-        "not exhaustive."
+        " The check stopped at its bound before covering every directory it knows."
         if report.get("capped")
         else ""
     )
-    directories = "1 directory" if checked == 1 else f"{checked} directories"
     return (
-        f"This index holds {indexed} files, and every file in the {directories} checked just "
-        f"now is one of them — so an empty result here is evidence of absence rather than a "
-        f"coverage gap. Files in directories the index has never seen are outside this "
-        f"check.{tail}"
+        f"This index holds {_plural(indexed, 'file', 'files')}, and every admitted file in the "
+        f"{_plural(checked, 'directory', 'directories')} checked just now "
+        f"is one of them — so this empty result is not a coverage gap. That is all it says: it is "
+        f"a statement about files, not about what the files contain. Directories the index has "
+        f"never seen are outside this check.{tail}{unadmitted}{window}{extra}"
     )
 
 
-def _block(report: Mapping[str, Any], directory: str) -> dict[str, Any]:
+def _block(
+    report: Mapping[str, Any], directory: str, *, truncated: bool = False, caveat: str = ""
+) -> dict[str, Any]:
     block: dict[str, Any] = {
         "files_indexed": report.get("files_indexed", 0),
         "dirs_checked": report.get("dirs_checked", 0),
-        "note": _note(report, directory),
+        "note": _note(report, directory, truncated=truncated, caveat=caveat),
     }
     missing = int(report.get("not_indexed_total") or 0)
     if missing:
@@ -108,6 +141,8 @@ def _block(report: Mapping[str, Any], directory: str) -> dict[str, Any]:
         # every empty page.
         block["not_indexed"] = list(report.get("not_indexed") or [])
         block["not_indexed_total"] = missing
+    if report.get("not_admitted"):
+        block["not_admitted"] = dict(report["not_admitted"])
     if report.get("capped"):
         block["partial"] = True
     return block
@@ -119,12 +154,15 @@ async def note_coverage(
     directory: str,
     checker: FreshnessChecker | None = None,
     indexed_paths: Sequence[str] | None = None,
+    caveat: str = "",
 ) -> MutableMapping[str, Any]:
     """Add ``meta.index_coverage`` when *payload* is an empty first page; return it either way.
 
     Pass the ``FreshnessChecker`` the response was stamped with — it already holds the
     project's stored checksums, so the file inventory costs nothing extra — or an explicit
-    *indexed_paths* when there is no checker.
+    *indexed_paths* when there is no checker. *caveat* is the calling tool's own sentence on
+    how its query can miss what is there (``search_text``: whole words, no stemming); it is
+    appended to the note so the one conclusion the block licenses is stated with its limits.
 
     Never raises: this annotates an answer the caller already has, and a failed coverage
     check must not turn a working empty search into an error. It is silently skipped (with a
@@ -146,5 +184,6 @@ async def note_coverage(
     except Exception:  # noqa: BLE001 — an annotation must never break the answer it annotates
         logger.debug("Coverage check failed for %s", directory, exc_info=True)
         return payload
-    meta["index_coverage"] = _block(report, directory)
+    truncated = bool(isinstance(page, Mapping) and page.get("truncated"))
+    meta["index_coverage"] = _block(report, directory, truncated=truncated, caveat=caveat)
     return payload

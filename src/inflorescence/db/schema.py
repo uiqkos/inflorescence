@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 
+from inflorescence.code_indexer.models import NODE_TYPE_LABELS
 from inflorescence.db.connection import MemgraphConnection
 
 logger = logging.getLogger(__name__)
@@ -23,16 +24,8 @@ PROPERTY_INDEXES: list[tuple[str, str]] = [
     ("Code", "project"),
     ("Code", "parent_id"),
     ("Code", "node_type"),
-    ("Directory", "project"),
-    ("Module", "project"),
-    ("Document", "project"),
-    ("Class", "project"),
-    ("Function", "project"),
-    ("Method", "project"),
-    ("Interface", "project"),
-    ("Enum", "project"),
-    ("Struct", "project"),
-    ("Trait", "project"),
+    # One per node-type label, derived from the enum so a new type is indexed like the rest.
+    *((label, "project") for label in NODE_TYPE_LABELS.values()),
     # Without these, MERGE (c:CodeChunk {id: ..., project: ...}) in STORE_CODE_CHUNKS_BATCH
     # scans every chunk in the DB for each row of the batch. A live re-store benchmark of
     # ~8.1k chunks dropped from 109.3s to 47.5s after adding these two indexes.

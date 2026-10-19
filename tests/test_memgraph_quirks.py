@@ -173,6 +173,11 @@ class _FakeConn:
         self.calls = 0
 
     async def execute_query(self, query, params=None, max_records=None):  # noqa: ANN001, ANN202
+        if "AS scanned" in query:
+            # The window probe a short page triggers: this fake's index holds one row, so the
+            # window came back short and the search stops without widening. Not counted —
+            # the tests below are about the retry policy of the search statement itself.
+            return [{"scanned": 1}]
         self.calls += 1
         if self._remaining > 0:
             self._remaining -= 1

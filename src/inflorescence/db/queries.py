@@ -1,7 +1,15 @@
 """Named Cypher query constants for the inflorescence project.
 
-All queries use parameterized placeholders ($project, $node_id, etc.) — no string interpolation.
+All queries use parameterized placeholders ($project, $node_id, etc.) — no string interpolation
+of values. Node *labels* cannot be parameters in Cypher; the few templates that name them take
+them from ``NODE_TYPE_LABELS``, which is derived from the ``NodeType`` enum.
 """
+
+from inflorescence.code_indexer.models import NODE_TYPE_LABELS
+
+# A node's type can change between runs (a const that became a function); its old label must
+# go before the new one is set.
+_REMOVE_TYPE_LABELS = "\n".join(f"REMOVE n:{label}" for label in NODE_TYPE_LABELS.values())
 
 # ---------------------------------------------------------------------------
 # CRUD operations
@@ -10,16 +18,7 @@ All queries use parameterized placeholders ($project, $node_id, etc.) — no str
 UPSERT_NODE_TEMPLATE = """
 MERGE (n:Code {{id: $id, project: $project}})
 WITH n, ($summary = '' AND coalesce(n.summary, '') <> '') AS keep_stored
-REMOVE n:Directory
-REMOVE n:Module
-REMOVE n:Document
-REMOVE n:Class
-REMOVE n:Function
-REMOVE n:Method
-REMOVE n:Interface
-REMOVE n:Enum
-REMOVE n:Struct
-REMOVE n:Trait
+""" + _REMOVE_TYPE_LABELS + """
 SET n:{node_label}
 SET n.node_type = $node_type,
     n.name = $name,
@@ -49,16 +48,7 @@ UPSERT_NODES_BATCH_TEMPLATE = """
 UNWIND $rows AS row
 MERGE (n:Code {{id: row.id, project: $project}})
 WITH n, row, (row.summary = '' AND coalesce(n.summary, '') <> '') AS keep_stored
-REMOVE n:Directory
-REMOVE n:Module
-REMOVE n:Document
-REMOVE n:Class
-REMOVE n:Function
-REMOVE n:Method
-REMOVE n:Interface
-REMOVE n:Enum
-REMOVE n:Struct
-REMOVE n:Trait
+""" + _REMOVE_TYPE_LABELS + """
 SET n:{node_label}
 SET n.node_type = row.node_type,
     n.name = row.name,
@@ -206,6 +196,21 @@ RETURN coalesce(n.watched, false) AS watched,
        d.holder AS daemon_holder, d.expires_at AS daemon_expires_at
 """
 
+# The commit this project's index last matched the disk at — stamped by every run that
+# leaves the index equal to the working tree (a full index, an update, a no-op re-check, a
+# worktree clone after its reconcile). A later answer compares it with the checkout's HEAD:
+# when they differ, a merge or a checkout moved the tree without the index following, and
+# the answer says so instead of describing the old commit in the present tense.
+SET_INDEXED_HEAD = """
+MATCH (n:Code:Directory {id: 'dir:.', project: $project})
+SET n.indexed_head = $head
+"""
+
+GET_INDEXED_HEAD = """
+MATCH (n:Code:Directory {id: 'dir:.', project: $project})
+RETURN n.indexed_head AS head
+"""
+
 SET_PROJECT_WATCHED = """
 MATCH (n:Code:Directory {id: 'dir:.', project: $project})
 SET n.watched = $watched
@@ -350,13 +355,16 @@ RETURN {_NODE_FIELDS}
 # (audit finding 8c). The next healthy run re-summarizes it.
 GET_NODES_MISSING_SUMMARIES = f"""
 MATCH (n:Code {{project: $project}})
-WHERE n.summary IS NULL OR n.summary = '' OR n.summary_input_hash = ''
+WHERE (n.summary IS NULL OR n.summary = '' OR n.summary_input_hash = '')
+  AND NOT n.node_type IN $declaration_types
 OPTIONAL MATCH (n)-[:CONTAINS]->(c:Code {{project: $project}})
+WHERE NOT c.node_type IN $declaration_types
 RETURN {_NODE_FIELDS}, count(c) AS child_count
 """
 
 GET_CHILD_SUMMARY_ROWS = """
 MATCH (p:Code {id: $node_id, project: $project})-[:CONTAINS]->(n:Code {project: $project})
+WHERE NOT n.node_type IN $declaration_types
 RETURN n.id AS id, n.name AS name, n.node_type AS node_type, labels(n) AS labels,
        n.file_path AS file_path, n.line_start AS line_start, n.line_end AS line_end,
        n.signature AS signature, n.summary AS summary
@@ -370,11 +378,16 @@ ORDER BY n.file_path, n.line_start, n.id
 # its chunks are still the old content (audit finding 8b). Either way the next healthy
 # run re-chunks the file. A legacy graph indexed before the marker existed has NULL
 # here and is re-chunked once — cheap: unchanged content reuses stored embeddings (0 API).
+#
+# The marker is the checksum *plus* the chunk-format suffix (rag.chunker.CHUNK_MARKER_SUFFIX),
+# so a chunker change that alters the chunks of unchanged content marks every file stale once
+# and the next run reaches it — the only way a new chunk kind ever reaches a file whose bytes
+# did not move. The size is returned so a cost gate can price the re-chunk before it runs.
 GET_FILES_WITH_STALE_CHUNKS = """
 MATCH (m:Code {project: $project})
 WHERE (m:Module OR m:Document)
   AND m.file_path IS NOT NULL AND m.file_path <> ''
-  AND (m.chunks_checksum IS NULL OR m.chunks_checksum <> m.checksum)
+  AND (m.chunks_checksum IS NULL OR m.chunks_checksum <> m.checksum + $marker_suffix)
 RETURN m.file_path AS file_path
 """
 
@@ -406,7 +419,7 @@ MARK_CHUNKS_COVERED = """
 UNWIND $rows AS row
 MATCH (m:Code {project: $project, file_path: row.file_path})
 WHERE ANY(label IN labels(m) WHERE label IN ['Module', 'Document'])
-SET m.chunks_checksum = row.checksum
+SET m.chunks_checksum = row.checksum + $marker_suffix
 RETURN count(*) AS written
 """
 
@@ -423,7 +436,7 @@ RETURN {_NODE_FIELDS}
 LIST_ENTITIES = """
 MATCH (n:Code {project: $project})
 WHERE ($node_types IS NULL OR ANY(label IN labels(n) WHERE toLower(label) IN $node_types))
-RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end, n.summary
+RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end, n.summary, n.signature
 ORDER BY n.file_path, n.line_start, n.name
 SKIP $offset
 LIMIT $limit
@@ -431,25 +444,25 @@ LIMIT $limit
 
 GET_STRUCTURE_ROOT_BY_ID = """
 MATCH (root:Code {project: $project, id: $node_id})
-RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary
+RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary, root.signature
 """
 
 # The node that stands for a whole file: its module, or its document node for a prose file.
 GET_STRUCTURE_ROOT_BY_FILE = """
 MATCH (root:Code {project: $project, file_path: $file_path})
 WHERE root:Module OR root:Document
-RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary
+RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary, root.signature
 """
 
 GET_PROJECT_ROOT = """
 MATCH (root:Code {project: $project, id: 'dir:.'})
-RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary
+RETURN root.id, root.name, labels(root) AS `root.labels`, root.file_path, root.line_start, root.line_end, root.summary, root.signature
 """
 
 GET_ENTITY_STRUCTURE = """
 MATCH (root:Code {{project: $project, id: $root_id}})-[:CONTAINS*1..{depth}]->(n:Code)
 WHERE ($node_types IS NULL OR ANY(label IN labels(n) WHERE toLower(label) IN $node_types))
-RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end, n.summary
+RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end, n.summary, n.signature
 ORDER BY n.file_path, n.line_start, n.name
 SKIP $offset
 LIMIT $limit
@@ -471,14 +484,14 @@ CALL {
   WITH n
   OPTIONAL MATCH (n)-[:CONTAINS]->(child:Code {project: $project})
   WITH child ORDER BY child.id
-  RETURN collect(DISTINCT CASE WHEN child IS NULL THEN null ELSE {id: child.id, name: child.name, labels: labels(child), file_path: child.file_path, line_start: child.line_start, line_end: child.line_end, summary: child.summary} END)[$offset..$offset + $limit] AS children
+  RETURN collect(DISTINCT CASE WHEN child IS NULL THEN null ELSE {id: child.id, name: child.name, labels: labels(child), file_path: child.file_path, line_start: child.line_start, line_end: child.line_end, summary: child.summary, signature: child.signature} END)[$offset..$offset + $limit] AS children
 }
 CALL {
   WITH n
   OPTIONAL MATCH (source:Code {project: $project})-[incoming]->(n)
     WHERE $relation_types IS NULL OR type(incoming) IN $relation_types
   WITH source, incoming ORDER BY type(incoming), source.id
-  RETURN collect(DISTINCT CASE WHEN source IS NULL THEN null ELSE {relation: type(incoming), entity: {id: source.id, name: source.name, labels: labels(source), file_path: source.file_path, line_start: source.line_start, line_end: source.line_end, summary: source.summary}} END)[$offset..$offset + $limit] AS incoming_rows
+  RETURN collect(DISTINCT CASE WHEN source IS NULL THEN null ELSE {relation: type(incoming), edge: properties(incoming), entity: {id: source.id, name: source.name, labels: labels(source), file_path: source.file_path, line_start: source.line_start, line_end: source.line_end, summary: source.summary, signature: source.signature}} END)[$offset..$offset + $limit] AS incoming_rows
 }
 CALL {
   WITH n
@@ -486,11 +499,11 @@ CALL {
     WHERE (target:Code OR target:External)
       AND ($relation_types IS NULL OR type(outgoing) IN $relation_types)
   WITH target, outgoing ORDER BY type(outgoing), target.id
-  RETURN collect(DISTINCT CASE WHEN target IS NULL THEN null ELSE {relation: type(outgoing), entity: {id: target.id, name: target.name, labels: labels(target), file_path: target.file_path, line_start: target.line_start, line_end: target.line_end, summary: target.summary}} END)[$offset..$offset + $limit] AS outgoing_rows
+  RETURN collect(DISTINCT CASE WHEN target IS NULL THEN null ELSE {relation: type(outgoing), edge: properties(outgoing), entity: {id: target.id, name: target.name, labels: labels(target), file_path: target.file_path, line_start: target.line_start, line_end: target.line_end, summary: target.summary, signature: target.signature}} END)[$offset..$offset + $limit] AS outgoing_rows
 }
 RETURN
-  {id: n.id, name: n.name, labels: labels(n), file_path: n.file_path, line_start: n.line_start, line_end: n.line_end, summary: n.summary} AS entity,
-  CASE WHEN parent IS NULL THEN null ELSE {id: parent.id, name: parent.name, labels: labels(parent), file_path: parent.file_path, line_start: parent.line_start, line_end: parent.line_end, summary: parent.summary} END AS parent,
+  {id: n.id, name: n.name, labels: labels(n), file_path: n.file_path, line_start: n.line_start, line_end: n.line_end, summary: n.summary, signature: n.signature} AS entity,
+  CASE WHEN parent IS NULL THEN null ELSE {id: parent.id, name: parent.name, labels: labels(parent), file_path: parent.file_path, line_start: parent.line_start, line_end: parent.line_end, summary: parent.summary, signature: parent.signature} END AS parent,
   children AS children,
   incoming_rows AS incoming,
   outgoing_rows AS outgoing
@@ -510,19 +523,33 @@ WHERE
 RETURN
   type(r) AS relation,
   CASE WHEN startNode(r).id = $node_id THEN 'outgoing' ELSE 'incoming' END AS direction,
-  related.id, related.name, labels(related) AS `related.labels`, related.file_path, related.line_start, related.line_end, related.summary
+  properties(r) AS edge,
+  related.id, related.name, labels(related) AS `related.labels`, related.file_path, related.line_start, related.line_end, related.summary, related.signature
 ORDER BY related.file_path, related.line_start, related.name
 SKIP $offset
 LIMIT $limit
 """
 
+# Every entity with a line span in the given files — how find_text names the entity that owns a
+# matching line (the innermost span holding it) without a round trip per hit.
+GET_FILE_ENTITIES = """
+MATCH (n:Code {project: $project})
+WHERE n.file_path IN $file_paths AND n.line_start IS NOT NULL AND NOT n:Directory
+RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end
+"""
+
+# Names spelled exactly as asked come first (exact case, then ignoring case), every other
+# substring match after them in path order. The tool's name resolution relies on this: its
+# candidate scan is bounded, and an exact `TASKS` must not sort behind fifty `readTasks`.
 SEARCH_ENTITIES = """
 MATCH (n:Code {project: $project})
 WHERE
   toLower(n.name) CONTAINS toLower($query)
   AND ($node_types IS NULL OR ANY(label IN labels(n) WHERE toLower(label) IN $node_types))
-RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end, n.summary
-ORDER BY n.file_path, n.line_start, n.name
+RETURN n.id, n.name, labels(n) AS `n.labels`, n.file_path, n.line_start, n.line_end, n.summary, n.signature
+ORDER BY
+  CASE WHEN n.name = $query THEN 0 WHEN toLower(n.name) = toLower($query) THEN 1 ELSE 2 END,
+  n.file_path, n.line_start, n.name
 SKIP $offset
 LIMIT $limit
 """
@@ -531,8 +558,17 @@ LIMIT $limit
 # Vector / FTS search
 # ---------------------------------------------------------------------------
 
+# Memgraph's search procedures read GLOBAL indexes — one per property across every project in
+# the database — and have no project-filtered variant. Each statement below therefore asks for
+# a global window of `$fetch` candidates and keeps this project's rows; the repository widens
+# that window until the project's own top rows are provably inside it (see
+# GraphRepository._widening_search). A fixed window used to decide the answer silently: the
+# text procedures stop at 1000 rows by default, so a common word matched 1000 chunks of
+# *other* projects and this one got nothing, and a vector window of 256 held 32 of the
+# project's rows once its worktree clones had filled the rest (measured, 25.09.2026).
+
 VECTOR_SEARCH_CODE = """
-CALL vector_search.search('code_embeddings', $top_k, $embedding)
+CALL vector_search.search('code_embeddings', $fetch, $embedding)
 YIELD node, similarity
 WITH node, similarity
 WHERE node.project = $project
@@ -545,51 +581,65 @@ RETURN
   code.line_start AS line_start,
   code.line_end AS line_end,
   code.summary AS summary,
+  code.signature AS signature,
   node.id AS chunk_id,
   node.chunk_kind AS chunk_kind,
   node.start_line AS match_start_line,
   node.end_line AS match_end_line,
   similarity AS score
+ORDER BY score DESC
 """
 
 VECTOR_SEARCH_SUMMARY = """
-CALL vector_search.search('summary_embeddings', $top_k, $embedding)
+CALL vector_search.search('summary_embeddings', $fetch, $embedding)
 YIELD node, similarity
 WITH node, similarity
 WHERE node.project = $project
 RETURN node.id AS id, node.name AS name, labels(node) AS labels,
        node.file_path AS file_path, node.line_start AS line_start,
-       node.line_end AS line_end, similarity AS score, node.summary AS summary
+       node.line_end AS line_end, similarity AS score, node.summary AS summary, node.signature AS signature
+ORDER BY score DESC
 """
 
-# BM25 full-text search (Tantivy indexes via MAGE text_search). Scores are
-# unbounded positive relevance values, so we ORDER BY score DESC and cap in Cypher.
+# How many candidates the global window actually held. Asked only when the project's rows
+# did not fill the page: a window that came back short of `$fetch` has nothing further to
+# give, so widening it cannot find more — which is what makes an unfilled page honest.
+VECTOR_SEARCH_WINDOW_TEMPLATE = """
+CALL vector_search.search('{index}', $fetch, $embedding)
+YIELD node
+RETURN count(node) AS scanned
+"""
+
+# BM25 full-text search (Tantivy indexes via MAGE text_search). Scores are unbounded positive
+# relevance values. `{limit: $fetch}` is not an optimisation: without it the procedure stops
+# at 1000 rows across ALL projects, before the project filter below ever runs.
 TEXT_SEARCH_SUMMARY = """
-CALL text_search.search_all('summary_text', $query)
+CALL text_search.search_all('summary_text', $query, {limit: $fetch})
 YIELD node, score
 WITH node, score
 WHERE node.project = $project
 RETURN node.id AS id, node.name AS name, labels(node) AS labels,
        node.file_path AS file_path, node.line_start AS line_start,
-       node.line_end AS line_end, node.summary AS summary, score AS score
+       node.line_end AS line_end, node.summary AS summary, node.signature AS signature, score AS score
 ORDER BY score DESC
-LIMIT $top_k
 """
 
 TEXT_SEARCH_SYMBOL = """
-CALL text_search.search_all('code_symbols_text', $query)
+CALL text_search.search_all('code_symbols_text', $query, {limit: $fetch})
 YIELD node, score
 WITH node, score
 WHERE node.project = $project
 RETURN node.id AS id, node.name AS name, labels(node) AS labels,
        node.file_path AS file_path, node.line_start AS line_start,
-       node.line_end AS line_end, node.summary AS summary, score AS score
+       node.line_end AS line_end, node.summary AS summary, node.signature AS signature, score AS score
 ORDER BY score DESC
-LIMIT $top_k
 """
 
+# The chunk's own text rides along so the tool can point at the matching *lines* inside a
+# window instead of only its span — an 80-line window around a one-line rule is otherwise a
+# second round trip to grep.
 TEXT_SEARCH_CODE = """
-CALL text_search.search_all('chunk_content_text', $query)
+CALL text_search.search_all('chunk_content_text', $query, {limit: $fetch})
 YIELD node, score
 WITH node, score
 WHERE node.project = $project
@@ -602,13 +652,48 @@ RETURN
   code.line_start AS line_start,
   code.line_end AS line_end,
   code.summary AS summary,
+  code.signature AS signature,
   node.id AS chunk_id,
   node.chunk_kind AS chunk_kind,
   node.start_line AS match_start_line,
   node.end_line AS match_end_line,
+  node.content AS chunk_content,
   score AS score
 ORDER BY score DESC
-LIMIT $top_k
+"""
+
+# Typo-tolerant variant for a word that matched nothing as typed: Tantivy's Levenshtein
+# automaton over the index's own terms, so "выбрасывания" reaches "выбрасывание" (one edit)
+# without this code knowing which language either word is in. Same window discipline as
+# above. Scores come from the fuzzy query and are not comparable to exact BM25 scores.
+TEXT_SEARCH_CODE_FUZZY = """
+CALL text_search.search_all('chunk_content_text', $query, {limit: $fetch, fuzzy_distance: $distance})
+YIELD node, score
+WITH node, score
+WHERE node.project = $project
+MATCH (code:Code {id: node.node_id, project: $project})
+RETURN
+  code.id AS id,
+  code.name AS name,
+  labels(code) AS labels,
+  code.file_path AS file_path,
+  code.line_start AS line_start,
+  code.line_end AS line_end,
+  code.summary AS summary,
+  code.signature AS signature,
+  node.id AS chunk_id,
+  node.chunk_kind AS chunk_kind,
+  node.start_line AS match_start_line,
+  node.end_line AS match_end_line,
+  node.content AS chunk_content,
+  score AS score
+ORDER BY score DESC
+"""
+
+TEXT_SEARCH_WINDOW_TEMPLATE = """
+CALL text_search.search_all('{index}', $query, {{limit: $fetch{extra}}})
+YIELD node
+RETURN count(node) AS scanned
 """
 
 STORE_CODE_CHUNK = """
@@ -860,7 +945,8 @@ SET n.root_path = null,
     n.index_exclude = null,
     n.worktree_of = null,
     n.worktree_main_root = null,
-    n.watched = null
+    n.watched = null,
+    n.indexed_head = null
 """
 
 # Verification. Counted independently of the writes, per label and per relationship type, on
@@ -941,6 +1027,15 @@ GET_CODE_EDGES = """
 MATCH (s:Code {project: $project})-[r]->(t {project: $project})
 WHERE t:Code OR t:External
 RETURN s.id AS source, type(r) AS type, t.id AS target
+"""
+
+# What each stored IMPORTS edge carries (see Edge.import_fingerprint). The incremental store
+# skips re-MERGEing an edge whose key already exists; for IMPORTS that is only a no-op when the
+# properties match too — otherwise an index built before the properties existed would never
+# get them for files that do not change.
+GET_IMPORT_FINGERPRINTS = """
+MATCH (s:Code {project: $project})-[r:IMPORTS]->(t {project: $project})
+RETURN s.id AS source, t.id AS target, r.fingerprint AS fingerprint
 """
 
 DELETE_NODES_BY_IDS = """

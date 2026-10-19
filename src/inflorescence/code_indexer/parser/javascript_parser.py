@@ -25,10 +25,14 @@ _METHOD_TYPES = {"method_definition"}
 _INTERFACE_TYPES = {"interface_declaration"}
 _ENUM_TYPES = {"enum_declaration"}
 _IMPORT_TYPES = {"import_statement"}
+_TYPE_ALIAS_TYPES = {"type_alias_declaration"}
+# A declaration's signature is its first source line, cut here — enough to show `export const
+# RULES: Rule[] = [` or `type PassFacts = {`, never a whole object literal.
+_DECLARATION_SIGNATURE_CHARS = 200
 # Top-level node types fully consumed by the structural handlers; anything else is a
 # plain statement whose calls belong to the module node.
 _HANDLED_TOP_LEVEL = (
-    _CLASS_TYPES | _FUNCTION_TYPES | _INTERFACE_TYPES | _ENUM_TYPES | _IMPORT_TYPES
+    _CLASS_TYPES | _FUNCTION_TYPES | _INTERFACE_TYPES | _ENUM_TYPES | _IMPORT_TYPES | _TYPE_ALIAS_TYPES
     | {"lexical_declaration", "variable_declaration", "export_statement", "export_default_declaration", "comment"}
 )
 
@@ -48,6 +52,38 @@ def _find_children_by_type(node: TSNode, *types: str) -> list[TSNode]:
     return [c for c in node.children if c.type in types]
 
 
+def _import_edge(
+    mod_id: str,
+    module: str,
+    statement: TSNode,
+    names: list[str],
+    *,
+    type_only: bool = False,
+    reexport: bool = False,
+    dynamic: bool = False,
+) -> Edge:
+    """An IMPORTS edge carrying the statement as written (see ``Edge.specifier``)."""
+    return Edge(
+        source=mod_id,
+        target=module,
+        edge_type=EdgeType.IMPORTS,
+        specifier=module,
+        line=statement.start_point[0] + 1,
+        names=names,
+        type_only=type_only,
+        reexport=reexport,
+        dynamic=dynamic,
+    )
+
+
+def _first_line(text: str) -> str:
+    stripped = text.strip()
+    line = stripped.splitlines()[0].rstrip() if stripped else ""
+    if len(line) > _DECLARATION_SIGNATURE_CHARS:
+        return line[: _DECLARATION_SIGNATURE_CHARS - 1] + "…"
+    return line
+
+
 def _get_jsdoc(node: TSNode, source_bytes: bytes) -> str:
     """Extract JSDoc comment preceding a node."""
     prev = node.prev_named_sibling
@@ -58,8 +94,10 @@ def _get_jsdoc(node: TSNode, source_bytes: bytes) -> str:
             lines = text.split("\n")
             cleaned: list[str] = []
             for line in lines:
-                line = line.strip()
-                if line in ("/**", "*/"):
+                # removeprefix/removesuffix also cover the one-line form `/** Tuning. */`,
+                # which used to keep its delimiters.
+                line = line.strip().removeprefix("/**").removesuffix("*/").strip()
+                if not line:
                     continue
                 line = line.lstrip("* ").rstrip()
                 if line:
@@ -204,6 +242,7 @@ class JavaScriptParser(BaseParser):
         )
 
         self._walk_top_level(tree.root_node, mod_id, rel, source_bytes, nodes, edges, facts)
+        self._dynamic_imports(tree.root_node, mod_id, source_bytes, edges)
         return nodes, edges, facts
 
     def _walk_top_level(
@@ -230,6 +269,8 @@ class JavaScriptParser(BaseParser):
                     "interface_declaration",
                     "enum_declaration",
                     "lexical_declaration",
+                    "variable_declaration",
+                    "type_alias_declaration",
                 )
                 actual = decl or child
 
@@ -243,9 +284,13 @@ class JavaScriptParser(BaseParser):
                 self._handle_enum(actual, mod_id, rel, source_bytes, nodes, edges)
             elif actual.type in ("lexical_declaration", "variable_declaration"):
                 # const Foo = () => {}, const utils = require('./utils'), var x = f()
-                self._handle_var_decl(actual, mod_id, rel, source_bytes, nodes, edges, facts)
+                self._handle_var_decl(actual, mod_id, rel, source_bytes, nodes, edges, facts, outer=child)
+            elif actual.type in _TYPE_ALIAS_TYPES:
+                self._handle_type_alias(actual, child, mod_id, rel, source_bytes, nodes, edges)
             elif child.type in _IMPORT_TYPES:
                 self._handle_import(child, mod_id, source_bytes, edges, facts)
+            elif child.type == "export_statement" and actual is child:
+                self._handle_reexport(child, mod_id, source_bytes, edges)
 
             if child.type not in _HANDLED_TOP_LEVEL and actual is child:
                 # Plain top-level statement (expression, if, for, describe(...) blocks in
@@ -411,6 +456,39 @@ class JavaScriptParser(BaseParser):
         facts.local_names[func_id] = _collect_local_names(node, source_bytes)
         self._extract_calls(node, func_id, source_bytes, edges)
 
+    def _handle_type_alias(
+        self,
+        node: TSNode,
+        outer: TSNode,
+        mod_id: str,
+        rel: str,
+        source_bytes: bytes,
+        nodes: list[CodeNode],
+        edges: list[Edge],
+    ) -> None:
+        """`type PassFacts = {...}` / `export type Mode = 'a' | 'b'` -> a TYPE_ALIAS node."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+        name = _node_text(name_node, source_bytes)
+        alias_id = f"{rel}::{name}"
+        if any(existing.id == alias_id for existing in nodes):
+            return
+        nodes.append(
+            CodeNode(
+                id=alias_id,
+                name=name,
+                node_type=NodeType.TYPE_ALIAS,
+                file_path=rel,
+                line_start=outer.start_point[0] + 1,
+                line_end=outer.end_point[0] + 1,
+                signature=_first_line(_node_text(outer, source_bytes)),
+                docstring=_get_jsdoc(outer, source_bytes),
+                parent_id=mod_id,
+            )
+        )
+        edges.append(Edge(source=mod_id, target=alias_id, edge_type=EdgeType.CONTAINS))
+
     def _handle_interface(
         self,
         node: TSNode,
@@ -484,10 +562,21 @@ class JavaScriptParser(BaseParser):
         nodes: list[CodeNode],
         edges: list[Edge],
         facts: FileFacts,
+        outer: TSNode | None = None,
     ) -> None:
-        """Handle `const foo = () => {}`, `const utils = require('./utils')` and friends."""
+        """Handle `const foo = () => {}`, `const utils = require('./utils')` and friends.
+
+        Any other top-level binding (`export const RULES = [...]`, `let cache = new Map()`)
+        becomes a VARIABLE node: its first line as signature, a preceding JSDoc as docstring.
+        *outer* is the statement as written — the `export` wrapper when there is one — so the
+        span and the signature include the `export` keyword.
+        """
+        outer = outer or node
+        declarators = _find_children_by_type(node, "variable_declarator")
+        keyword = node.children[0].type if node.children else "const"
+        exported = "export " if outer is not node else ""
         handled_declarators = 0
-        for decl in _find_children_by_type(node, "variable_declarator"):
+        for decl in declarators:
             name_node = _find_child_by_type(decl, "identifier")
             value_node = _find_child_by_type(decl, "arrow_function", "function_expression", "function")
             if name_node and value_node:
@@ -519,6 +608,30 @@ class JavaScriptParser(BaseParser):
 
             if self._record_require(decl, mod_id, source_bytes, edges, facts):
                 handled_declarators += 1
+                continue
+
+            binding = decl.child_by_field_name("name")
+            if binding is None or binding.type != "identifier":
+                continue  # a destructuring pattern binds several names; none is "the" name
+            name = _node_text(binding, source_bytes)
+            var_id = f"{rel}::{name}"
+            if any(existing.id == var_id for existing in nodes):
+                continue  # `const X` next to `type X` (TypeScript declaration merging): keep the first
+            span = outer if len(declarators) == 1 else decl
+            nodes.append(
+                CodeNode(
+                    id=var_id,
+                    name=name,
+                    node_type=NodeType.VARIABLE,
+                    file_path=rel,
+                    line_start=span.start_point[0] + 1,
+                    line_end=span.end_point[0] + 1,
+                    signature=f"{exported}{keyword} {_first_line(_node_text(decl, source_bytes))}",
+                    docstring=_get_jsdoc(outer, source_bytes),
+                    parent_id=mod_id,
+                )
+            )
+            edges.append(Edge(source=mod_id, target=var_id, edge_type=EdgeType.CONTAINS))
 
         if handled_declarators == 0:
             # Initializers with plain calls (`const store = createStore()`) belong to the
@@ -540,8 +653,17 @@ class JavaScriptParser(BaseParser):
         if s is None:
             return False
         module = _node_text(s, source_bytes).strip("'\"")
-        edges.append(Edge(source=mod_id, target=module, edge_type=EdgeType.IMPORTS))
         name_node = _find_child_by_type(decl, "identifier", "object_pattern")
+        names: list[str] = []
+        if name_node is not None and name_node.type == "object_pattern":
+            for pair in name_node.children:
+                if pair.type == "shorthand_property_identifier_pattern":
+                    names.append(_node_text(pair, source_bytes))
+                elif pair.type == "pair_pattern" and pair.children:
+                    names.append(_node_text(pair.children[0], source_bytes))
+        elif name_node is not None:
+            names.append("*")
+        edges.append(_import_edge(mod_id, module, call, names))
         if name_node is None:
             return True
         if name_node.type == "identifier":
@@ -564,8 +686,32 @@ class JavaScriptParser(BaseParser):
         if not source_node:
             return
         module = _node_text(source_node, source_bytes).strip("'\"")
-        edges.append(Edge(source=mod_id, target=module, edge_type=EdgeType.IMPORTS))
         clause = _find_child_by_type(node, "import_clause")
+        # `import type {…}` marks the whole statement; `import {type A, B}` marks specifiers.
+        # A mixed statement becomes two edges — one type-only, one not — so a symbol-level
+        # edge built from either (resolver) carries the right flag for its own name.
+        whole_type_only = _find_child_by_type(node, "type") is not None
+        value_names: list[str] = []
+        type_names: list[str] = []
+        for c in clause.children if clause is not None else ():
+            if c.type == "identifier":
+                value_names.append("default")
+            elif c.type == "namespace_import":
+                value_names.append("*")
+            elif c.type == "named_imports":
+                for spec in _find_children_by_type(c, "import_specifier"):
+                    idents = [x for x in spec.children if x.type == "identifier"]
+                    if not idents:
+                        continue
+                    exported = _node_text(idents[0], source_bytes)
+                    spec_type_only = _find_child_by_type(spec, "type") is not None
+                    (type_names if spec_type_only else value_names).append(exported)
+        if whole_type_only:
+            type_names, value_names = type_names + value_names, []
+        if value_names or not type_names:  # a bare `import './styles.css'` is a value import too
+            edges.append(_import_edge(mod_id, module, node, value_names))
+        if type_names:
+            edges.append(_import_edge(mod_id, module, node, type_names, type_only=True))
         if clause is None:
             return
         for c in clause.children:
@@ -585,6 +731,46 @@ class JavaScriptParser(BaseParser):
                         orig = _node_text(idents[0], source_bytes)
                         local = _node_text(idents[-1], source_bytes)
                         facts.imports[local] = f"{module}:{orig}"
+
+    def _handle_reexport(self, node: TSNode, mod_id: str, source_bytes: bytes, edges: list[Edge]) -> None:
+        """`export {a, b as c} from 'm'`, `export * from 'm'`, `export * as ns from 'm'`.
+
+        A barrel file is a dependency like any import — a bundle that loads it loads what it
+        re-exports — and used to produce no edge at all.
+        """
+        source_node = _find_child_by_type(node, "string")
+        if source_node is None:
+            return  # `export { a, b }` of local names: not a module dependency
+        module = _node_text(source_node, source_bytes).strip("'\"")
+        names: list[str] = []
+        clause = _find_child_by_type(node, "export_clause")
+        if clause is not None:
+            for spec in _find_children_by_type(clause, "export_specifier"):
+                idents = [x for x in spec.children if x.type == "identifier"]
+                if idents:
+                    names.append(_node_text(idents[0], source_bytes))
+        else:
+            names.append("*")
+        type_only = _find_child_by_type(node, "type") is not None
+        edges.append(_import_edge(mod_id, module, node, names, type_only=type_only, reexport=True))
+
+    def _dynamic_imports(self, root: TSNode, mod_id: str, source_bytes: bytes, edges: list[Edge]) -> None:
+        """`import('./BoardHost')` anywhere in the file, as a dynamic IMPORTS edge of the module.
+
+        A lazy import is a different dependency from a static one — the code lands in its own
+        chunk — and "does the production bundle statically reach X" turns on exactly that
+        difference. Only string-literal specifiers: a computed one names no module.
+        """
+        stack = [root]
+        while stack:
+            current = stack.pop()
+            if current.type == "call_expression" and current.children and current.children[0].type == "import":
+                args = _find_child_by_type(current, "arguments")
+                literal = _find_child_by_type(args, "string") if args is not None else None
+                if literal is not None:
+                    module = _node_text(literal, source_bytes).strip("'\"")
+                    edges.append(_import_edge(mod_id, module, current, [], dynamic=True))
+            stack.extend(reversed(current.children))
 
     def _extract_calls(
         self, node: TSNode, caller_id: str, source_bytes: bytes, edges: list[Edge]

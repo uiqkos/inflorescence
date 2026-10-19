@@ -58,6 +58,12 @@ tree — a submodule, a vendored repository — ``meta.nested_checkouts`` names 
 HEAD (:func:`describe_nested_checkouts`), because the outer branch says nothing about code
 that is on a different one.
 
+One more line covers what the page-sized check cannot: ``drift``. An index records the commit
+it last matched the disk at (``indexed_head``). When the checkout's HEAD is a different commit
+— a merge, a rebase, a checkout the index did not follow — every indexed file is re-hashed once
+(bounded, cached per commit pair) and the block says how many differ, because a merge rewrites
+files an answer never returns, and "this page is fresh" then says nothing about the rest.
+
 What this module cannot see is a file that was never indexed: with no node there is no
 checksum, so ``checked``/``stale``/``missing`` are all silent about it and a clean block over
 a missing file reads as a clean bill of health. That gap is answered separately, on empty
@@ -71,13 +77,15 @@ small reads under ``.git``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterable, Mapping, MutableMapping
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from inflorescence.code_indexer.models import FileChecksum, NodeType
-from inflorescence.worktree import head_description, registered_worktree_paths, worktree_main_root
+from inflorescence.worktree import head_description, head_sha, registered_worktree_paths, worktree_main_root
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +272,79 @@ def count_live_worktrees(root: Path) -> int:
         return 0
 
 
+# Drift is measured once per (tree, HEAD, index state): re-hashing every indexed file is
+# seconds on a large repository, and nothing about the answer changes until one of the three
+# does. Keyed by the stored checksums' identity too, so a re-index that did not move HEAD
+# (a watcher catching up on uncommitted work) is seen on the next call.
+_drift_cache: dict[tuple[str, str, str, int], tuple[int, list[str], bool]] = {}
+_DRIFT_CACHE_MAX = 64
+# The re-hash runs on a read tool's path, so it is bounded; a partial count says so.
+DRIFT_TIME_BUDGET_S = 4.0
+_DRIFT_EXAMPLES = 5
+
+
+def measure_drift(
+    root: Path, stored: Mapping[str, str], indexed_head: str | None
+) -> tuple[int, list[str], bool] | None:
+    """How far the index is behind a checkout whose HEAD moved since it was last brought up to date.
+
+    Returns ``(differing_files, examples, partial)``, or ``None`` when there is nothing to say:
+    no recorded commit (an index from before this was stamped), no readable HEAD, the same
+    commit — or a moved HEAD over which every indexed file still hashes equal (a commit of
+    work the watcher had already indexed).
+
+    Why it exists: the per-page freshness flags only ever look at the handful of files an
+    answer returns, and a merge rewrites files the answer never touched. Field reports
+    (15-16.09.2026): a worktree absorbed four merges touching ~40 files, and every answer
+    afterwards said ``stale: []`` about the four files it happened to return while the index
+    described the pre-merge tree; another answered a review question from files the branch
+    had rewritten, with ``answered_from`` naming the branch. HEAD moving is the cheap trigger;
+    the re-hash is what makes the claim exact rather than a guess about which files a merge
+    touched. Blocking I/O — call it off the event loop.
+    """
+    if not indexed_head:
+        return None
+    current = head_sha(root)
+    if not current or current == indexed_head:
+        return None
+    key = (str(root), current, indexed_head, len(stored))
+    cached = _drift_cache.get(key)
+    if cached is not None:
+        return cached if cached[0] else None
+    deadline = monotonic() + DRIFT_TIME_BUDGET_S
+    differing: list[str] = []
+    partial = False
+    for rel_path, md5 in sorted(stored.items()):
+        if monotonic() > deadline:
+            partial = True
+            break
+        checksum = FileChecksum.try_compute(root / rel_path, root)
+        if checksum is None or checksum.md5 != md5:
+            differing.append(rel_path)
+    result = (len(differing), differing[:_DRIFT_EXAMPLES], partial)
+    if len(_drift_cache) >= _DRIFT_CACHE_MAX:
+        _drift_cache.clear()
+    _drift_cache[key] = result
+    return result if differing else None
+
+
+def _drift_notice(root: Path, indexed_head: str, drift: tuple[int, list[str], bool]) -> str:
+    """Phrase a drift measurement as the warning it is, with the command that clears it."""
+    count, examples, partial = drift
+    now = head_description(root) or "a different commit"
+    amount = f"at least {count}" if partial else str(count)
+    noun = "file differs" if count == 1 else "files differ"
+    shown = ", ".join(examples)
+    more = "…" if count > len(examples) else ""
+    return (
+        f"the checkout moved on since this index was last brought up to date at "
+        f"{indexed_head[:7]}; HEAD is now {now}, and {amount} indexed {noun} from what the "
+        f"index holds ({shown}{more}). Entities, line numbers and summaries for those files "
+        f"describe the older version, whatever this page's own flags say — read them from disk, "
+        f"or run index_directory({str(root)!r}) to catch up (preview=true prices it first)"
+    )
+
+
 class FreshnessChecker:
     """Re-hashes the files behind one page of entity refs and annotates them.
 
@@ -278,12 +359,14 @@ class FreshnessChecker:
         live_worktrees: int = 0,
         origin: str | None = None,
         watch_state: Mapping[str, Any] | None = None,
+        drift: str | None = None,
     ) -> None:
         self._root = root
         self._stored = dict(stored)
         self._live_worktrees = live_worktrees
         self._origin = origin
         self._watch_state = watch_state
+        self._drift = drift
         # path -> status; doubles as the "already read this file" memo and as the record
         # of which paths this page actually touched (`checked` counts its keys).
         self._statuses: dict[str, str] = {}
@@ -385,6 +468,8 @@ class FreshnessChecker:
         }
         if self._watch_state is not None:
             block["watcher"] = _watcher_notice(self._watch_state)
+        if self._drift:
+            block["drift"] = self._drift
         if self._live_worktrees:
             block["live_worktrees"] = _live_worktrees_notice(self._live_worktrees)
         return block
@@ -439,10 +524,21 @@ async def build_checker(repo: Any, project: str, directory: str) -> FreshnessChe
     """
     stored = await repo.get_checksums(project)
     root = Path(directory).resolve()
+    drift_notice: str | None = None
+    indexed_head = await repo.get_indexed_head(project)
+    if indexed_head:
+        try:
+            drift = await asyncio.to_thread(measure_drift, root, stored, indexed_head)
+        except Exception:  # noqa: BLE001 — a provenance line must never break the answer
+            logger.debug("Drift measurement failed for %s", root, exc_info=True)
+            drift = None
+        if drift is not None:
+            drift_notice = _drift_notice(root, indexed_head, drift)
     return FreshnessChecker(
         root,
         stored,
         live_worktrees=count_live_worktrees(root),
         origin=describe_origin(root),
         watch_state=await repo.get_watch_state(project),
+        drift=drift_notice,
     )

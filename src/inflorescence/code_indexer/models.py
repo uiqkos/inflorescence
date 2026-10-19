@@ -33,6 +33,33 @@ class NodeType(StrEnum):
     # chunked with overlap instead of being parsed. Kept apart from MODULE so a search
     # for modules doesn't return documentation and vice versa.
     DOCUMENT = "document"
+    # A top-level binding that is not a function: `export const RULES = [...]`, a module-level
+    # `MIN_VISIBLE_TEXT = 400`, a Go `var checkers = map[...]...`, a Rust `static`. Rule tables,
+    # tuning constants and registries live here, and agents look them up by name ("who reads
+    # TASKS", "where is AUTOPILOT defined") — before this type they had no node at all.
+    VARIABLE = "variable"
+    # A named type that is neither a class, an interface, an enum nor a struct: a TypeScript
+    # `type PassFacts = {...}`, a Go `type Status string`, a Rust or Python type alias.
+    TYPE_ALIAS = "type_alias"
+
+
+def _label_for(value: str) -> str:
+    return "".join(part.capitalize() for part in value.split("_"))
+
+
+# The Memgraph label each node type is stored under (``type_alias`` -> ``TypeAlias``). Derived,
+# so a type added to the enum gets its label, its index and its place in every label list
+# without anyone remembering to add it by hand.
+NODE_TYPE_LABELS: dict[str, str] = {t.value: _label_for(t.value) for t in NodeType}
+
+# Declarations whose own text is their description. They get no LLM summary and take no part
+# in their parent's summary input: a one-line `export const PROBE = {...}` says what it is
+# better than a paraphrase would, and counting it among a module's children would change the
+# summary input hash of every module that declares one — re-buying those summaries, and every
+# directory summary above them, for no new information. They are found by name
+# (``search_entities``, the ``code_symbols_text`` index over name + signature) and their
+# lines by ``search_text`` / ``find_text``.
+DECLARATION_NODE_TYPES: frozenset[NodeType] = frozenset({NodeType.VARIABLE, NodeType.TYPE_ALIAS})
 
 
 class EdgeType(StrEnum):
@@ -96,6 +123,28 @@ class Edge(BaseModel):
     # The call as written at the call site ("s.content.ForCheck") — kept for debugging
     # and for upgrading heuristic edges when a semantic pass later covers the file.
     callee_text: str = ""
+    # IMPORTS provenance: the statement as written. "Who imports X" is asked in the shape a
+    # refactor needs — which spelling (``'../tasks'`` vs ``'../tasks/read-show'``), which
+    # names, and whether the import is a lazy ``import()`` chunk or a static dependency of the
+    # bundle (field reports, 17.09.2026). An edge that only says "A imports B" collapses all
+    # of that, and the agents went back to grep. Empty/False on every other edge type.
+    specifier: str = ""  # the module string as written: "../tasks/read-show", "net/http", "pkg.mod"
+    line: int = 0  # 1-based line of the (first) statement
+    names: list[str] = Field(default_factory=list)  # imported names; "default", "*" for those forms
+    dynamic: bool = False  # only ever reached through import() — a lazy chunk
+    type_only: bool = False  # only `import type` / `export type` — erased at build time
+    reexport: bool = False  # `export … from` — this module passes the names on
+
+    def import_fingerprint(self) -> str:
+        """The IMPORTS properties as one string — equal fingerprints make a re-write a no-op."""
+        flags = f"{int(self.dynamic)}{int(self.type_only)}{int(self.reexport)}"
+        return f"{self.specifier}|{self.line}|{','.join(sorted(self.names))}|{flags}"
+
+
+# The IMPORTS properties a tool publishes as an edge's ``import`` object: the fields as stored,
+# and the flags (published only when true).
+IMPORT_FACT_FIELDS = ("specifier", "line", "names")
+IMPORT_FACT_FLAGS = ("dynamic", "type_only", "reexport")
 
 
 class ExternalRef(BaseModel):

@@ -1365,9 +1365,11 @@ def _preview(
         settings=settings,
         config=IndexerConfig.from_settings(settings),
     )
-    from inflorescence.cost import estimate_index_cost
+    from inflorescence.cost import estimate_index_cost, price_largest_files
 
-    preview = builder.preview(root, include_patterns=include_patterns, exclude_patterns=exclude_patterns)
+    preview = price_largest_files(
+        builder.preview(root, include_patterns=include_patterns, exclude_patterns=exclude_patterns), settings
+    )
     estimate = estimate_index_cost(preview, settings)
     print(f"Dry-run preview: {{'estimated_cost_usd': {estimate['usd']}, {str(preview)[1:-1]}}}")
 

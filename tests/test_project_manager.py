@@ -1322,6 +1322,33 @@ async def test_preview_of_a_worktree_prices_only_what_the_donor_does_not_cover(t
 
 
 @pytest.mark.asyncio
+async def test_a_worktree_preview_names_its_biggest_files_and_what_each_costs(tmp_path: Path) -> None:
+    """"$0.62 for 64 files" with no breakdown was abandoned; the biggest files are what to ignore."""
+    from inflorescence.code_indexer.graph_builder import GraphBuilder
+    from inflorescence.code_indexer.models import IndexerConfig
+
+    main, worktree = _worktree_dirs(tmp_path)
+    (worktree / "table.json").write_text("[" + ",\n".join(["1"] * 400) + "]\n")
+    (worktree / "added.py").write_text("x = 1\n")
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    builder.scan_checksums_result = {"added.py": "a", "table.json": "t"}
+    real = GraphBuilder(repo=None, llm=None, config=IndexerConfig(use_llm_summaries=False, use_llm_fallback_parser=False))
+    builder.estimate_paths = real.estimate_paths  # type: ignore[method-assign]
+    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), main)
+    repo.indexed_projects.add(manager.get_project(str(main)))
+    repo.checksums[manager.get_project(str(main))] = {}
+
+    result = await manager.preview_directory(str(worktree))
+
+    largest = result["largest_files"]
+    assert [f["path"] for f in largest] == ["table.json", "added.py"]
+    assert set(largest[0]) == {"path", "bytes", "estimated_cost_usd"}
+    assert largest[0]["estimated_cost_usd"] > largest[1]["estimated_cost_usd"]
+    assert sum(f["estimated_cost_usd"] for f in largest) == pytest.approx(result["estimated_cost_usd"], abs=1e-3)
+
+
+@pytest.mark.asyncio
 async def test_preview_of_a_plain_directory_still_prices_the_whole_tree(tmp_path: Path) -> None:
     repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
     builder = FakeGraphBuilder()

@@ -12,6 +12,7 @@ from typing import Any
 
 import neo4j.graph
 
+from inflorescence.code_indexer.models import NODE_TYPE_LABELS
 from inflorescence.config import Settings
 from inflorescence.db import queries
 from inflorescence.db.connection import MemgraphConnection
@@ -23,7 +24,8 @@ logger = logging.getLogger(__name__)
 # Embedding vectors are large and useless in API payloads.
 _EXCLUDED_PROPS = frozenset({"summary_embedding", "embedding"})
 
-_TYPE_LABELS = ("Directory", "Module", "Class", "Function", "Method", "Interface", "Enum", "Struct", "Trait")
+# label -> node type value, derived from the enum (``TypeAlias`` -> ``type_alias``).
+_TYPE_BY_LABEL = {label: value for value, label in NODE_TYPE_LABELS.items()}
 
 _RELATION_TYPES = ("CALLS", "IMPORTS", "INHERITS", "IMPLEMENTS", "CONTAINS")
 
@@ -178,9 +180,9 @@ def _score(value: Any) -> float:
 
 def _entity_type(labels: Any) -> str:
     if isinstance(labels, (list, tuple, set, frozenset)):
-        for label in _TYPE_LABELS:
-            if label in labels:
-                return label.lower()
+        for label in labels:
+            if label in _TYPE_BY_LABEL:
+                return _TYPE_BY_LABEL[label]
     return "code"
 
 

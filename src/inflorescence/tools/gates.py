@@ -25,6 +25,19 @@ VALID_NODE_TYPES: tuple[str, ...] = tuple(node_type.value for node_type in NodeT
 
 _NODE_TYPE_BY_LOWER = {value.lower(): value for value in VALID_NODE_TYPES}
 
+# Names that stand for a *group* of node types. One exists because the question behind it is
+# one of the most common an agent asks — "is there an X in this codebase", as opposed to "is X
+# mentioned in the design notes" — and spelling the group out type by type was a hint nobody
+# took (field reports, 15-17.09.2026: a keyword popular in a repository's own docs returned a
+# page of markdown and no code, and the agent could not tell whether code existed). Derived
+# from the enum, so a node type added later lands in the group without anyone remembering to.
+NODE_TYPE_GROUPS: dict[str, tuple[str, ...]] = {
+    "code": tuple(
+        value for value in VALID_NODE_TYPES
+        if value not in (NodeType.DOCUMENT.value, NodeType.DIRECTORY.value)
+    ),
+}
+
 
 async def ensure_indexed(manager: ProjectManager, directory: str) -> tuple[str, dict | None]:
     """Resolve *directory* to a queryable project, or to the error explaining why it is not.
@@ -55,7 +68,9 @@ def normalize_node_types(node_types: list[str] | None) -> list[str] | dict | Non
     """Normalize ``node_types`` to canonical NodeType values, case-insensitively.
 
     Returns the normalized list (``None`` stays ``None``: no filter at all), or an
-    ``error_response`` payload (dict) when any value is not a node type. Callers must
+    ``error_response`` payload (dict) when any value is not a node type. A group name
+    (:data:`NODE_TYPE_GROUPS`, e.g. ``"code"``) expands to its members, and the expanded list
+    is what the tools echo in ``meta.node_types`` — the filter as actually applied. Callers must
     check ``isinstance(result, dict)`` and return it as-is **before** querying.
 
     Same reasoning as ``direction`` in graph.py: unvalidated, ``node_types=["func"]``
@@ -66,12 +81,19 @@ def normalize_node_types(node_types: list[str] | None) -> list[str] | dict | Non
         return None
     normalized: list[str] = []
     for value in node_types:
-        canonical = _NODE_TYPE_BY_LOWER.get(str(value).strip().lower())
+        key = str(value).strip().lower()
+        group = NODE_TYPE_GROUPS.get(key)
+        if group is not None:
+            normalized.extend(member for member in group if member not in normalized)
+            continue
+        canonical = _NODE_TYPE_BY_LOWER.get(key)
         if canonical is None:
+            groups = ", ".join(f"{name!r} ({', '.join(members)})" for name, members in NODE_TYPE_GROUPS.items())
             return error_response(
                 "invalid_node_type",
-                f"{value!r} is not a valid node type; valid: {', '.join(VALID_NODE_TYPES)}. "
-                "Matching is case-insensitive.",
+                f"{value!r} is not a valid node type; valid: {', '.join(VALID_NODE_TYPES)}, or the "
+                f"group {groups}. Matching is case-insensitive.",
             )
-        normalized.append(canonical)
+        if canonical not in normalized:
+            normalized.append(canonical)
     return normalized

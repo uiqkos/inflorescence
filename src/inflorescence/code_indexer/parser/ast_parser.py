@@ -79,7 +79,11 @@ def parse_file_with_facts(
     )
 
     # Walk top-level statements
-    for stmt in ast.iter_child_nodes(tree):
+    body = tree.body
+    for position, stmt in enumerate(body):
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.TypeAlias)):
+            following = body[position + 1] if position + 1 < len(body) else None
+            _handle_declaration(stmt, following, mod_id, rel, lines, nodes, edges)
         if isinstance(stmt, (ast.Import, ast.ImportFrom)):
             _handle_import(stmt, mod_id, edges, facts)
         elif isinstance(stmt, ast.ClassDef):
@@ -93,6 +97,85 @@ def parse_file_with_facts(
             _extract_calls(stmt, mod_id, edges)
 
     return nodes, edges, facts
+
+
+# A declaration's signature is its first source line, cut here (see javascript_parser).
+_DECLARATION_SIGNATURE_CHARS = 200
+
+
+def _bound_names(target: ast.expr) -> list[str]:
+    """Plain names an assignment target binds: ``A``, ``A, B``, ``[A, B]`` (not ``a.b``, ``a[0]``)."""
+    if isinstance(target, ast.Name):
+        return [target.id]
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return [name for element in target.elts for name in _bound_names(element)]
+    return []
+
+
+def _is_type_alias_annotation(annotation: ast.expr) -> bool:
+    """``X: TypeAlias = ...`` / ``X: typing.TypeAlias = ...``."""
+    if isinstance(annotation, ast.Name):
+        return annotation.id == "TypeAlias"
+    return isinstance(annotation, ast.Attribute) and annotation.attr == "TypeAlias"
+
+
+def _attribute_docstring(following: ast.stmt | None) -> str:
+    """The string literal right after an assignment — the attribute-docstring convention."""
+    if (
+        isinstance(following, ast.Expr)
+        and isinstance(following.value, ast.Constant)
+        and isinstance(following.value.value, str)
+    ):
+        return following.value.value.strip()
+    return ""
+
+
+def _handle_declaration(
+    stmt: ast.Assign | ast.AnnAssign | ast.TypeAlias,
+    following: ast.stmt | None,
+    mod_id: str,
+    rel: str,
+    lines: list[str],
+    nodes: list[CodeNode],
+    edges: list[Edge],
+) -> None:
+    """Module-level ``NAME = ...`` / ``NAME: T = ...`` / ``type NAME = ...`` -> declaration nodes.
+
+    A plain or annotated assignment is a VARIABLE; ``type X = ...`` (3.12) and an assignment
+    annotated ``TypeAlias`` are a TYPE_ALIAS. Calls in the initializer stay with the module.
+    """
+    if isinstance(stmt, ast.TypeAlias):
+        names, node_type = _bound_names(stmt.name), NodeType.TYPE_ALIAS
+    elif isinstance(stmt, ast.AnnAssign):
+        names = _bound_names(stmt.target)
+        node_type = NodeType.TYPE_ALIAS if _is_type_alias_annotation(stmt.annotation) else NodeType.VARIABLE
+    else:
+        names = [name for target in stmt.targets for name in _bound_names(target)]
+        node_type = NodeType.VARIABLE
+    if not names:
+        return
+    first = lines[stmt.lineno - 1].strip() if 0 < stmt.lineno <= len(lines) else ""
+    if len(first) > _DECLARATION_SIGNATURE_CHARS:
+        first = first[: _DECLARATION_SIGNATURE_CHARS - 1] + "…"
+    doc = _attribute_docstring(following)
+    for name in names:
+        node_id = f"{rel}::{name}"
+        if any(existing.id == node_id for existing in nodes):
+            continue  # rebound later in the module: the first binding is the declaration
+        nodes.append(
+            CodeNode(
+                id=node_id,
+                name=name,
+                node_type=node_type,
+                file_path=rel,
+                line_start=stmt.lineno,
+                line_end=stmt.end_lineno or stmt.lineno,
+                signature=first,
+                docstring=doc,
+                parent_id=mod_id,
+            )
+        )
+        edges.append(Edge(source=mod_id, target=node_id, edge_type=EdgeType.CONTAINS))
 
 
 def _collect_local_names(func: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
@@ -128,12 +211,22 @@ def _handle_import(
                 target = f"{module}.{alias.name}"
             else:
                 target = "." * stmt.level + alias.name
-            edges.append(Edge(source=mod_id, target=target, edge_type=EdgeType.IMPORTS))
+            edges.append(
+                Edge(
+                    source=mod_id, target=target, edge_type=EdgeType.IMPORTS,
+                    specifier=module, line=stmt.lineno, names=[alias.name],
+                )
+            )
             if alias.name != "*":
                 facts.imports[alias.asname or alias.name] = target
     elif isinstance(stmt, ast.Import):
         for alias in stmt.names:
-            edges.append(Edge(source=mod_id, target=alias.name, edge_type=EdgeType.IMPORTS))
+            edges.append(
+                Edge(
+                    source=mod_id, target=alias.name, edge_type=EdgeType.IMPORTS,
+                    specifier=alias.name, line=stmt.lineno, names=["*"],
+                )
+            )
             if alias.asname:
                 facts.imports[alias.asname] = alias.name
             else:

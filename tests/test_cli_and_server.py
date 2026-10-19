@@ -28,6 +28,7 @@ def test_create_server_registers_expected_tools(monkeypatch) -> None:
             "list_entities",
             "get_entity_structure",
             "get_entity_context",
+            "find_text",
             "get_related_entities",
             "search_entities",
             "search_code",
@@ -403,3 +404,13 @@ def test_serve_allow_degraded_starts_despite_unreachable(monkeypatch) -> None:
 
     assert ran.get("ran_server") is True
     assert ran.get("conn_closed") is True
+
+
+@pytest.mark.parametrize("raw", ["", "null", "None"])
+def test_an_empty_cost_cap_disables_it_as_documented(monkeypatch, raw: str) -> None:
+    from inflorescence.config import Settings
+
+    monkeypatch.setenv("MAX_INDEX_COST_USD", raw)
+    assert Settings().max_index_cost_usd is None
+    monkeypatch.setenv("MAX_INDEX_COST_USD", "2.5")
+    assert Settings().max_index_cost_usd == 2.5

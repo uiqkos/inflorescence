@@ -16,6 +16,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Top-level items that declare a value or a type name rather than define behaviour.
+_DECLARATION_ITEMS = {
+    "const_item": NodeType.VARIABLE,
+    "static_item": NodeType.VARIABLE,
+    "type_item": NodeType.TYPE_ALIAS,
+}
+# A declaration's signature is its first source line, cut here (see javascript_parser).
+_DECLARATION_SIGNATURE_CHARS = 200
+
+
 def _node_text(node: TSNode, source_bytes: bytes) -> str:
     return source_bytes[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
 
@@ -106,8 +116,46 @@ class RustParser(BaseParser):
                 self._handle_impl(child, mod_id, rel, source_bytes, nodes, edges)
             elif child.type == "use_declaration":
                 self._handle_use(child, mod_id, source_bytes, edges)
+            elif child.type in _DECLARATION_ITEMS:
+                self._handle_declaration(child, mod_id, rel, source_bytes, nodes, edges)
 
         return nodes, edges
+
+    def _handle_declaration(
+        self,
+        node: TSNode,
+        mod_id: str,
+        rel: str,
+        source_bytes: bytes,
+        nodes: list[CodeNode],
+        edges: list[Edge],
+    ) -> None:
+        """``const``/``static`` items -> VARIABLE, ``type X = ...`` -> TYPE_ALIAS."""
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return
+        name = _node_text(name_node, source_bytes)
+        node_id = f"{rel}::{name}"
+        if any(existing.id == node_id for existing in nodes):
+            return
+        text = _node_text(node, source_bytes).strip()
+        first = text.splitlines()[0].rstrip() if text else ""
+        if len(first) > _DECLARATION_SIGNATURE_CHARS:
+            first = first[: _DECLARATION_SIGNATURE_CHARS - 1] + "…"
+        nodes.append(
+            CodeNode(
+                id=node_id,
+                name=name,
+                node_type=_DECLARATION_ITEMS[node.type],
+                file_path=rel,
+                line_start=node.start_point[0] + 1,
+                line_end=node.end_point[0] + 1,
+                signature=first,
+                docstring=_get_doc_comment(node, source_bytes),
+                parent_id=mod_id,
+            )
+        )
+        edges.append(Edge(source=mod_id, target=node_id, edge_type=EdgeType.CONTAINS))
 
     def _handle_function(
         self,
@@ -334,7 +382,12 @@ class RustParser(BaseParser):
         if arg:
             target = _node_text(arg, source_bytes).rstrip(";").strip()
             if target:
-                edges.append(Edge(source=mod_id, target=target, edge_type=EdgeType.IMPORTS))
+                edges.append(
+                    Edge(
+                        source=mod_id, target=target, edge_type=EdgeType.IMPORTS,
+                        specifier=target, line=node.start_point[0] + 1,
+                    )
+                )
 
     def _extract_calls(
         self, node: TSNode, caller_id: str, source_bytes: bytes, edges: list[Edge]

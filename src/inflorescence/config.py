@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -77,35 +77,21 @@ DEFAULT_EXCLUDE_PATTERNS: list[str] = [
 # lock files are dropped by name (LOCKFILE_NAMES), anything over MAX_FILE_SIZE_BYTES lands
 # in `skipped_large_files` instead of being summarized, and .gitignore/exclude patterns
 # already keep node_modules, dist and build output out of the scan.
-DEFAULT_DOCUMENT_EXTENSIONS: list[str] = [
-    # prose
-    ".md",
-    ".markdown",
-    ".mdx",
-    ".rst",
-    ".txt",
-    ".text",
-    ".adoc",
-    ".asciidoc",
-    ".org",
+DOCUMENT_EXTENSION_GROUPS: dict[str, list[str]] = {
+    "prose": [".md", ".markdown", ".mdx", ".rst", ".txt", ".text", ".adoc", ".asciidoc", ".org"],
     # styles — hand-written, prose-free, and where layout/theme/media-query answers live
-    ".css",
-    ".scss",
-    ".sass",
-    ".less",
-    ".styl",
+    "stylesheets": [".css", ".scss", ".sass", ".less", ".styl"],
     # markup — index.html carries the meta tags, the mount point and the script tags
-    ".html",
-    ".htm",
+    "markup": [".html", ".htm"],
     # configuration and build/tool settings
-    ".json",
-    ".jsonc",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".ini",
-    ".cfg",
-    ".conf",
+    "configuration": [".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf"],
+    # interface and query definitions — the contract a service is built against. A field
+    # report (14.09.2026) asked "how does search work" of a Go backend whose gRPC contracts
+    # lived in .proto files and whose actual search SQL (full-text match, filters, ORDER BY)
+    # lived in sqlc query files: neither was indexed, so the semantic search landed on the Go
+    # wrappers and never on the query itself. No parser here builds symbols from them, so they
+    # are documents: found by their own text and by meaning, which is what that question needed.
+    "schemas and queries": [".proto", ".sql", ".graphql", ".gql"],
     # shell and operator scripts — the runbook layer. A field report (10.09.2026) traced a
     # whole failed research task to their absence: the task was "explain how a batch run
     # is launched", and the exact invocation, every flag, and the reason for each deviation
@@ -114,11 +100,10 @@ DEFAULT_DOCUMENT_EXTENSIONS: list[str] = [
     # from that directory and not one of its nine shell scripts, so no query could reach
     # them: not ranked low, absent. Teams put operational truth in these files precisely
     # because they are executable; that makes them documentation, not noise.
-    ".sh",
-    ".bash",
-    ".zsh",
-    ".fish",
-    ".ps1",
+    "shell and operator scripts": [".sh", ".bash", ".zsh", ".fish", ".ps1"],
+}
+DEFAULT_DOCUMENT_EXTENSIONS: list[str] = [
+    extension for group in DOCUMENT_EXTENSION_GROUPS.values() for extension in group
 ]
 
 # Documents admitted by **exact filename** rather than by extension: the build and runbook
@@ -283,9 +268,21 @@ class Settings(BaseSettings):
     # billable behind a call that reads like a cheap refresh. Default $10 clears normal and even large repos (a full index
     # of a ~200-file Go service measured well under $1) while stopping a runaway monorepo, or a
     # thousand-file `git checkout` flush, cold. Raise it (env MAX_INDEX_COST_USD / --max-cost / max_cost_usd),
-    # or set to null to disable the cap entirely. Prices default to the v0.1 default models
+    # or set it empty (or null) to disable the cap entirely. Prices default to the v0.1 default models
     # (gemini-2.5-flash-lite + text-embedding-3-small); update if you switch.
     max_index_cost_usd: float | None = 10.0
+
+    @field_validator("max_index_cost_usd", mode="before")
+    @classmethod
+    def _empty_cap_means_no_cap(cls, value: object) -> object:
+        """``MAX_INDEX_COST_USD=`` (empty), ``null`` or ``none`` disables the cap, as the docs say.
+
+        An environment variable cannot hold a JSON null, so without this the documented way to
+        turn the cap off was a validation error at startup.
+        """
+        if isinstance(value, str) and value.strip().lower() in ("", "null", "none"):
+            return None
+        return value
     llm_price_input_usd_per_mtok: float = 0.25
     llm_price_output_usd_per_mtok: float = 1.50
     embedding_price_usd_per_mtok: float = 0.02

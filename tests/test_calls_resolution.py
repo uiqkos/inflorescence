@@ -371,11 +371,14 @@ def test_js_parent_relative_import_carries_calls_and_imports(tmp_path: Path) -> 
     result = resolve_edges(nodes, edges, facts)
 
     assert _calls(result)[("src/screens/SessionScreen.tsx::load", "src/api/units.ts::fetchUnits")] == "import"
-    assert Edge(
-        source="src/screens/SessionScreen.tsx",
-        target="src/api/units.ts",
-        edge_type=EdgeType.IMPORTS,
-    ) in result.edges
+    imports = {
+        e.target: e for e in result.edges
+        if e.edge_type is EdgeType.IMPORTS and e.source == "src/screens/SessionScreen.tsx"
+    }
+    # The module edge, with the statement as written, and the symbol edge the named import binds.
+    assert imports["src/api/units.ts"].specifier == "../api/units"
+    assert imports["src/api/units.ts"].line == 1 and imports["src/api/units.ts"].names == ["fetchUnits"]
+    assert imports["src/api/units.ts::fetchUnits"].names == ["fetchUnits"]
     assert "src/screens/SessionScreen.tsx::load" not in result.external_calls
 
 

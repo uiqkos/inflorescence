@@ -267,7 +267,9 @@ Indexing costs real money. Two mechanisms keep that deliberate (INV-10).
 
 **Preview.** `index_directory(path, preview=true)` and `inflorescence index <path> --dry-run`
 both count files, bytes, entities and tokens and price them — no database writes, no LLM calls,
-no watcher started. Read the estimate, then run for real.
+no watcher started. `largest_files` names the biggest files priced, each with its own share of
+the quote, so a generated table or a fixture tree that dominates it is visible before you pay —
+add it to `.inflorescenceignore` and preview again. Read the estimate, then run for real.
 
 ```bash
 inflorescence index /path/to/repo --dry-run          # estimate volume + cost
@@ -801,6 +803,7 @@ ever rewrites or deletes one — the log grows until you prune it yourself.
 | Styles | `.css` `.scss` `.sass` `.less` `.styl` — indexed whole, not parsed |
 | Markup | `.html` `.htm` — indexed whole, not parsed |
 | Configuration | `.json` `.jsonc` `.yaml` `.yml` `.toml` `.ini` `.cfg` `.conf` — indexed whole, not parsed |
+| Schemas & queries | `.proto` `.sql` `.graphql` `.gql` — indexed whole, not parsed: a gRPC contract or the SQL behind a search is found by its own text and by meaning |
 | Shell / operator scripts | `.sh` `.bash` `.zsh` `.fish` `.ps1` — indexed whole, not parsed |
 | Build files, by exact name | `Makefile` `GNUmakefile` `Dockerfile` `Containerfile` `Justfile` `Procfile` `Rakefile` `Brewfile` `.env.example` (and `.sample` / `.template` / `.dist`) — indexed whole, not parsed |
 

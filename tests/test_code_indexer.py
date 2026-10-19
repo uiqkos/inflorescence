@@ -406,7 +406,7 @@ async def test_graph_builder_update_rebuilds_project_to_keep_cross_file_edges(tm
     assert repo.deleted_projects == []
     assert repo.deleted_code_edges == 0
     assert {node.id for node in nodes} >= {"a.py", "b.py", "a.py::call", "b.py::target"}
-    assert Edge(source="a.py", target="b.py", edge_type=EdgeType.IMPORTS) in edges
+    assert ("a.py", "b.py") in {(e.source, e.target) for e in edges if e.edge_type is EdgeType.IMPORTS}
 
 
 @pytest.mark.asyncio
@@ -556,6 +556,9 @@ class RecordingRepository:
 
     async def get_code_edges(self, project: str) -> list[tuple[str, str, str]]:
         return list(self.stored_edges)
+
+    async def get_import_fingerprints(self, project: str) -> dict[tuple[str, str], str]:
+        return dict(getattr(self, "import_fingerprints", {}))
 
     async def delete_nodes_by_ids(self, project: str, ids: list) -> int:
         self.deleted_node_ids.extend(ids)
@@ -1768,12 +1771,24 @@ async def test_update_skips_stored_structural_edges_but_always_remerges_calls(tm
     submitted = {(e.source, e.edge_type.value.upper(), e.target) for e in repo.upserted_edges}
     produced = {(e.source, e.edge_type.value.upper(), e.target) for e in result.edges}
     calls = {key for key in produced if key[1] == "CALLS"}
+    imports = {key for key in produced if key[1] == "IMPORTS"}
     assert calls, "sanity: this fixture has a cross-file call"
+    assert imports, "sanity: this fixture has an import"
     assert calls <= submitted                    # provenance may have moved: always re-MERGE
     assert missing in submitted                  # absent from the store: must be written
-    # Everything else was already there and MERGEs no properties — not re-written.
-    assert submitted == calls | {missing}
+    # A stored IMPORTS key without this run's properties (an index built before they
+    # existed) is written once — that is the backfill.
+    assert submitted == calls | imports | {missing}
     assert repo.deleted_edge_keys == []          # nothing stale: narrowing is not deletion
+
+    # Once the store holds the same properties, IMPORTS is as settled as any structural edge.
+    repo.import_fingerprints = {
+        (e.source, e.target): e.import_fingerprint() for e in result.edges if e.edge_type is EdgeType.IMPORTS
+    }
+    repo.stored_edges = list(edge_keys)
+    repo.upserted_edges = []
+    await builder.update("fixture", tmp_path)
+    assert {(e.source, e.edge_type.value.upper(), e.target) for e in repo.upserted_edges} == calls
 
 
 @pytest.mark.asyncio

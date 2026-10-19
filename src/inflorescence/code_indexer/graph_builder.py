@@ -17,6 +17,7 @@ from typing import Any
 import pathspec
 
 from inflorescence.code_indexer.models import (
+    DECLARATION_NODE_TYPES,
     CodeNode,
     Edge,
     EdgeType,
@@ -152,6 +153,72 @@ def _within(directory: str, prefix: str) -> bool:
     if not prefix or not directory or directory == prefix:
         return True
     return directory.startswith(f"{prefix}/") or prefix.startswith(f"{directory}/")
+
+
+# How much of a file the coverage check reads to tell text from binary — git's own heuristic
+# (a NUL byte in the first 8000 bytes) over the same window, so "binary" means what it means
+# to the tool the repository already lives in.
+_BINARY_SNIFF_BYTES = 8000
+
+
+def _looks_binary(path: Path) -> bool:
+    """True when *path* holds a NUL byte in its first block (unreadable counts as binary).
+
+    Decided by content, not by a list of suffixes: an image, an archive or a compiled object
+    is recognised whatever it is called, and a text format nobody listed is still counted.
+    """
+    try:
+        with path.open("rb") as handle:
+            return b"\0" in handle.read(_BINARY_SNIFF_BYTES)
+    except OSError:
+        return True
+
+
+def _unadmitted_kind(path: Path) -> str:
+    """The label a coverage report counts an unadmitted file under, or "" to skip it.
+
+    Keyed by suffix (``.proto``) because that is the unit ``DOCUMENT_EXTENSIONS`` admits; a
+    file with no suffix is keyed by its name. Dotfiles (editor and tool state) and binary
+    files are skipped — no text search could ever have matched them, and listing them would
+    bury the one type that matters under a list of assets.
+    """
+    name = path.name
+    if name.startswith(".") or _looks_binary(path):
+        return ""
+    return path.suffix.lower() or name
+
+
+def _definitions_win(nodes: list[CodeNode], edges: list[Edge]) -> tuple[list[CodeNode], list[Edge]]:
+    """Resolve an id claimed twice in one file: a definition beats a declaration.
+
+    ``foo = None`` above ``def foo():``, or ``let X`` above ``function X``, gives a declaration
+    node and a definition the same id. The definition is what every other feature (calls,
+    summaries, structure) is about, so it keeps the id and the declaration is dropped, with the
+    duplicate CONTAINS edge it brought. Any other duplicate is left exactly as the parser made it.
+    """
+    by_id: dict[str, CodeNode] = {}
+    dropped = False
+    for node in nodes:
+        held = by_id.get(node.id)
+        if held is None:
+            by_id[node.id] = node
+        elif held.node_type in DECLARATION_NODE_TYPES and node.node_type not in DECLARATION_NODE_TYPES:
+            by_id[node.id] = node
+            dropped = True
+        elif node.node_type in DECLARATION_NODE_TYPES:
+            dropped = True
+    if not dropped:
+        return nodes, edges
+    kept = [node for node in nodes if by_id.get(node.id) is node]
+    seen: set[tuple[str, str, str]] = set()
+    unique_edges: list[Edge] = []
+    for edge in edges:
+        key = (edge.source, edge.target, edge.edge_type.value)
+        if edge.edge_type == EdgeType.CONTAINS and key in seen:
+            continue
+        seen.add(key)
+        unique_edges.append(edge)
+    return kept, unique_edges
 
 
 def _build_default_registry(config: IndexerConfig | None = None) -> ParserRegistry:
@@ -564,8 +631,11 @@ class GraphBuilder:
         **Edges.** A relationship whose ``(source, TYPE, target)`` key is already in the store
         is not re-MERGEd — except CALLS, whose MERGE also refreshes ``resolution`` and
         ``callee_text``, and those can change while the key does not (a heuristic edge
-        upgraded by a semantic pass). Every other edge type MERGEs no properties at all, so
-        re-writing an existing key is a provable no-op. Existing edges are left in place, so
+        upgraded by a semantic pass); and IMPORTS whose stored ``fingerprint`` differs from
+        this run's (``Edge.import_fingerprint``) — which is also how an index built before
+        IMPORTS carried properties gets them on its next run, for $0 and no re-parse of
+        anything by hand. Every other edge type MERGEs no properties at all, so re-writing an
+        existing key is a provable no-op. Existing edges are left in place, so
         the "never edgeless" property is strengthened, not weakened.
         """
         stored_facts: dict[str, dict[str, object]] = {}
@@ -584,11 +654,21 @@ class GraphBuilder:
             )
 
         nodes = [n for n in all_nodes if not already_stored(n)]
-        edges = [
+        imports_stored = [
             e for e in all_edges
-            if e.edge_type is EdgeType.CALLS
-            or (e.source, e.edge_type.value.upper(), e.target) not in stored_edge_keys
+            if e.edge_type is EdgeType.IMPORTS and (e.source, "IMPORTS", e.target) in stored_edge_keys
         ]
+        fingerprints = await self._repo.get_import_fingerprints(project) if imports_stored else {}
+
+        def needs_write(e: Edge) -> bool:
+            if e.edge_type is EdgeType.CALLS:
+                return True
+            if (e.source, e.edge_type.value.upper(), e.target) not in stored_edge_keys:
+                return True
+            # IMPORTS carries the statement as written; the key alone does not prove the row.
+            return e.edge_type is EdgeType.IMPORTS and fingerprints.get((e.source, e.target)) != e.import_fingerprint()
+
+        edges = [e for e in all_edges if needs_write(e)]
         logger.info(
             "Incremental store: %d/%d node(s) and %d/%d edge(s) need writing for project=%s "
             "(%d unchanged file(s))",
@@ -1062,6 +1142,7 @@ class GraphBuilder:
         parser = self._registry.get_parser(f)
         if parser:
             nodes, edges, facts = parser.parse_file_with_facts(f, root)
+            nodes, edges = _definitions_win(nodes, edges)
         else:
             nodes, edges, facts = [], [], None
 
@@ -1194,7 +1275,7 @@ class GraphBuilder:
         )
 
         languages: dict[str, dict[str, int]] = {}
-        sizes: list[tuple[str, int]] = []
+        sizes: list[tuple[str, int, int]] = []
         total_bytes = 0
         total_lines = 0
         for f in files:
@@ -1203,20 +1284,20 @@ class GraphBuilder:
             except OSError:
                 continue
             size = len(data)
+            lines = data.count(b"\n") + 1
             total_bytes += size
-            total_lines += data.count(b"\n") + 1
+            total_lines += lines
             rel = f.relative_to(root).as_posix()
-            sizes.append((rel, size))
+            sizes.append((rel, size, lines))
             entry = languages.setdefault(_language_for_file(f), {"files": 0, "bytes": 0})
             entry["files"] += 1
             entry["bytes"] += size
 
-        sizes.sort(key=lambda item: item[1], reverse=True)
         return {
             "files": len(files),
             "total_bytes": total_bytes,
             "languages": languages,
-            "largest_files": [{"path": p, "bytes": b} for p, b in sizes[:top_n]],
+            "largest_files": _largest_files(sizes, top_n),
             "skipped_large_files": list(skipped_large_files),
             "estimated_nodes": total_lines // 10,
             "estimated_tokens": total_bytes // 4,
@@ -1289,20 +1370,25 @@ class GraphBuilder:
         """
         root = root_path.resolve()
         indexed = {str(p).replace("\\", "/") for p in indexed_paths}
+        known = {""} | {posixpath.dirname(p) for p in indexed}
+        prefixes = [prefix for prefix in (_literal_prefix(pattern) for pattern in scope or []) if prefix]
+        # A directory the caller named is checked even when the index holds nothing under it
+        # — that is exactly the case where it matters most: a field report (14.09.2026) scoped
+        # a search to backend/proto, whose files are all of a type the index does not admit,
+        # and the check never looked there because no indexed file lived in it.
+        named = [prefix for prefix in dict.fromkeys(prefixes) if (root / prefix).is_dir()]
         directories = sorted(
             # The project root is always known — the project node itself names it — so it is
             # checked even when the index holds no files under it yet, which is exactly the
             # state (a half-built or scope-narrowed index) where the gap is widest.
-            {""} | {posixpath.dirname(p) for p in indexed},
-            # Shallowest first: the cap has to fall somewhere, and a breadth-first order keeps
-            # what it covers spread across the tree instead of stuck in one alphabetical corner.
-            key=lambda d: (d.count("/"), d),
+            known | set(named),
+            # The directories the caller named first, then shallowest first: the cap has to fall
+            # somewhere, and a breadth-first order keeps what it covers spread across the tree
+            # instead of stuck in one alphabetical corner.
+            key=lambda d: (d not in named, d.count("/"), d),
         )
-        if scope:
-            prefixes = [_literal_prefix(pattern) for pattern in scope]
-            prefixes = [prefix for prefix in prefixes if prefix]
-            if prefixes:
-                directories = [d for d in directories if any(_within(d, prefix) for prefix in prefixes)]
+        if prefixes:
+            directories = [d for d in directories if any(_within(d, prefix) for prefix in prefixes)]
 
         excludes = _normalize_patterns(self._config.exclude_patterns)
         # Not _load_ignore_specs: that rglob's the whole tree for ignore files, which would
@@ -1313,6 +1399,11 @@ class GraphBuilder:
         deadline = monotonic() + time_budget_seconds
 
         uncovered: list[str] = []
+        # Files a re-index would still not admit — a suffix no parser or document list names.
+        # Counted by type, because "7 .proto files here" is the whole actionable fact: no
+        # index_directory call will ever make them searchable, and saying nothing about them
+        # read as "nothing is missing" (field report, 14.09.2026).
+        not_admitted: dict[str, int] = defaultdict(int)
         checked_dirs = 0
         on_disk = 0
         capped = False
@@ -1333,11 +1424,16 @@ class GraphBuilder:
                     continue
                 name = entry.name
                 rel = f"{directory}/{name}" if directory else name
-                if not self.indexes(name) or name in LOCKFILE_NAMES:
+                if name in LOCKFILE_NAMES:
                     continue
                 if _matches_patterns(rel, name, excludes):
                     continue
                 if gitignore and _gitignored(rel, gitignore):
+                    continue
+                if not self.indexes(name):
+                    kind = _unadmitted_kind(Path(entry.path))
+                    if kind:
+                        not_admitted[kind] += 1
                     continue
                 on_disk += 1
                 if rel in indexed:
@@ -1361,10 +1457,11 @@ class GraphBuilder:
             "files_on_disk": on_disk,
             "not_indexed": uncovered[:max_examples],
             "not_indexed_total": len(uncovered),
+            "not_admitted": dict(sorted(not_admitted.items(), key=lambda item: (-item[1], item[0]))),
             "capped": capped,
         }
 
-    def estimate_paths(self, root_path: Path, paths: list[str]) -> dict[str, object]:
+    def estimate_paths(self, root_path: Path, paths: list[str], top_n: int = 10) -> dict[str, object]:
         """Preview-style token/node stats for a specific set of changed paths.
 
         Lets a background watcher update be cost-gated (INV-10, finding 5b) without a full-project
@@ -1376,6 +1473,7 @@ class GraphBuilder:
         root = root_path.resolve()
         total_bytes = 0
         total_lines = 0
+        sizes: list[tuple[str, int, int]] = []
         seen: set[str] = set()
         for p in paths:
             candidate = Path(p)
@@ -1391,9 +1489,30 @@ class GraphBuilder:
                 data = f.read_bytes()
             except OSError:
                 continue
+            lines = data.count(b"\n") + 1
             total_bytes += len(data)
-            total_lines += data.count(b"\n") + 1
-        return {"estimated_tokens": total_bytes // 4, "estimated_nodes": total_lines // 10}
+            total_lines += lines
+            sizes.append((Path(rel).as_posix(), len(data), lines))
+        return {
+            "estimated_tokens": total_bytes // 4,
+            "estimated_nodes": total_lines // 10,
+            "largest_files": _largest_files(sizes, top_n),
+        }
+
+
+def _largest_files(sizes: list[tuple[str, int, int]], top_n: int) -> list[dict[str, object]]:
+    """The *top_n* biggest files of a scan, biggest first, with the proxies the estimate prices.
+
+    A field report (17.09.2026) was quoted $0.62 for a branch's 64 files and abandoned the tool:
+    nothing said how the sum broke down, and among those files were a generated JSON table and
+    long specs it did not need indexed. Naming the biggest files is what lets a caller add them
+    to ``.inflorescenceignore`` and preview again instead.
+    """
+    ranked = sorted(sizes, key=lambda item: item[1], reverse=True)[:top_n]
+    return [
+        {"path": path, "bytes": size, "estimated_tokens": size // 4, "estimated_nodes": lines // 10}
+        for path, size, lines in ranked
+    ]
 
 
 _PREVIEW_LANGUAGES: dict[str, str] = {
@@ -1432,6 +1551,10 @@ _PREVIEW_LANGUAGES: dict[str, str] = {
     ".ini": "ini",
     ".cfg": "ini",
     ".conf": "ini",
+    ".proto": "protobuf",
+    ".sql": "sql",
+    ".graphql": "graphql",
+    ".gql": "graphql",
     # Shell and operator scripts group as one "shell" line: .sh/.bash/.zsh answer the same
     # question and a preview that splits them reads as three unrelated file types.
     ".sh": "shell",

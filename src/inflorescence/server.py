@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 from inflorescence import janitor
 from inflorescence.code_indexer.graph_builder import GraphBuilder
-from inflorescence.code_indexer.models import IndexerConfig
+from inflorescence.code_indexer.models import DECLARATION_NODE_TYPES, IndexerConfig
 from inflorescence.config import Settings
 from inflorescence.db.connection import MemgraphConnection
 from inflorescence.db.repository import GraphRepository
@@ -20,8 +20,11 @@ from inflorescence.feedback import FeedbackStore
 from inflorescence.llm_client import LLMClient
 from inflorescence.project_manager import ProjectManager
 from inflorescence.rag.indexer import RAGIndexer
+from inflorescence.tools import descriptions as doc
+from inflorescence.tools.archive import ARCHIVE_FILE
 from inflorescence.tools.cypher import register_cypher_tools
 from inflorescence.tools.feedback import register_feedback_tools
+from inflorescence.tools.find import register_find_tools
 from inflorescence.tools.graph import register_graph_tools
 from inflorescence.tools.indexing import register_indexing_tools
 from inflorescence.tools.search import register_search_tools
@@ -108,6 +111,7 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
     """
     components = create_components()
     settings = components.settings
+    declarations = " and ".join(sorted(t.value for t in DECLARATION_NODE_TYPES))
 
     # Server-level instructions are injected into consuming agents' context — this is
     # the only place an agent learns what the server is FOR before picking a tool.
@@ -115,19 +119,17 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
         "inflorescence",
         instructions=(
             "Code intelligence over indexed repositories: a code graph in Memgraph "
-            "(functions/classes/modules/directories with CALLS / IMPORTS / INHERITS / "
-            "IMPLEMENTS / CONTAINS edges), LLM-written summaries for every entity, and "
-            "embeddings for search.\n\n"
+            "(functions/classes/methods/modules/directories, plus top-level constants, "
+            "variables and type aliases, with CALLS / IMPORTS / INHERITS / IMPLEMENTS / "
+            "CONTAINS edges), LLM-written summaries for every entity except those top-level "
+            f"declarations (node types {declarations}: they carry their first line as "
+            "`signature` instead, and cost nothing to index), and embeddings for search.\n\n"
             "The index is not only code. Non-code files are indexed whole as `document` "
-            "entities — prose (.md, .markdown, .mdx, .rst, .txt, .text, .adoc, .asciidoc, "
-            ".org), stylesheets (.css, .scss, .sass, .less, .styl), markup (.html, .htm), "
-            "configuration (.json, .jsonc, .yaml, .yml, .toml, .ini, .cfg, .conf), shell "
-            "and operator scripts (.sh, .bash, .zsh, .fish, .ps1) and the build files named "
-            "rather than suffixed (Makefile, GNUmakefile, Dockerfile, Containerfile, "
-            "Justfile, Procfile, Rakefile, Brewfile, .env.example/.sample/.template/.dist) — "
+            f"entities — by default {doc.DOCUMENT_TYPES} — "
             "with their body split into overlapping windows, so a CSS media query, an "
-            "index.html meta tag, a build-config key or the exact flags a wrapper script "
-            "passes to a runner is findable by its own text (search_text) and by meaning "
+            "index.html meta tag, a build-config key, a gRPC contract, the SQL behind a "
+            "search, or the exact flags a wrapper script passes to a runner is findable by "
+            "its own text (search_text, find_text) and by meaning "
             "(search_semantic). Shell scripts matter more than their size suggests: the "
             "operational recipe — which env vars, which flags, and the comment saying why — "
             "usually exists only there. They are not parsed for structure, so they own no "
@@ -145,12 +147,49 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
             "Use this server instead of grepping the filesystem when the question is about "
             "code structure, relationships, or purpose: find code by meaning "
             "(search_semantic), by exact identifier / string literal / error text "
-            "(search_text), by name (search_entities), or by code-vector similarity "
-            "(search_code, search_hybrid). Deep-dive a found entity with "
-            "get_entity_context / get_entity_structure, trace callers/callees and imports "
-            "with get_related_entities (which takes either a node_id or a name= substring, "
-            "so \"who calls X\" is one call), and answer arbitrary structural questions with "
-            "a read-only cypher_query (call graph_schema first).\n\n"
+            "(search_text — ranked, whole words), by name (search_entities), or by "
+            "code-vector similarity (search_code, search_hybrid). When the answer must be "
+            "COMPLETE rather than ranked — every use of a name before a rename, every "
+            "occurrence of a CSS token or config key, partial words and punctuation-heavy "
+            "literals — use find_text: it reads the files line by line (literal or regex), "
+            "exhaustively, and ties each hit to the entity whose span holds it. search_text "
+            "has no stemming in any language (`running` does not match `run`); only a word "
+            "that matched nothing at all is retried within one or two edits, and those hits "
+            "carry \"fuzzy\": true — so name the inflection you mean, or use find_text with "
+            "a regex. Deep-dive a found entity with get_entity_context / "
+            "get_entity_structure (which also takes a directory as file_path), trace "
+            "callers/callees and imports with get_related_entities (which takes either a "
+            "node_id or a name= — the exact name wins over names that merely contain it, "
+            "and an ambiguous name fails with the candidates instead of guessing — so "
+            "\"who calls X\" is one call), and answer arbitrary structural questions with "
+            "a read-only cypher_query (call graph_schema first). An IMPORTS row carries "
+            "the statement as written (`import`: specifier, line, names, and "
+            "dynamic/type_only/reexport when true), and a named JS/TS import also points at "
+            "the symbol itself, so incoming IMPORTS on a constant answer \"who reads it\" "
+            "and \"which imports are lazy import() chunks\" needs no file reading.\n\n"
+            "SCOPE EVERY SEARCH. Pass include_paths for the area you mean and exclude_paths "
+            "for what would crowd it out — mocks, fixtures, generated code, a vendored or "
+            "archived copy of an old version, a second app in the same monorepo. It is "
+            "strongly recommended on every search and listing, and it is the difference "
+            "between a first page that answers and one that only looks relevant. Listings "
+            "(list_entities, get_entity_structure, get_related_entities, search_entities) "
+            "take include_tests=false too, and full_summaries=true when the whole module "
+            "summaries are what you want to read. A repository can declare its history "
+            f"once, in a committed `{ARCHIVE_FILE}` (gitignore syntax, read at query time): "
+            "hits from those paths carry \"archived\": true and rank after every live hit, "
+            "so an old copy of a feature stops out-ranking the feature. When a response "
+            "carries meta.hints, read them: each is one sentence about the page you "
+            "actually got — a directory dominating it, words that matched nothing, a read "
+            "that stopped early — and what to do about it.\n\n"
+            "What this server does not answer, so you can go straight to the right tool: "
+            "it indexes checked-out trees (a main checkout and its git worktrees), not git "
+            "refs — comparing branches or asking what origin/main contains is `git diff` / "
+            "`git show`, or a worktree of that ref passed as directory. Whether every "
+            "consumer of a widened union type or enum handles the new case is a question "
+            "for the typechecker or an exhaustiveness linter; the graph gives you the "
+            "consumers (incoming IMPORTS/CALLS), not the exhaustiveness. Documents are not "
+            "parsed, so counting or aggregating values inside JSON/YAML is a job for jq/yq "
+            "on the file the search found.\n\n"
             "An ordinary project must be indexed before anything else works: call "
             "index_directory(path, preview=true) to see the estimated dollar cost, then "
             "preview=false to build. A git worktree of an already-indexed checkout is the "
@@ -253,6 +292,7 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
     register_indexing_tools(mcp, manager, watcher if enable_watcher else None, repo)
     register_graph_tools(mcp, manager, repo)
     register_search_tools(mcp, manager, repo, settings)
+    register_find_tools(mcp, manager, repo)
     register_cypher_tools(mcp, manager, conn)
     register_feedback_tools(mcp, components.feedback)
 

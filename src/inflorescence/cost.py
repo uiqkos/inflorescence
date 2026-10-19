@@ -25,16 +25,29 @@ class IndexCostExceededError(Exception):
     Raised for all three gated runs: a first-time index (priced over the whole tree), an
     incremental re-index and a background watcher update (both priced over just the files
     whose content moved). ``changed_files``, when set, says how many files the quoted
-    estimate covers, so the message cannot be misread as the price of the whole project.
+    estimate covers, so the message cannot be misread as the price of the whole project;
+    ``rechunk_files`` adds the unchanged files whose chunks the run will redo because the
+    chunker changed (embedding cost only — see :func:`estimate_rechunk_cost`).
     """
 
     def __init__(
-        self, estimated_usd: float, limit_usd: float, *, changed_files: int | None = None
+        self,
+        estimated_usd: float,
+        limit_usd: float,
+        *,
+        changed_files: int | None = None,
+        rechunk_files: int = 0,
     ) -> None:
         self.estimated_usd = estimated_usd
         self.limit_usd = limit_usd
         self.changed_files = changed_files
+        self.rechunk_files = rechunk_files
         scope = f" over {changed_files} changed file(s)" if changed_files is not None else ""
+        if rechunk_files:
+            scope += (
+                f"{' and' if scope else ' over'} {rechunk_files} unchanged file(s) whose chunks "
+                "predate the current chunk format (re-chunked and embedded, no LLM)"
+            )
         super().__init__(
             f"Estimated indexing cost ${estimated_usd:.4f}{scope} exceeds the limit "
             f"${limit_usd:.4f}. Raise the limit (max_index_cost_usd, --max-cost or the "
@@ -77,4 +90,38 @@ def estimate_index_cost(preview: dict[str, object], settings: Settings) -> dict[
         "llm_input_tokens": float(llm_input),
         "llm_output_tokens": float(llm_output),
         "embedding_tokens": float(embedding),
+    }
+
+
+def price_largest_files(preview: dict[str, object], settings: Settings) -> dict[str, object]:
+    """Put a dollar figure on each of a preview's ``largest_files`` — the same formula as the total.
+
+    Each file's token/node proxies are replaced by its price, so a caller reads "this JSON
+    table is $0.21 of the $0.62" and can ``.inflorescenceignore`` it, rather than doing token
+    math. A preview without the list is returned unchanged.
+    """
+    largest = preview.get("largest_files")
+    if not isinstance(largest, list):
+        return preview
+    priced = []
+    for item in largest:
+        proxies = {key: item.get(key, 0) for key in ("estimated_tokens", "estimated_nodes")}
+        rest = {key: value for key, value in item.items() if key not in proxies}
+        priced.append({**rest, "estimated_cost_usd": estimate_index_cost(proxies, settings)["usd"]})
+    return {**preview, "largest_files": priced}
+
+
+def estimate_rechunk_cost(preview: dict[str, object], settings: Settings) -> dict[str, float]:
+    """Estimate re-chunking files whose content did not change: embeddings only, no LLM.
+
+    A chunker upgrade (``rag.chunker.CHUNK_FORMAT``) re-cuts every file on the next run.
+    Chunks identical to stored ones reuse their vectors; only what the new format adds is
+    embedded — so pricing the files' whole text at the embedding rate over-estimates, which
+    is the right direction for a guard. Summaries are untouched (their input hashes did not
+    move), so there is no LLM term.
+    """
+    tokens = _as_int(preview.get("estimated_tokens"))
+    return {
+        "usd": round(tokens * settings.embedding_price_usd_per_mtok / 1_000_000, 4),
+        "embedding_tokens": float(tokens),
     }

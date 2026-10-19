@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from inflorescence.code_indexer.models import CodeNode, NodeType
+from inflorescence.code_indexer.models import DECLARATION_NODE_TYPES, CodeNode, NodeType
 from inflorescence.rag.config import RAGConfig
 
 logger = logging.getLogger(__name__)
@@ -100,6 +100,10 @@ _DOCUMENT_LANGUAGES: dict[str, str] = {
     ".ini": "ini",
     ".cfg": "ini",
     ".conf": "ini",
+    ".proto": "proto",
+    ".sql": "sql",
+    ".graphql": "graphql",
+    ".gql": "graphql",
     # Shell scripts are documents here even though _EXT_TO_LANGUAGE has a bash grammar for
     # them: the pipeline gives a .sh file a Document node (it owns no symbols this graph
     # models), so its body is windowed as text. An AST split at this entry point would chunk
@@ -160,6 +164,36 @@ _BINARY_EXTENSIONS: frozenset[str] = frozenset({
     ".db", ".sqlite", ".sqlite3",
     ".bin", ".dat", ".iso", ".img",
 })
+
+
+# Chunk kinds whose content is the file's own text, line for line, so a match inside one can
+# be pointed at by file line number. The two *_context kinds are generated listings (a module's
+# docstring and member table, a class header and its members) — their lines are not file lines.
+VERBATIM_CHUNK_KINDS: frozenset[str] = frozenset({
+    "function_body", "module_body", "type_body", "document", "fallback_text",
+})
+
+# The version of what chunk_repository produces for unchanged content. The coverage marker a
+# file carries (``chunks_checksum``) is its content checksum *plus* this, so bumping it marks
+# every file's chunks stale once: the next run re-chunks them, reuses every vector whose chunk
+# is unchanged, embeds only the chunks the new format adds — and prices that before spending
+# (ProjectManager's cost gates read the same stale set). Bump it whenever a chunker change
+# alters the chunks of a file whose bytes did not move; nothing else can reach such a file.
+#   2 — module-level code and type bodies became verbatim chunks (module_body / type_body).
+CHUNK_FORMAT = 2
+CHUNK_MARKER_SUFFIX = f"@chunks-v{CHUNK_FORMAT}"
+
+# Node types whose own lines (those outside every member with a chunk of its own) are chunked
+# as ``type_body``: fields, enum members, interface members, class attributes.
+_TYPE_NODE_TYPES = frozenset({
+    NodeType.CLASS, NodeType.INTERFACE, NodeType.ENUM, NodeType.STRUCT, NodeType.TRAIT,
+})
+
+# Verbatim window for a function body or a run of module/type lines, in lines. Small enough that
+# a match names a narrow span, with an overlap so a statement cut by the boundary is whole in
+# one of the two windows.
+_BODY_WINDOW_LINES = 80
+_BODY_WINDOW_OVERLAP = 12
 
 
 @dataclass
@@ -287,6 +321,7 @@ class Chunker:
                     chunks.append(self._class_context_chunk(node, file_nodes, lines, language))
                 elif node.node_type in {NodeType.FUNCTION, NodeType.METHOD}:
                     chunks.extend(self._body_chunks(node, lines, language, "function_body"))
+            chunks.extend(self._residual_chunks(file_nodes, lines, language))
         return [chunk for chunk in chunks if chunk.content.strip()]
 
     def collect_files(self, root: Path, exclude_patterns: Sequence[str]) -> list[Path]:
@@ -542,19 +577,98 @@ class Chunker:
         return chunks
 
     def _body_chunks(self, node: CodeNode, lines: list[str], language: str, chunk_kind: str) -> list[Chunk]:
-        start = max(node.line_start, 1)
-        end = min(node.line_end, len(lines))
-        window = 80
-        overlap = 12
+        return self._window_chunks(node, node.line_start, node.line_end, lines, language, chunk_kind)
+
+    def _window_chunks(
+        self,
+        node: CodeNode,
+        first: int,
+        last: int,
+        lines: list[str],
+        language: str,
+        chunk_kind: str,
+        index: int = 0,
+    ) -> list[Chunk]:
+        """Verbatim, overlapping windows over file lines *first*..*last* (1-based, inclusive)."""
+        start = max(first, 1)
+        end = min(last, len(lines))
         chunks: list[Chunk] = []
-        index = 0
         current = start
         while current <= end:
-            chunk_end = min(current + window - 1, end)
+            chunk_end = min(current + _BODY_WINDOW_LINES - 1, end)
             content = "\n".join(lines[current - 1 : chunk_end])
             chunks.append(Chunk(content, node.file_path, current, chunk_end, language, index, node.id, chunk_kind))
             if chunk_end == end:
                 break
-            current = max(chunk_end - overlap + 1, current + 1)
+            current = max(chunk_end - _BODY_WINDOW_OVERLAP + 1, current + 1)
             index += 1
+        return chunks
+
+    def _residual_chunks(self, file_nodes: list[CodeNode], lines: list[str], language: str) -> list[Chunk]:
+        """Verbatim chunks for every line no function or method body chunk already holds.
+
+        A code file used to reach the text index only through its function and method bodies
+        plus two generated listings (the module's member table, a class's header). Everything
+        else in the file — imports, module-level constants, the rule table a whole subsystem
+        is written as, an exported config object, a struct's fields, an enum's members — was
+        in no chunk at all, so no search could find a literal written there: three agents of
+        one field report (11.09.2026) independently failed to find ``Rule("capture.spa_no_xhr",
+        …)`` in a module-level tuple that ``grep`` found instantly, and later reports hit the
+        same wall with ``export const NO_PASS = {…}`` and ``var checkers = map[…]{…}``.
+
+        Each line of the file goes to the innermost node whose span contains it. Lines owned
+        by a function or method are already in that body's chunks; lines owned by a class,
+        interface, enum, struct or trait become ``type_body`` chunks of that node; the rest
+        become ``module_body`` chunks of the module. Contiguous runs are windowed like a body,
+        and a run with no text on it is dropped — the blank lines between two functions are
+        not content.
+        """
+        total = len(lines)
+        module = next((n for n in file_nodes if n.node_type == NodeType.MODULE), None)
+        if module is None or total == 0:
+            return []
+        owners: list[CodeNode | None] = [module] * (total + 1)  # 1-based; index 0 unused
+        # Widest first, so a nested node overwrites its container's claim on the lines it spans.
+        # Declarations (a const, a type alias) are transparent here: their lines stay with the
+        # module or type around them, so a rule table is chunked with its neighbours instead of
+        # as hundreds of one-line chunks, and the declaration itself is found by name.
+        members = sorted(
+            (
+                n for n in file_nodes
+                if n.node_type != NodeType.MODULE
+                and n.node_type not in DECLARATION_NODE_TYPES
+                and n.line_end >= n.line_start
+            ),
+            key=lambda n: (-(n.line_end - n.line_start), n.line_start, n.id),
+        )
+        for node in members:
+            for line in range(max(node.line_start, 1), min(node.line_end, total) + 1):
+                owners[line] = node
+        chunks: list[Chunk] = []
+        run_owner: CodeNode | None = None
+        run_start = 0
+        per_owner_index: dict[str, int] = {}
+
+        def flush(end: int) -> None:
+            if run_owner is None or run_start == 0:
+                return
+            if not any(lines[i - 1].strip() for i in range(run_start, end + 1)):
+                return
+            if run_owner.node_type in _TYPE_NODE_TYPES:
+                kind = "type_body"
+            elif run_owner.node_type == NodeType.MODULE:
+                kind = "module_body"
+            else:
+                return  # a function's or method's lines are its body chunks already
+            index = per_owner_index.get(run_owner.id, 0)
+            produced = self._window_chunks(run_owner, run_start, end, lines, language, kind, index)
+            per_owner_index[run_owner.id] = index + len(produced)
+            chunks.extend(produced)
+
+        for line in range(1, total + 1):
+            owner = owners[line]
+            if owner is not run_owner:
+                flush(line - 1)
+                run_owner, run_start = owner, line
+        flush(total)
         return chunks
