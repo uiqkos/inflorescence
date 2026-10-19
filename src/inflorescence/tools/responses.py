@@ -7,12 +7,19 @@ from typing import Any
 
 MAX_GRAPH_LIMIT = 500
 MAX_SEARCH_LIMIT = 100
+# The fewest entities a ranked search draws from each index: the pool a page is cut from and
+# ``meta.facets`` counts — wider than a page, so the facets show where the candidates lie.
+SEARCH_CANDIDATE_POOL = 100
 
 # Summary preview bound for navigation tools (list/structure/related): a page of
 # hundreds of entities each carrying a multi-paragraph summary overflows tool
 # token limits, so those tools ship a one-line preview and point at
 # get_entity_context for the full text.
 NAV_SUMMARY_MAX_CHARS = 200
+# Page cap when a navigation tool is asked for whole summaries (``full_summaries=true``):
+# module summaries run to a couple of thousand characters, so a default-sized page of them
+# would overflow the very token limit the preview exists to respect.
+FULL_SUMMARY_MAX_LIMIT = 25
 
 _ENTITY_FIELDS = ("id", "name", "node_type", "file_path", "line_start", "line_end", "summary")
 
@@ -50,6 +57,11 @@ def entity_ref(raw: Mapping[str, Any] | None, summary_max_chars: int | None = No
         if field == "summary" and summary_max_chars is not None:
             value = truncate_summary(str(value), summary_max_chars)
         ref[field] = value
+    # An entity with no summary — a top-level declaration (never summarized), or anything
+    # before its first summary exists — would otherwise be a bare name. Its signature line
+    # (``export const RETRY_POLICY = {``, ``def run(job: Job) -> None``) is what says what it is.
+    if not ref.get("summary") and raw.get("signature"):
+        ref["signature"] = raw["signature"]
     return ref
 
 

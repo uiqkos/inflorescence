@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 
+from inflorescence.code_indexer.models import NODE_TYPE_LABELS
 from inflorescence.db.connection import MemgraphConnection
 
 logger = logging.getLogger(__name__)
@@ -23,16 +24,8 @@ PROPERTY_INDEXES: list[tuple[str, str]] = [
     ("Code", "project"),
     ("Code", "parent_id"),
     ("Code", "node_type"),
-    ("Directory", "project"),
-    ("Module", "project"),
-    ("Document", "project"),
-    ("Class", "project"),
-    ("Function", "project"),
-    ("Method", "project"),
-    ("Interface", "project"),
-    ("Enum", "project"),
-    ("Struct", "project"),
-    ("Trait", "project"),
+    # One per node-type label, derived from the enum so a new type is indexed like the rest.
+    *((label, "project") for label in NODE_TYPE_LABELS.values()),
     # Without these, MERGE (c:CodeChunk {id: ..., project: ...}) in STORE_CODE_CHUNKS_BATCH
     # scans every chunk in the DB for each row of the batch. A live re-store benchmark of
     # ~8.1k chunks dropped from 109.3s to 47.5s after adding these two indexes.
@@ -43,7 +36,28 @@ PROPERTY_INDEXES: list[tuple[str, str]] = [
 VECTOR_INDEXES: list[dict[str, str | int]] = [
     {"name": "code_embeddings", "label": "CodeChunk", "property": "embedding", "dimension": 1536, "metric": "cos", "capacity": 10000},
     {"name": "summary_embeddings", "label": "Code", "property": "summary_embedding", "dimension": 1536, "metric": "cos", "capacity": 10000},
+    # The coarse rungs of the CONTAINS ladder, each in an index of its own. The shared
+    # summary index holds every entity of every project (61k vectors on one real machine),
+    # and vector_search.search only filters AFTER its global top-k — so "which directory is
+    # about X" over 39 directories of one project first came back empty, and even a window
+    # that widens until they appear has to rank tens of thousands of functions to reach
+    # them. A label-scoped index ranks directories against directories only.
+    # Optional (not in REQUIRED_SEARCH_VECTORS): without them search uses the shared index
+    # and says so in the response (meta.summary_index_fallback).
+    *(
+        {"name": index, "label": label, "property": "summary_embedding", "dimension": 1536, "metric": "cos", "capacity": 10000}
+        for index, label in (
+            ("directory_summary_embeddings", "Directory"),
+            ("module_summary_embeddings", "Module"),
+        )
+    ),
 ]
+
+# node_type → the label-scoped summary index that ranks that type on its own (see above).
+LEVEL_SUMMARY_INDEXES: dict[str, str] = {
+    "directory": "directory_summary_embeddings",
+    "module": "module_summary_embeddings",
+}
 
 TEXT_INDEXES: list[dict[str, str]] = [
     {"name": "summary_text", "label": "Code", "property": "summary"},
@@ -150,6 +164,38 @@ async def schema_present(conn: MemgraphConnection) -> bool:
     return REQUIRED_INDEX_KEYS.issubset(existing)
 
 
+async def present_vector_indexes(conn: MemgraphConnection) -> set[str]:
+    """Names of the :data:`VECTOR_INDEXES` that exist, matched by (label, property)."""
+    vectors, _texts = await _existing_search_indexes(conn)
+    return {str(v["name"]) for v in VECTOR_INDEXES if (str(v["label"]), str(v["property"])) in vectors}
+
+
+async def mismatched_vector_dimensions(conn: MemgraphConnection, dimension: int) -> dict[str, int]:
+    """``{index name: its width}`` for every :data:`VECTOR_INDEXES` entry not *dimension* wide.
+
+    An index keeps the width it was created with, so after EMBEDDING_DIMENSION changes every
+    vector write into it fails — embeddings paid for and never stored. Read from
+    ``vector_search.show_index_info()``; an image without that procedure reports nothing,
+    since nothing can be verified there.
+    """
+    try:
+        records = await conn.execute_query("CALL vector_search.show_index_info() YIELD * RETURN *")
+    except Exception:  # noqa: BLE001 — an unverifiable width is not evidence of a wrong one
+        logger.debug("vector_search.show_index_info() unavailable; index widths not checked", exc_info=True)
+        return {}
+    widths = {
+        (str(r.get("label", "")).lstrip(":"), str(r.get("property", ""))): int(r["dimension"])
+        for r in records
+        if r.get("dimension") is not None
+    }
+    mismatched: dict[str, int] = {}
+    for vdef in VECTOR_INDEXES:
+        width = widths.get((str(vdef["label"]), str(vdef["property"])))
+        if width is not None and width != dimension:
+            mismatched[str(vdef["name"])] = width
+    return mismatched
+
+
 async def missing_search_indexes(conn: MemgraphConnection) -> list[str]:
     """Return the required vector search indexes that do not exist.
 
@@ -210,8 +256,14 @@ async def _ensure_index_lock_constraint(conn: MemgraphConnection) -> None:
         logger.debug("Uniqueness constraint on :IndexLock(project) already present or unsupported")
 
 
-async def setup_schema(conn: MemgraphConnection) -> list[str]:
+async def setup_schema(conn: MemgraphConnection, *, dimension: int | None = None) -> list[str]:
     """Create all required indexes in Memgraph, skipping any that already exist.
+
+    ``dimension`` is ``Settings.embedding_dimension`` — the width a new vector index is
+    created with. Every index used to be created at a hard-coded 1536 whatever
+    EMBEDDING_DIMENSION said, so a smaller model's vectors could never be stored. It only
+    shapes indexes created now: an existing index keeps its width (changing it means
+    dropping the index and re-indexing, as .env.example says).
 
     Returns the names of required vector search indexes that could NOT be created (empty on a
     healthy MAGE image). A non-empty result is logged at ERROR here and makes the indexing
@@ -242,7 +294,7 @@ async def setup_schema(conn: MemgraphConnection) -> list[str]:
         if (str(label), str(prop)) in existing_vectors:
             logger.info("Vector index %s already exists — skipped", name)
             continue
-        dim = vdef["dimension"]
+        dim = dimension or vdef["dimension"]
         metric = vdef["metric"]
         capacity = vdef.get("capacity", 10000)
         query = (
@@ -281,6 +333,13 @@ async def setup_schema(conn: MemgraphConnection) -> list[str]:
 
     # Authoritative re-read: which required vector search indexes actually exist now? A
     # swallowed creation error above can't hide a missing index from this check.
+    if dimension:
+        for name, width in (await mismatched_vector_dimensions(conn, dimension)).items():
+            logger.error(
+                "Vector index %s is %d wide but EMBEDDING_DIMENSION=%d — vectors of the configured "
+                "width cannot be stored in it. Drop the index and re-index, or set "
+                "EMBEDDING_DIMENSION back to %d.", name, width, dimension, width,
+            )
     missing = await missing_search_indexes(conn)
     if missing:
         logger.error(

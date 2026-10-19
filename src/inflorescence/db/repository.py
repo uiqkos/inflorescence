@@ -6,12 +6,25 @@ import asyncio
 import logging
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from time import monotonic, time
 from typing import Any
 
-from inflorescence.code_indexer.models import CodeNode, Edge, ExternalRef, NodeType
+from inflorescence.code_indexer.models import (
+    DECLARATION_NODE_TYPES,
+    IMPORT_FACT_FIELDS,
+    IMPORT_FACT_FLAGS,
+    NODE_TYPE_LABELS,
+    CodeNode,
+    Edge,
+    EdgeType,
+    ExternalRef,
+    NodeType,
+)
 from inflorescence.db import lease, queries
 from inflorescence.db.connection import MemgraphConnection
+from inflorescence.db.schema import LEVEL_SUMMARY_INDEXES, present_vector_indexes
+from inflorescence.rag.chunker import CHUNK_MARKER_SUFFIX
 
 logger = logging.getLogger(__name__)
 
@@ -61,22 +74,26 @@ _UPSERT_CALLS_EDGES_TEMPLATE = (
     "RETURN count(*) AS written"
 )
 
-_NODE_TYPE_LABEL_BY_VALUE = {
-    NodeType.DIRECTORY.value: "Directory",
-    NodeType.MODULE.value: "Module",
-    NodeType.CLASS.value: "Class",
-    NodeType.FUNCTION.value: "Function",
-    NodeType.METHOD.value: "Method",
-    NodeType.INTERFACE.value: "Interface",
-    NodeType.ENUM.value: "Enum",
-    NodeType.STRUCT.value: "Struct",
-    NodeType.TRAIT.value: "Trait",
-    # Prose files. Labelled apart from :Module so "list the modules" doesn't return
-    # READMEs, and so the file-level queries below can address both explicitly.
-    NodeType.DOCUMENT.value: "Document",
-}
+# IMPORTS edges carry the statement as written (models.Edge.specifier and siblings) and the
+# fingerprint the incremental store compares before deciding a re-MERGE is a no-op.
+_UPSERT_IMPORTS_EDGES_TEMPLATE = (
+    "UNWIND $rows AS row "
+    "MATCH (s:Code {id: row.source, project: $project}) "
+    "MATCH (t {id: row.target, project: $project}) "
+    "WHERE ANY(label IN labels(t) WHERE label IN ['Code', 'External']) "
+    "MERGE (s)-[r:IMPORTS]->(t) "
+    "SET r.specifier = row.specifier, r.line = row.line, r.names = row.names, "
+    "r.dynamic = row.dynamic, r.type_only = row.type_only, r.reexport = row.reexport, "
+    "r.fingerprint = row.fingerprint "
+    "RETURN count(*) AS written"
+)
+
+_NODE_TYPE_LABEL_BY_VALUE = NODE_TYPE_LABELS
 # Invariant (guarded by a test): every NodeType has an entry here. upsert_nodes indexes
 # this map by value, so a type added without a label raises KeyError on its first node.
+# Node types that are never summarized (see models.DECLARATION_NODE_TYPES) — excluded from the
+# missing-summary repair, which would otherwise try to buy one for every constant on every run.
+_DECLARATION_TYPES = sorted(t.value for t in DECLARATION_NODE_TYPES)
 _NODE_TYPE_VALUE_BY_LABEL = {label: value for value, label in _NODE_TYPE_LABEL_BY_VALUE.items()}
 
 # Rows per clone transaction. Far larger than DEFAULT_WRITE_BATCH_SIZE because nothing
@@ -124,16 +141,82 @@ class ProjectCloneError(RuntimeError):
     """
 
 
-# Memgraph's vector_search.search has no filtered variant: it returns the GLOBAL
-# top-k across every project sharing the index, and the project filter runs after.
-# With several indexed projects a small top_k can be fully consumed by another
-# project's nodes, silently starving the query. Over-fetch and truncate post-filter.
+# Memgraph's vector_search.search and text_search.search_all have no filtered variant: they
+# return a GLOBAL window across every project sharing the index, and the project filter runs
+# after. A fixed window is therefore a silent cap on the answer — with several indexed
+# projects (and a worktree clone duplicates every vector of its donor) the window can be
+# consumed by other projects' rows before this one's appear. So the window is not fixed: it
+# starts at a size that answers the common case in one round and widens until this project's
+# rows fill the request or the index has nothing further to give (INV-9). The text procedure
+# additionally stops at 1000 rows unless told otherwise, which is why its window is always
+# passed explicitly.
 _VECTOR_OVERFETCH_FACTOR = 20
 _VECTOR_MIN_FETCH = 256
+_TEXT_MIN_FETCH = 1000
+# Each round multiplies the window by this much, so the rounds stay few even when the first
+# guess was far off.
+_WINDOW_GROWTH = 4
+# The widest window a single search may ask for. Measured on a 187k-node database with a dozen
+# projects: a 65k-row vector window answers in ~0.6 s and a 64k-row text window in ~0.1 s, so
+# the ceiling costs a slow answer, never a stuck one. Reaching it with the window still full
+# is reported as an incomplete result, not passed off as "no more matches".
+_SEARCH_WINDOW_CEILING = 65_536
 
 
 def _vector_fetch_k(top_k: int) -> int:
     return max(top_k * _VECTOR_OVERFETCH_FACTOR, _VECTOR_MIN_FETCH)
+
+
+def _text_fetch_k(top_k: int) -> int:
+    return max(top_k * _VECTOR_OVERFETCH_FACTOR, _TEXT_MIN_FETCH)
+
+
+RowFilter = Callable[[list[dict[str, object]]], list[dict[str, object]]]
+
+# Which named index each search kind reads; the window probes format these in.
+_VECTOR_INDEXES = {"code": "code_embeddings", "summary": "summary_embeddings"}
+_TEXT_INDEXES = {"summary": "summary_text", "symbol": "code_symbols_text", "code": "chunk_content_text"}
+
+
+@dataclass(frozen=True)
+class ProjectHits:
+    """One project's rows from a global search index, and whether they are the whole answer.
+
+    ``complete`` is True when ``rows`` are provably this project's best rows for the request —
+    either enough of them were found inside the global window, or the window came back short,
+    which means the index held nothing further. It is False only when the widest window this
+    repository will ask for was still full and the request still unfilled: rows may exist
+    beyond it, so an empty or short result must not be read as "nothing else matches".
+    """
+
+    rows: list[dict[str, object]]
+    complete: bool
+    # Set when a narrower index was asked for but absent and the shared one answered instead:
+    # the indexes that were missing. The rows are still right, only ranked against more.
+    fallback_from: tuple[str, ...] = ()
+
+
+def _keep_all(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return rows
+
+
+def _take_entities(rows: list[dict[str, object]], needed: int) -> tuple[list[dict[str, object]], bool]:
+    """The best rows of the first *needed* distinct entities, and whether that many were there.
+
+    Rows are best first. Every row of an entity already taken is kept (a function's second
+    matching chunk still says where in it the match is); a row of a new entity is kept only
+    while fewer than *needed* entities have been taken.
+    """
+    taken: set[object] = set()
+    out: list[dict[str, object]] = []
+    for row in rows:
+        key = row.get("id")
+        if key not in taken:
+            if len(taken) >= needed:
+                continue
+            taken.add(key)
+        out.append(row)
+    return out, len(taken) >= needed
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +349,65 @@ def _code_node_from_row(row: Mapping[str, object]) -> CodeNode | None:
         docstring=str(row.get("docstring") or ""),
         summary=str(row.get("summary") or ""),
         summary_input_hash=str(row.get("summary_input_hash") or ""),
+        summary_prompt_version=str(row.get("summary_prompt_version") or ""),
     )
+
+
+# The IMPORTS properties a reader gets, in this order; flags only when true (INV-7's convention).
+_IMPORT_FIELDS = IMPORT_FACT_FIELDS
+_IMPORT_FLAGS = IMPORT_FACT_FLAGS
+
+
+def _import_facts(props: Mapping[str, object] | None) -> dict[str, object] | None:
+    """The statement behind an IMPORTS edge, or ``None`` for an edge written before it was kept."""
+    if not props or not props.get("specifier"):
+        return None
+    facts: dict[str, object] = {key: props[key] for key in _IMPORT_FIELDS if props.get(key) not in (None, "", [])}
+    facts.update({flag: True for flag in _IMPORT_FLAGS if props.get(flag)})
+    return facts
+
+
+def _relation_row(
+    raw: Mapping[str, object], entity: Mapping[str, object] | None, *, serialized: bool = False
+) -> dict[str, object]:
+    """``{relation, entity[, import]}`` — ``import`` carries how an IMPORTS edge was written."""
+    row: dict[str, object] = {
+        "relation": raw["relation"],
+        "entity": entity if serialized else _serialize_entity(entity),
+    }
+    if raw["relation"] == "IMPORTS":
+        facts = _import_facts(raw.get("edge"))  # type: ignore[arg-type]
+        if facts:
+            row["import"] = facts
+    return row
+
+
+def _edge_row(edge: Edge) -> dict[str, object]:
+    """One UNWIND row for an edge upsert; the IMPORTS fields ride along only on IMPORTS."""
+    row: dict[str, object] = {
+        "source": edge.source,
+        "target": edge.target,
+        "resolution": edge.resolution,
+        "callee_text": edge.callee_text,
+    }
+    if edge.edge_type is EdgeType.IMPORTS:
+        row.update(
+            specifier=edge.specifier,
+            line=edge.line,
+            names=list(edge.names),
+            dynamic=edge.dynamic,
+            type_only=edge.type_only,
+            reexport=edge.reexport,
+            fingerprint=edge.import_fingerprint(),
+        )
+    return row
 
 
 def _serialize_entity(raw: Mapping[str, object] | None, prefix: str = "") -> dict[str, object] | None:
     if raw is None:
         return None
     p = f"{prefix}." if prefix else ""
-    return {
+    entity = {
         "id": raw.get(f"{p}id"),
         "name": raw.get(f"{p}name"),
         "node_type": _node_type_from_labels(raw.get(f"{p}labels")),
@@ -282,6 +416,30 @@ def _serialize_entity(raw: Mapping[str, object] | None, prefix: str = "") -> dic
         "line_end": raw.get(f"{p}line_end"),
         "summary": raw.get(f"{p}summary"),
     }
+    # Only when the query returned one: ``entity_ref`` shows it for entities without a summary.
+    signature = raw.get(f"{p}signature")
+    if signature:
+        entity["signature"] = signature
+    return entity
+
+
+def _serialize_scored_entity(raw: Mapping[str, object]) -> dict[str, object]:
+    return {**(_serialize_entity(raw) or {}), "score": raw.get("score")}
+
+
+def _serialize_chunk_hit(raw: Mapping[str, object]) -> dict[str, object]:
+    """An entity joined to the chunk that matched it, with the chunk's span (and text, if read)."""
+    hit = {
+        **(_serialize_entity(raw) or {}),
+        "score": raw.get("score"),
+        "chunk_id": raw.get("chunk_id"),
+        "chunk_kind": raw.get("chunk_kind"),
+        "match_start_line": raw.get("match_start_line"),
+        "match_end_line": raw.get("match_end_line"),
+    }
+    if raw.get("chunk_content") is not None:
+        hit["chunk_content"] = raw.get("chunk_content")
+    return hit
 
 
 class GraphRepository:
@@ -324,6 +482,7 @@ class GraphRepository:
                         "docstring": node.docstring,
                         "summary": node.summary,
                         "summary_input_hash": node.summary_input_hash,
+                        "summary_prompt_version": node.summary_prompt_version,
                         "parent_id": node.parent_id,
                         "external_calls": node.external_calls,
                         "unresolved_calls": node.unresolved_calls,
@@ -353,19 +512,13 @@ class GraphRepository:
         for edge_type, group in by_type.items():
             if edge_type == "CALLS":
                 query = _UPSERT_CALLS_EDGES_TEMPLATE
+            elif edge_type == "IMPORTS":
+                query = _UPSERT_IMPORTS_EDGES_TEMPLATE
             else:
                 query = _UPSERT_EDGES_BATCH_TEMPLATE.format(edge_type=edge_type)
             for start in range(0, len(group), self._batch_size):
                 chunk = group[start : start + self._batch_size]
-                rows = [
-                    {
-                        "source": edge.source,
-                        "target": edge.target,
-                        "resolution": edge.resolution,
-                        "callee_text": edge.callee_text,
-                    }
-                    for edge in chunk
-                ]
+                rows = [_edge_row(edge) for edge in chunk]
                 result = await self._conn.execute_write_query(query, {"project": project, "rows": rows})
                 written += _written(result)
                 logger.info("Upserted %d/%d edges for project=%s", written, submitted, project)
@@ -826,6 +979,11 @@ class GraphRepository:
         records = await self._conn.execute_query(queries.GET_CHUNK_INDEX, {"project": project})
         return {r["id"]: str(r.get("file_path") or "") for r in records if r.get("id")}
 
+    async def get_import_fingerprints(self, project: str) -> dict[tuple[str, str], str]:
+        """``{(source, target): fingerprint}`` for every stored IMPORTS edge ("" when it has none)."""
+        records = await self._conn.execute_query(queries.GET_IMPORT_FINGERPRINTS, {"project": project})
+        return {(str(r["source"]), str(r["target"])): str(r.get("fingerprint") or "") for r in records}
+
     async def get_code_edges(self, project: str) -> list[tuple[str, str, str]]:
         """Return ``(source_id, TYPE, target_id)`` for every Code->Code relationship."""
         records = await self._conn.execute_query(queries.GET_CODE_EDGES, {"project": project})
@@ -930,6 +1088,20 @@ class GraphRepository:
             queries.SET_PROJECT_ROOT_PATH,
             {"project": project, "root_path": root_path},
         )
+
+    async def set_indexed_head(self, project: str, head: str | None) -> None:
+        """Record the commit this project's index now matches the disk at (see SET_INDEXED_HEAD)."""
+        await self._conn.execute_write(queries.SET_INDEXED_HEAD, {"project": project, "head": head})
+
+    async def get_indexed_head(self, project: str) -> str | None:
+        """The commit the index last matched the disk at, or ``None``. Never raises."""
+        try:
+            records = await self._conn.execute_query(queries.GET_INDEXED_HEAD, {"project": project})
+        except Exception:  # noqa: BLE001 — a provenance read must never break the caller's answer
+            logger.debug("Could not read indexed_head for project=%s", project, exc_info=True)
+            return None
+        head = records[0].get("head") if records else None
+        return str(head) if head else None
 
     async def get_watch_state(self, project: str) -> dict[str, Any]:
         """Is anything keeping this project's index current? ``{watched, live, holder, daemon_live}``.
@@ -1162,7 +1334,11 @@ class GraphRepository:
             batch = items[start : start + self._batch_size]
             result = await self._conn.execute_write_query(
                 queries.MARK_CHUNKS_COVERED,
-                {"project": project, "rows": [dict(item) for item in batch]},
+                {
+                    "project": project,
+                    "rows": [dict(item) for item in batch],
+                    "marker_suffix": CHUNK_MARKER_SUFFIX,
+                },
             )
             written += _written(result)
         return written
@@ -1183,6 +1359,7 @@ class GraphRepository:
             r["id"]: {
                 "summary": r["summary"],
                 "summary_input_hash": r["summary_input_hash"],
+                "summary_prompt_version": r.get("summary_prompt_version") or "",
                 "summary_embedding": r["summary_embedding"],
                 "summary_embedding_hash": r["summary_embedding_hash"],
             }
@@ -1211,6 +1388,7 @@ class GraphRepository:
             r["id"]: {
                 "summary": r["summary"],
                 "summary_input_hash": r["summary_input_hash"],
+                "summary_prompt_version": r.get("summary_prompt_version") or "",
                 "summary_embedding_hash": r["summary_embedding_hash"],
                 "has_embedding": bool(r["has_embedding"]),
             }
@@ -1262,7 +1440,9 @@ class GraphRepository:
 
     async def get_nodes_missing_summaries(self, project: str) -> list[tuple[CodeNode, int]]:
         """Return (node, child_count) pairs for nodes with no summary at all."""
-        records = await self._conn.execute_query(queries.GET_NODES_MISSING_SUMMARIES, {"project": project})
+        records = await self._conn.execute_query(
+            queries.GET_NODES_MISSING_SUMMARIES, {"project": project, "declaration_types": _DECLARATION_TYPES}
+        )
         return [
             (node, int(r["child_count"] or 0))
             for r in records
@@ -1272,7 +1452,8 @@ class GraphRepository:
     async def get_child_summary_rows(self, project: str, node_id: str) -> list[CodeNode]:
         """Return a container's direct children with their stored summaries, in source order."""
         records = await self._conn.execute_query(
-            queries.GET_CHILD_SUMMARY_ROWS, {"project": project, "node_id": node_id}
+            queries.GET_CHILD_SUMMARY_ROWS,
+            {"project": project, "node_id": node_id, "declaration_types": _DECLARATION_TYPES},
         )
         return [node for r in records if (node := _code_node_from_row(r)) is not None]
 
@@ -1280,10 +1461,14 @@ class GraphRepository:
         """Return file paths whose stored chunks are missing, partial, or stale content.
 
         A file is flagged when its module node's ``chunks_checksum`` coverage marker is
-        absent or no longer equals the current file checksum — i.e. the chunks were never
-        fully stored (missing / killed mid-window) or belong to old content (finding 8b).
+        absent or no longer equals the current file checksum stamped with the current chunk
+        format — i.e. the chunks were never fully stored (missing / killed mid-window), belong
+        to old content (finding 8b), or were cut by an older chunker (``CHUNK_FORMAT``).
         """
-        records = await self._conn.execute_query(queries.GET_FILES_WITH_STALE_CHUNKS, {"project": project})
+        records = await self._conn.execute_query(
+            queries.GET_FILES_WITH_STALE_CHUNKS,
+            {"project": project, "marker_suffix": CHUNK_MARKER_SUFFIX},
+        )
         return [r["file_path"] for r in records]
 
     async def get_nodes_missing_contains_edges(self, project: str) -> list[tuple[str, str]]:
@@ -1415,34 +1600,189 @@ class GraphRepository:
             )
         return written
 
+    async def _widening_search(
+        self,
+        run_rows: Callable[[int], Awaitable[list[Mapping[str, object]]]],
+        run_count: Callable[[int], Awaitable[int]],
+        serialize: Callable[[Mapping[str, object]], dict[str, object]],
+        needed: int,
+        start: int,
+        keep: RowFilter,
+    ) -> ProjectHits:
+        """Ask a global index for wider and wider windows until this project's entities suffice.
+
+        *run_rows(fetch)* returns this project's rows from a global window of *fetch*
+        candidates, best first; *keep* applies whatever else the caller filters on (paths,
+        node types, tests) — applied here rather than after, because a filter that removes
+        rows is exactly what can leave a page unfilled while matches remain outside the
+        window. *needed* counts distinct entities, not rows: a chunk index returns several
+        rows for one long function, and the caller pages over entities, so a hundred chunks
+        of one file are one result, not a full page (see :func:`_take_entities`). The loop
+        stops as soon as one of three things is true:
+
+        * *needed* entities survived — they are this project's best, since any better one
+          would rank inside the same window;
+        * the window came back short of *fetch* (*run_count*), so the index has nothing more
+          to offer and a short answer is the whole answer;
+        * the window reached :data:`_SEARCH_WINDOW_CEILING` still full — then the answer is
+          reported incomplete rather than guessed complete.
+
+        *run_count* is asked only on the rounds that need it, so the common case — the first
+        window already holds the page — costs one query, as before.
+        """
+        fetch = max(1, start)
+        while True:
+            kept, enough = _take_entities(keep([serialize(r) for r in await run_rows(fetch)]), needed)
+            if enough:
+                return ProjectHits(kept, complete=True)
+            if await run_count(fetch) < fetch:
+                return ProjectHits(kept, complete=True)
+            if fetch >= _SEARCH_WINDOW_CEILING:
+                logger.info(
+                    "Search window reached its ceiling of %d candidates with %d rows of fewer than %d entities",
+                    fetch, len(kept), needed,
+                )
+                return ProjectHits(kept, complete=False)
+            fetch = min(fetch * _WINDOW_GROWTH, _SEARCH_WINDOW_CEILING)
+
+    async def vector_hits(
+        self,
+        kind: str,
+        project: str,
+        embedding: list[float],
+        needed: int,
+        keep: RowFilter = _keep_all,
+        node_types: Sequence[str] | None = None,
+    ) -> ProjectHits:
+        """This project's nearest *needed* rows by vector similarity (*kind*: code | summary).
+
+        Code hits are chunks joined to their owning entity; summary hits are entities. Every
+        round is retried through Memgraph's post-deletion vector-index lag (see
+        :func:`_vector_search_with_retry`); any other failure propagates untouched.
+
+        A summary search whose *node_types* all have a label-scoped index of their own
+        (``schema.LEVEL_SUMMARY_INDEXES`` — directories, modules) runs in those indexes, so a
+        few hundred directories are ranked against each other instead of behind every function
+        of every project. Each index widens on its own exactly like the shared one, and their
+        rows merge by score. *keep* still applies the type filter, so the answer is the same
+        set either way — only the work to reach it differs. When one of those indexes is
+        absent (a database set up before they existed), the shared index answers and
+        ``fallback_from`` names what was missing.
+        """
+        level = [LEVEL_SUMMARY_INDEXES.get(t) for t in node_types or ()] if kind == "summary" else []
+        if level and all(level):
+            wanted = sorted({str(index) for index in level})
+            present = await present_vector_indexes(self._conn)
+            missing = tuple(index for index in wanted if index not in present)
+            if not missing:
+                per_index = [
+                    await self._vector_hits_in(index, kind, project, embedding, needed, keep) for index in wanted
+                ]
+                if len(per_index) == 1:
+                    return per_index[0]
+                merged = sorted(
+                    (row for hits in per_index for row in hits.rows),
+                    key=lambda row: float(row.get("score") or 0.0),  # type: ignore[arg-type]
+                    reverse=True,
+                )
+                rows, _ = _take_entities(merged, needed)
+                return ProjectHits(rows, complete=all(hits.complete for hits in per_index))
+            found = await self._vector_hits_in(_VECTOR_INDEXES[kind], kind, project, embedding, needed, keep)
+            logger.warning(
+                "Summary indexes %s are missing — searched the shared summary index instead "
+                "(the server creates them in setup_schema on its next start)", ", ".join(missing),
+            )
+            return ProjectHits(found.rows, found.complete, fallback_from=missing)
+        return await self._vector_hits_in(_VECTOR_INDEXES[kind], kind, project, embedding, needed, keep)
+
+    async def _vector_hits_in(
+        self,
+        index: str,
+        kind: str,
+        project: str,
+        embedding: list[float],
+        needed: int,
+        keep: RowFilter,
+    ) -> ProjectHits:
+        """One vector index, widened until this project's *needed* entities are in the window."""
+        query = (
+            queries.VECTOR_SEARCH_CODE if kind == "code" else queries.VECTOR_SEARCH_SUMMARY_TEMPLATE.format(index=index)
+        )
+        probe = queries.VECTOR_SEARCH_WINDOW_TEMPLATE.format(index=index)
+
+        async def run_rows(fetch: int) -> list[Mapping[str, object]]:
+            return await _vector_search_with_retry(
+                lambda: self._conn.execute_query(
+                    query, {"embedding": embedding, "fetch": fetch, "project": project}
+                )
+            )
+
+        async def run_count(fetch: int) -> int:
+            records = await _vector_search_with_retry(
+                lambda: self._conn.execute_query(probe, {"embedding": embedding, "fetch": fetch})
+            )
+            return int(records[0]["scanned"]) if records else 0
+
+        serialize = _serialize_chunk_hit if kind == "code" else _serialize_scored_entity
+        return await self._widening_search(
+            run_rows, run_count, serialize, needed, _vector_fetch_k(needed), keep
+        )
+
+    async def text_hits(
+        self,
+        kind: str,
+        project: str,
+        query: str,
+        needed: int,
+        keep: RowFilter = _keep_all,
+        fuzzy_distance: int = 0,
+    ) -> ProjectHits:
+        """This project's best *needed* BM25 rows (*kind*: summary | symbol | code).
+
+        *fuzzy_distance* > 0 (code only) matches every indexed word within that many edits of
+        a query word — the fallback for a word that matched nothing as typed.
+        """
+        if fuzzy_distance and kind != "code":
+            raise ValueError("fuzzy text search is only defined over code chunks")
+        if fuzzy_distance:
+            statement = queries.TEXT_SEARCH_CODE_FUZZY
+            probe = queries.TEXT_SEARCH_WINDOW_TEMPLATE.format(
+                index=_TEXT_INDEXES[kind], extra=", fuzzy_distance: $distance"
+            )
+        else:
+            statement = {
+                "summary": queries.TEXT_SEARCH_SUMMARY,
+                "symbol": queries.TEXT_SEARCH_SYMBOL,
+                "code": queries.TEXT_SEARCH_CODE,
+            }[kind]
+            probe = queries.TEXT_SEARCH_WINDOW_TEMPLATE.format(index=_TEXT_INDEXES[kind], extra="")
+
+        async def run_rows(fetch: int) -> list[Mapping[str, object]]:
+            params: dict[str, object] = {"query": query, "fetch": fetch, "project": project}
+            if fuzzy_distance:
+                params["distance"] = fuzzy_distance
+            return await self._conn.execute_query(statement, params)
+
+        async def run_count(fetch: int) -> int:
+            params: dict[str, object] = {"query": query, "fetch": fetch}
+            if fuzzy_distance:
+                params["distance"] = fuzzy_distance
+            records = await self._conn.execute_query(probe, params)
+            return int(records[0]["scanned"]) if records else 0
+
+        serialize = _serialize_chunk_hit if kind == "code" else _serialize_scored_entity
+        return await self._widening_search(
+            run_rows, run_count, serialize, needed, _text_fetch_k(needed), keep
+        )
+
     async def search_code_vectors(
         self,
         project: str,
         embedding: list[float],
         top_k: int = 10,
     ) -> list[dict[str, object]]:
-        """Search code chunks by vector similarity.
-
-        Retries Memgraph's post-deletion vector-index lag (see
-        :func:`_vector_search_with_retry`); any other failure propagates untouched.
-        """
-        records = await _vector_search_with_retry(
-            lambda: self._conn.execute_query(
-                queries.VECTOR_SEARCH_CODE,
-                {"embedding": embedding, "top_k": _vector_fetch_k(top_k), "project": project},
-            )
-        )
-        return [
-            {
-                **_serialize_entity(r),
-                "score": r["score"],
-                "chunk_id": r["chunk_id"],
-                "chunk_kind": r["chunk_kind"],
-                "match_start_line": r["match_start_line"],
-                "match_end_line": r["match_end_line"],
-            }
-            for r in records[:top_k]
-        ]
+        """This project's *top_k* code chunks by vector similarity (see :meth:`vector_hits`)."""
+        return (await self.vector_hits("code", project, embedding, top_k)).rows
 
     async def search_summary_vectors(
         self,
@@ -1450,21 +1790,8 @@ class GraphRepository:
         embedding: list[float],
         top_k: int = 10,
     ) -> list[dict[str, object]]:
-        """Search nodes by summary embedding similarity.
-
-        Retries Memgraph's post-deletion vector-index lag (see
-        :func:`_vector_search_with_retry`); any other failure propagates untouched.
-        """
-        records = await _vector_search_with_retry(
-            lambda: self._conn.execute_query(
-                queries.VECTOR_SEARCH_SUMMARY,
-                {"embedding": embedding, "top_k": _vector_fetch_k(top_k), "project": project},
-            )
-        )
-        return [
-            {**_serialize_entity(r), "score": r["score"]}
-            for r in records[:top_k]
-        ]
+        """This project's *top_k* entities by summary similarity (see :meth:`vector_hits`)."""
+        return (await self.vector_hits("summary", project, embedding, top_k)).rows
 
     async def search_summary_text(
         self,
@@ -1473,14 +1800,7 @@ class GraphRepository:
         top_k: int = 10,
     ) -> list[dict[str, object]]:
         """BM25 keyword search over Code.summary via the summary_text text index."""
-        records = await self._conn.execute_query(
-            queries.TEXT_SEARCH_SUMMARY,
-            {"query": query, "top_k": top_k, "project": project},
-        )
-        return [
-            {**_serialize_entity(r), "score": r["score"]}
-            for r in records
-        ]
+        return (await self.text_hits("summary", project, query, top_k)).rows
 
     async def search_symbol_text(
         self,
@@ -1489,14 +1809,7 @@ class GraphRepository:
         top_k: int = 10,
     ) -> list[dict[str, object]]:
         """BM25 keyword search over Code.name / Code.signature via code_symbols_text."""
-        records = await self._conn.execute_query(
-            queries.TEXT_SEARCH_SYMBOL,
-            {"query": query, "top_k": top_k, "project": project},
-        )
-        return [
-            {**_serialize_entity(r), "score": r["score"]}
-            for r in records
-        ]
+        return (await self.text_hits("symbol", project, query, top_k)).rows
 
     async def search_code_text(
         self,
@@ -1505,21 +1818,7 @@ class GraphRepository:
         top_k: int = 10,
     ) -> list[dict[str, object]]:
         """BM25 keyword search over CodeChunk.content, joined to the owning Code entity."""
-        records = await self._conn.execute_query(
-            queries.TEXT_SEARCH_CODE,
-            {"query": query, "top_k": top_k, "project": project},
-        )
-        return [
-            {
-                **_serialize_entity(r),
-                "score": r["score"],
-                "chunk_id": r["chunk_id"],
-                "chunk_kind": r["chunk_kind"],
-                "match_start_line": r["match_start_line"],
-                "match_end_line": r["match_end_line"],
-            }
-            for r in records
-        ]
+        return (await self.text_hits("code", project, query, top_k)).rows
 
     # ------------------------------------------------------------------
     # Graph queries
@@ -1547,7 +1846,7 @@ class GraphRepository:
         if node_id:
             query = queries.GET_STRUCTURE_ROOT_BY_ID
             params = {"project": project, "node_id": node_id}
-        elif file_path:
+        elif file_path and file_path != ".":
             query = queries.GET_STRUCTURE_ROOT_BY_FILE
             params = {"project": project, "file_path": file_path}
         else:
@@ -1597,16 +1896,8 @@ class GraphRepository:
             "entity": _serialize_entity(record["entity"]),
             "parent": _serialize_entity(record["parent"]),
             "children": [_serialize_entity(child) for child in record["children"] if child],
-            "incoming": [
-                {"relation": row["relation"], "entity": _serialize_entity(row["entity"])}
-                for row in record["incoming"]
-                if row.get("entity")
-            ],
-            "outgoing": [
-                {"relation": row["relation"], "entity": _serialize_entity(row["entity"])}
-                for row in record["outgoing"]
-                if row.get("entity")
-            ],
+            "incoming": [_relation_row(row, row["entity"]) for row in record["incoming"] if row.get("entity")],
+            "outgoing": [_relation_row(row, row["entity"]) for row in record["outgoing"] if row.get("entity")],
         }
 
     async def get_related_entities(
@@ -1630,13 +1921,18 @@ class GraphRepository:
             },
         )
         return [
-            {
-                "relation": r["relation"],
-                "direction": r["direction"],
-                "entity": _serialize_entity(r, "related"),
-            }
+            {"direction": r["direction"], **_relation_row(r, _serialize_entity(r, "related"), serialized=True)}
             for r in records
         ]
+
+    async def get_file_entities(self, project: str, file_paths: list[str]) -> list[dict[str, object]]:
+        """Every entity with a line span in *file_paths* (one query for a whole page of files)."""
+        if not file_paths:
+            return []
+        records = await self._conn.execute_query(
+            queries.GET_FILE_ENTITIES, {"project": project, "file_paths": file_paths}
+        )
+        return [entity for r in records if (entity := _serialize_entity(r, "n"))]
 
     async def search_entities(
         self,

@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from inflorescence.code_indexer.models import EdgeType, NodeType
 from inflorescence.db.connection import MemgraphConnection
+from inflorescence.db.schema import VECTOR_INDEXES
 from inflorescence.project_manager import ProjectManager
 from inflorescence.tools.responses import clamp_limit, clamp_offset, error_response, paginated_response
 
@@ -337,10 +338,26 @@ def register_cypher_tools(mcp: FastMCP, manager: ProjectManager, conn: MemgraphC
                                   "absent on graphs indexed before the resolution ladder",
                     "callee_text": "the call as written at the call site, e.g. 's.content.ForCheck'",
                 },
+                "IMPORTS": {
+                    "specifier": "the module as written in the statement: '../tasks', './board.css', 'net/http'",
+                    "line": "line of the first statement behind this edge",
+                    "names": "names the statements bring in, e.g. ['TASKS']; '*' = namespace / whole "
+                             "module, 'default' = default import; empty for side-effect and dynamic imports",
+                    "dynamic": "true when every statement behind the edge is a lazy import() — the "
+                               "dependency is a split chunk, not part of the static bundle",
+                    "type_only": "true when every statement is `import type` (erased at build)",
+                    "reexport": "true when a statement re-exports (`export ... from`)",
+                    "note": "Several statements from one file into one target fold into one edge. A "
+                            "named JS/TS import ALSO gets an edge to the symbol itself "
+                            "(module::NAME), so incoming IMPORTS on a constant answer 'who reads "
+                            "it'. Edges written before these properties existed gain them on the "
+                            "next index run (no LLM spend); until then they are absent.",
+                },
             },
             "entity_properties": [
                 "id", "node_type", "name", "file_path", "line_start", "line_end",
-                "signature", "docstring", "summary", "summary_input_hash", "parent_id",
+                "signature", "docstring", "summary", "summary_input_hash", "summary_prompt_version",
+                "parent_id",
                 "project", "summary_embedding", "checksum", "root_path",
                 "external_calls", "unresolved_calls", "calls_provenance",
             ],
@@ -352,12 +369,18 @@ def register_cypher_tools(mcp: FastMCP, manager: ProjectManager, conn: MemgraphC
                 "('scip-go'/'scip-python'/'scip-typescript' = compiler-grade, 'heuristic' = "
                 "syntactic ladder)."
             ),
+            "summary_prompt_version": (
+                "Which revision of the summarization prompts wrote the summary ('<layout>.<prompt "
+                "digest>'; empty = written before revisions were recorded). A prompt change does "
+                "not re-summarize anything by itself, so one project can hold summaries of several "
+                "revisions; group by this property to see which."
+            ),
             "chunk_properties": [
                 "id", "node_id", "file_path", "content", "start_line", "end_line",
                 "language", "chunk_kind", "embedding", "project",
             ],
             "indexes": {
-                "vector": ["code_embeddings", "summary_embeddings"],
+                "vector": [str(index["name"]) for index in VECTOR_INDEXES],
                 "text": ["summary_text", "code_symbols_text", "chunk_content_text"],
             },
             "query_rules": [

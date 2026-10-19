@@ -42,6 +42,7 @@ import pytest
 from inflorescence.config import Settings
 from inflorescence.db import repository as repository_module
 from inflorescence.db.repository import GraphRepository
+from inflorescence.rag.chunker import CHUNK_MARKER_SUFFIX
 
 LIVE_URL = os.environ.get("INFLORESCENCE_TEST_MEMGRAPH_URL")
 live = pytest.mark.skipif(
@@ -140,7 +141,7 @@ async def test_mark_chunks_covered_stamps_every_row_of_the_batch() -> None:
             {"project": project},
         )
         assert {r["file_path"] for r in stamped} == set(every_file)
-        assert all(r["marker"] == f"sum-{r['file_path']}" for r in stamped)
+        assert all(r["marker"] == f"sum-{r['file_path']}{CHUNK_MARKER_SUFFIX}" for r in stamped)
 
         # The money consequence: nothing is re-chunked and re-embedded next run.
         assert await repo.get_files_with_stale_chunks(project) == []
@@ -173,6 +174,11 @@ class _FakeConn:
         self.calls = 0
 
     async def execute_query(self, query, params=None, max_records=None):  # noqa: ANN001, ANN202
+        if "AS scanned" in query:
+            # The window probe a short page triggers: this fake's index holds one row, so the
+            # window came back short and the search stops without widening. Not counted —
+            # the tests below are about the retry policy of the search statement itself.
+            return [{"scanned": 1}]
         self.calls += 1
         if self._remaining > 0:
             self._remaining -= 1

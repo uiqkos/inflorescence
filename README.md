@@ -53,11 +53,11 @@ stream in batch by batch, and an interrupted run resumes without repeating LLM s
 
 ## FIG. 02 · GRAPH
 
-Ten node types and five edge types, plus the chunks.
+Twelve node types and five edge types, plus the chunks.
 
 ```
 directory ──CONTAINS───▶ directory · module · document
-module    ──CONTAINS───▶ class · function
+module    ──CONTAINS───▶ class · function · variable · type_alias
 class     ──CONTAINS───▶ method
 
 module    ──IMPORTS────▶ module · document · External
@@ -69,14 +69,14 @@ Code      ──HAS_CHUNK──▶ CodeChunk
 
 | | values |
 |---|---|
-| `node_types` | `module` `class` `function` `method` `directory` `interface` `enum` `struct` `trait` `document` |
+| `node_types` | `module` `class` `function` `method` `directory` `interface` `enum` `struct` `trait` `document` `variable` `type_alias` |
 | relationship types | `CONTAINS` `CALLS` `IMPORTS` `INHERITS` `IMPLEMENTS` `HAS_CHUNK` |
-| node labels | `Code` + exactly one type label (`Module`, `Class`, …); `CodeChunk`; `External` |
+| node labels | `Code` + exactly one type label (`Module`, `Class`, …, `TypeAlias`); `CodeChunk`; `External` |
 | `CALLS.resolution` | `semantic` `exact` `import` `field-type` `self` `same-module` `same-package` |
 
 Every entity carries `id`, `name`, `file_path`, `line_start` / `line_end`, `signature`,
-`docstring`, `summary`, `summary_input_hash`, `parent_id`, `checksum`, `calls_provenance`,
-`external_calls`, `unresolved_calls`, and its summary embedding. `graph_schema` returns this
+`docstring`, `summary`, `summary_input_hash`, `summary_prompt_version`, `parent_id`, `checksum`,
+`calls_provenance`, `external_calls`, `unresolved_calls`, and its summary embedding. `graph_schema` returns this
 list at run time, which is what you should read before writing Cypher.
 
 **`document` nodes** are non-code files indexed whole — prose, stylesheets, markup and
@@ -88,6 +88,14 @@ no outgoing edges, but code that imports one by path — `import './index.css'`,
 `import cfg from './config.json'` — points an `IMPORTS` edge at it, so "who pulls in this
 stylesheet" is an ordinary `get_related_entities(direction="incoming")` call. Filter them in or
 out with `node_types=["document"]` like any other type.
+
+**Declarations — `variable` and `type_alias`** are top-level bindings that are not functions
+(`export const RULES = [...]`, `MIN_BATCH_SIZE = 400`, a Go `var`, a Rust `static`) and named
+types that are not classes (`type OrderTotals = {...}`, `type Status string`). Their signature is
+the declaration's first line, and that is their whole description: they get no LLM summary and
+take no part in their module's summary input, so their appearance re-buys no summary anywhere.
+Find them by name (`search_entities`) and their lines with `search_text` / `find_text`; their
+text stays inside the module's chunks.
 
 **`External` nodes** are packages the project imports and base classes it inherits from,
 living outside the indexed tree. They are deliberately *not* labelled `Code`, so they never
@@ -107,20 +115,39 @@ Every entity gets one LLM-written summary, and it is what `search_semantic` sear
 container's summary is written from its children's summaries, so the hierarchy reads
 bottom-up: method → class → module → directory.
 
+Written bottom-up, read top-down. Because each directory's summary describes its whole subtree,
+an agent that does not know where something lives can walk down to it one level per call —
+`get_entity_structure(dir)` for the root, `file_path="src/pkg"` for a directory,
+`file_path="src/pkg/client.py"` for a file's functions with line ranges — reading a short page of
+summaries at each step instead of listing every module at once. Or jump by meaning:
+`search_semantic(node_types=["directory"])` ranks directories against directories only (they
+and modules have vector indexes of their own, so a few dozen directories are not crowded out of
+the candidate pool by every function of every indexed project). A database created before those
+indexes existed gets them at the server's next start; until then the search uses the shared index
+and says so in `meta.summary_index_fallback`.
+
 Re-summarization is decided by a content hash, not by a timestamp. `summary_input_hash` is
 `H(source + signature + docstring)` for a leaf and `H(ordered child descriptors, each carrying
 that child's current summary)` for a container. A changed leaf therefore propagates exactly one
 path upward — the file, its directory, the root — and nothing else in the project is re-sent.
 
 On failure the previous summary is kept and the hash is cleared, so the node is dirty again
-next run: stale beats empty (INV-3). `USE_LLM_SUMMARIES=false` skips this stage entirely and
+next run: stale beats empty (INV-3).
+
+Each summary also records which prompts wrote it: `summary_prompt_version` (`"<layout>.<digest
+of the system prompts>"`). It is deliberately *not* part of the hash — a reworded prompt does
+not re-buy every summary in every indexed project. A reused summary keeps the version it was
+written with, so one project can hold several revisions —
+`MATCH (n:Code {project: $project}) RETURN n.summary_prompt_version, count(*)` shows which (empty
+= written before versions were recorded). Rebuilding older ones is a deliberate, priced decision. `USE_LLM_SUMMARIES=false` skips this stage entirely and
 builds a graph with code-chunk embeddings and no summaries.
 
 ---
 
 ## FIG. 04 · SEARCH
 
-Five ways in. They differ in what is embedded, not in how the results are shaped.
+Five ranked ways in, plus one exhaustive one. The ranked five differ in what is embedded, not in
+how the results are shaped.
 
 | tool | searches | reach for it when |
 |---|---|---|
@@ -129,9 +156,11 @@ Five ways in. They differ in what is embedded, not in how the results are shaped
 | `search_hybrid` | both, deduplicated per entity | you do not want to choose |
 | `search_text` | BM25 over names, signatures, summaries, raw code | an identifier, a string literal, an error message, non-English text |
 | `search_entities` | entity names, case-insensitive substring | you know part of the identifier — and it answers the moment parsing finishes, before any summary exists |
+| `find_text` | every line of every indexed file, literal or regex, unranked | the answer must be *complete*: every use before a rename, a CSS token, a config key — each line tied to the innermost entity holding it |
 
 All five take `node_types`, `include_paths` / `exclude_paths` globs, `include_tests`,
-`min_score`, `limit` and `offset`. Summaries and the identifiers they are matched against are
+`min_score`, `limit` and `offset`; `find_text` takes the path filters, `include_tests`, `regex`
+and `case_sensitive`. Summaries and the identifiers they are matched against are
 English-dominated, so a query in another language embeds far from that space and returns a
 plausible-looking wrong answer rather than an error — put non-English text and exact strings
 through `search_text`.
@@ -169,10 +198,19 @@ after indexing (`"stale": true`) or is gone from disk (`"file_missing": true`). 
 item was checked and still matches. When the files on a page live in an independent checkout
 inside that tree — a submodule, a vendored repository on its own branch — `meta.nested_checkouts`
 names it and its HEAD, because that, not the outer branch in `answered_from`, is the code being
-read. Search hits from test-like paths carry `"is_test": true`; pass `include_tests=false`
-whenever you are looking for an implementation rather than its tests — a test summary restates
-the vocabulary of the code it exercises, so tests out-rank that code on the very queries used to
-find it.
+read.
+
+**A search is a few calls, not one.** Every search page carries `meta.facets` — where the
+candidates came from, not just the page (for a ranked search, the best 100 entities the page is
+cut from, so `counted` is that pool's size, not a total): `counted`, the `common_path` they share, `by_directory`
+(one level below it, largest first), `by_node_type`, and — unless `include_tests=false` —
+`tests`. There are no ranking tricks and
+no advice strings: when one tree dominates (fixtures, a vendored copy, generated code, tests),
+the next call narrows with `exclude_paths=["that/tree/"]` or `include_paths=["src/"]`, and the
+facets show what is left. `find_text`'s facets are exact counts over every match. Search hits
+from test-like paths carry `"is_test": true`, and `include_tests=false` is a shortcut for
+excluding the test-path heuristic — a test summary restates the vocabulary of the code it
+exercises, so tests out-rank that code on the very queries used to find it.
 
 ---
 
@@ -267,7 +305,9 @@ Indexing costs real money. Two mechanisms keep that deliberate (INV-10).
 
 **Preview.** `index_directory(path, preview=true)` and `inflorescence index <path> --dry-run`
 both count files, bytes, entities and tokens and price them — no database writes, no LLM calls,
-no watcher started. Read the estimate, then run for real.
+no watcher started. `largest_files` names the biggest files priced, each with its own share of
+the quote, so a generated table or a fixture tree that dominates it is visible before you pay —
+add it to `.inflorescenceignore` and preview again. Read the estimate, then run for real.
 
 ```bash
 inflorescence index /path/to/repo --dry-run          # estimate volume + cost
@@ -288,6 +328,8 @@ for work it is going to reuse — while an upgrade that widens what the indexer 
 cap before it spends. The estimate uses `LLM_PRICE_INPUT_USD_PER_MTOK`,
 `LLM_PRICE_OUTPUT_USD_PER_MTOK` and `EMBEDDING_PRICE_USD_PER_MTOK`, whose defaults match the
 default models: switch models and update the prices, or the cap measures the wrong thing.
+An upgrade that changes how files are cut into chunks (`CHUNK_FORMAT`) re-chunks unchanged
+files on their next run too; that re-embedding is priced with the run, never spent unannounced.
 
 `--force` re-parses and re-resolves even when no file changed — needed after an upgrade that
 improves edge resolution, since the incremental path compares content checksums and a better
@@ -454,14 +496,18 @@ create, fails loudly on the pinned name — `Conflict. The container name
 nothing to do (`docker start inflorescence-memgraph` is the whole job; use compose only if you
 also want Lab, and then start from `docker compose down`).
 
-If you meet a spare anyway, stop it (`docker stop <name>`); to repair a container already
+If you meet a spare anyway, stop it (`docker stop -t 600 <name>`); to repair a container already
 orphaned off the network, recreate it — the graph is in the volume, not the container:
 
 ```bash
-docker rm -f inflorescence-memgraph && docker run -d --name inflorescence-memgraph \
-  --restart unless-stopped -p 127.0.0.1:7687:7687 \
+docker stop -t 600 inflorescence-memgraph
+docker rm inflorescence-memgraph
+docker run -d --name inflorescence-memgraph \
+  --restart unless-stopped --stop-timeout 600 -p 127.0.0.1:7687:7687 \
   -v inflorescence_mg_data:/var/lib/memgraph \
-  memgraph/memgraph-mage:latest
+  memgraph/memgraph-mage:latest \
+  --storage-snapshot-on-exit=true --storage-snapshot-interval-sec=21600 \
+  --storage-snapshot-retention-count=2
 ```
 
 Give it a couple of minutes on a populated graph: `memgraph-mage` loads its query modules and
@@ -470,11 +516,29 @@ is merely starting looks exactly like one that is down. `docker logs -f inflores
 shows which it is.
 </details>
 
+**Stopping and memory.** Disabling MCP in one client does not stop the shared database or
+servers owned by other sessions. Each stdio session has its own Python process; Memgraph
+keeps the graph and vector indexes in RAM even without queries. To leave it off:
+
+1. Set `MEMGRAPH_AUTOSTART=false` in your per-user or checkout `.env`. New `serve` and
+   `watch` commands then leave Docker and a stopped local database alone. With the database
+   down, `serve` exits before loading its MCP/indexing stack (unless `--allow-degraded`).
+2. Disconnect Inflorescence in all MCP clients and close their existing server processes.
+   If installed, stop its independent watch daemon with `inflorescence watch uninstall`.
+3. Run `docker stop -t 600 inflorescence-memgraph` (and stop Lab if it is running).
+   The named volume and indexes are retained. The long grace period lets Memgraph finish
+   its exit snapshot; Docker's default 10 seconds can leave a truncated multi-GB snapshot.
+
+Resume with `docker start inflorescence-memgraph`, then reconnect the MCP clients. Set
+`MEMGRAPH_AUTOSTART=true` again if you want client sessions to start the database for you.
+Compose and newly created containers use a 600-second stop timeout; for an existing
+container, keep passing `-t 600` until it is recreated with the new configuration.
+
 ---
 
 ## FIG. 08 · TOOLS
 
-Thirteen tools. The catalogue card, one line each; the server publishes each tool's full
+Fourteen tools. The catalogue card, one line each; the server publishes each tool's full
 docstring as its description, so this is the index, not the text.
 
 **Index**
@@ -488,7 +552,7 @@ docstring as its description, so this is the index, not the text.
 | tool | |
 |---|---|
 | `list_entities` | Inventory in path order, unranked, with pagination and glob path filters — "what is in this package" |
-| `get_entity_structure` | The `CONTAINS` outline under a node, file or project root, one to three levels deep |
+| `get_entity_structure` | The `CONTAINS` outline under the project root, a directory, a file or a node, one to three levels deep — the top-down walk: root → directory → file → functions, a subtree summary at every step |
 | `get_entity_context` | One call, one known `node_id`: full summary plus parent, children, incoming and outgoing edges |
 | `get_related_entities` | Entities related by relationship and `direction` (`both` / `incoming` / `outgoing`), addressed by `node_id` **or** by a `name` substring the tool resolves itself — so "who calls X" is one call. An ambiguous name returns the candidates instead of guessing |
 | `search_entities` | Case-insensitive substring of an entity's name; answers before any summary exists |
@@ -501,6 +565,7 @@ docstring as its description, so this is the index, not the text.
 | `search_semantic` | Vector search by meaning over summaries |
 | `search_hybrid` | Both, deduplicated per entity |
 | `search_text` | Exact BM25 over names, signatures, summaries and raw code |
+| `find_text` | Exhaustive line search, literal or regex, over every indexed file plus new ones on disk — each line with its owning entity, exact `meta.facets` |
 
 **Query**
 
@@ -515,9 +580,9 @@ docstring as its description, so this is the index, not the text.
 |---|---|
 | `send_feedback` | The agent's channel back to the maintainer: which description sent it to the wrong tool, which result was empty when the code plainly exists, what took four calls |
 
-Limits are clamped, not errors: `limit` is capped at 500 for graph tools and `cypher_query`,
-100 for the four searches; navigation summaries are truncated to 200 characters (use
-`get_entity_context` for the full one); a search hit carries at most three `matches`, with
+Limits are clamped, not errors: `limit` is capped at 500 for graph tools, `cypher_query` and
+`find_text`, 100 for the four searches; navigation summaries are truncated to 200 characters
+(`full_summaries=true` returns them whole on pages of at most 25, or use `get_entity_context`); a search hit carries at most three `matches`, with
 `matches_total` present only when the list was trimmed.
 
 ---
@@ -801,6 +866,7 @@ ever rewrites or deletes one — the log grows until you prune it yourself.
 | Styles | `.css` `.scss` `.sass` `.less` `.styl` — indexed whole, not parsed |
 | Markup | `.html` `.htm` — indexed whole, not parsed |
 | Configuration | `.json` `.jsonc` `.yaml` `.yml` `.toml` `.ini` `.cfg` `.conf` — indexed whole, not parsed |
+| Schemas & queries | `.proto` `.sql` `.graphql` `.gql` — indexed whole, not parsed: a gRPC contract or the SQL behind a search is found by its own text and by meaning |
 | Shell / operator scripts | `.sh` `.bash` `.zsh` `.fish` `.ps1` — indexed whole, not parsed |
 | Build files, by exact name | `Makefile` `GNUmakefile` `Dockerfile` `Containerfile` `Justfile` `Procfile` `Rakefile` `Brewfile` `.env.example` (and `.sample` / `.template` / `.dist`) — indexed whole, not parsed |
 
@@ -871,6 +937,7 @@ both.
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | OpenRouter API key (**required**) |
 | `MEMGRAPH_URL` | `bolt://localhost:7687` | connection URL |
+| `MEMGRAPH_AUTOSTART` | `true` | allow MCP/watch commands to start local Docker and Memgraph; `false` respects a manual stop |
 | `MEMGRAPH_USER` / `MEMGRAPH_PASSWORD` | — | optional auth |
 | `LLM_MODEL` | `google/gemini-2.5-flash-lite` | summaries and the LLM parse fallback |
 | `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | OpenAI-compatible endpoint |

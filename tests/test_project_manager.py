@@ -454,6 +454,27 @@ async def test_preflight_refuses_to_index_when_vector_search_indexes_are_missing
 
 
 @pytest.mark.asyncio
+async def test_preflight_refuses_to_index_into_vector_indexes_of_another_width(tmp_path: Path) -> None:
+    from inflorescence.db.schema import mismatched_vector_dimensions
+    from inflorescence.project_manager import SearchUnavailableError
+
+    conn = FakeConnNarrowVectorIndexes()
+    assert await mismatched_vector_dimensions(conn, 768) == {}
+    assert await mismatched_vector_dimensions(conn, 1536) == {"code_embeddings": 768, "summary_embeddings": 768}
+
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    manager = ProjectManager(
+        repo=repo, graph_builder=builder, rag_indexer=FakeRAGIndexer(),
+        settings=Settings(_env_file=None, embedding_dimension=1536), conn=conn,
+    )
+
+    with pytest.raises(SearchUnavailableError, match="EMBEDDING_DIMENSION=1536"):
+        await manager.index_directory(str(tmp_path))
+    assert builder.builds == 0, "nothing is paid for before the refusal"
+
+
+@pytest.mark.asyncio
 async def test_preflight_allows_indexing_without_search_when_opted_out(tmp_path: Path) -> None:
     # The gate is overridable for graph-only use on a search-less DB.
     repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
@@ -530,10 +551,12 @@ class _SummaryNode:
         summary: str = "",
         summary_input_hash: str = "",
         file_path: str | None = None,
+        summary_prompt_version: str = "",
     ) -> None:
         self.id = node_id
         self.summary = summary
         self.summary_input_hash = summary_input_hash
+        self.summary_prompt_version = summary_prompt_version
         # The clone path scopes its paid phases by file, so these stand-ins carry one.
         # Defaults to the id, which is what a module node's id already is.
         self.file_path = node_id if file_path is None else file_path
@@ -605,7 +628,7 @@ async def test_worktree_seeding_writes_reused_summaries_into_the_new_project(tmp
     skeleton's empty summaries and the repair pass regenerates them for real money."""
     main, worktree = _worktree_dirs(tmp_path)
     nodes = [
-        _SummaryNode("a.py", "reused from donor", "h1"),   # reused -> must be written back
+        _SummaryNode("a.py", "reused from donor", "h1", summary_prompt_version="2.ab"),  # reused -> written back
         _SummaryNode("b.py", "freshly generated", "h2"),   # dirty -> already persisted by build
         _SummaryNode("c.py", "", ""),                      # failed with nothing to keep
     ]
@@ -623,7 +646,11 @@ async def test_worktree_seeding_writes_reused_summaries_into_the_new_project(tmp
 
     project = manager.get_project(str(worktree))
     assert repo.summaries_written == [
-        (project, [{"node_id": "a.py", "summary": "reused from donor", "summary_input_hash": "h1"}])
+        # The donor's prompt version travels with its summary: the text was not rewritten.
+        (project, [{
+            "node_id": "a.py", "summary": "reused from donor", "summary_input_hash": "h1",
+            "summary_prompt_version": "2.ab",
+        }])
     ]
     # The invariant the repair pass depends on: every node that ends the run with a summary
     # is either dirty (persisted batch-by-batch by the build) or explicitly written back —
@@ -985,7 +1012,7 @@ async def test_clone_failure_deletes_the_partial_copy_and_falls_back_to_client_s
     assert builder.build_stored_summaries == [donor_summaries]
     assert repo.chunk_embedding_requests == [donor]
     assert repo.summaries_written == [
-        (project, [{"node_id": "a.py", "summary": "s", "summary_input_hash": "h1"}])
+        (project, [{"node_id": "a.py", "summary": "s", "summary_input_hash": "h1", "summary_prompt_version": ""}])
     ]
     assert result["worktree_of"] == donor
     assert result["seeded_summaries"] == 1
@@ -1319,6 +1346,33 @@ async def test_preview_of_a_worktree_prices_only_what_the_donor_does_not_cover(t
     assert result["files"] == 2                           # "files" = what this index would pay for
     assert result["estimated_tokens"] == 40
     assert "estimated_cost_usd" in result
+
+
+@pytest.mark.asyncio
+async def test_a_worktree_preview_names_its_biggest_files_and_what_each_costs(tmp_path: Path) -> None:
+    """"$0.62 for 64 files" with no breakdown was abandoned; the biggest files are what to ignore."""
+    from inflorescence.code_indexer.graph_builder import GraphBuilder
+    from inflorescence.code_indexer.models import IndexerConfig
+
+    main, worktree = _worktree_dirs(tmp_path)
+    (worktree / "table.json").write_text("[" + ",\n".join(["1"] * 400) + "]\n")
+    (worktree / "added.py").write_text("x = 1\n")
+    repo = FakeProjectRepository({"nodes": 0, "edges": 0, "chunks": 0, "summaries": 0})
+    builder = FakeGraphBuilder()
+    builder.scan_checksums_result = {"added.py": "a", "table.json": "t"}
+    real = GraphBuilder(repo=None, llm=None, config=IndexerConfig(use_llm_summaries=False, use_llm_fallback_parser=False))
+    builder.estimate_paths = real.estimate_paths  # type: ignore[method-assign]
+    manager = _worktree_manager(repo, builder, FakeRAGIndexer(), main)
+    repo.indexed_projects.add(manager.get_project(str(main)))
+    repo.checksums[manager.get_project(str(main))] = {}
+
+    result = await manager.preview_directory(str(worktree))
+
+    largest = result["largest_files"]
+    assert [f["path"] for f in largest] == ["table.json", "added.py"]
+    assert set(largest[0]) == {"path", "bytes", "estimated_cost_usd"}
+    assert largest[0]["estimated_cost_usd"] > largest[1]["estimated_cost_usd"]
+    assert sum(f["estimated_cost_usd"] for f in largest) == pytest.approx(result["estimated_cost_usd"], abs=1e-3)
 
 
 @pytest.mark.asyncio
@@ -1801,4 +1855,20 @@ class FakeConnMissingSearchIndexes:
         return [
             _FakeRecord({"index type": "label+property", "label": "Code", "property": ["id"], "name": ""}),
             _FakeRecord({"index type": "label+property", "label": "Code", "property": ["project"], "name": ""}),
+        ]
+
+
+class FakeConnNarrowVectorIndexes(FakeConnMissingSearchIndexes):
+    """Both vector indexes exist, but were created 768 wide — before EMBEDDING_DIMENSION changed."""
+
+    async def execute_query(self, query: str, params: dict[str, object] | None = None) -> list[object]:
+        if "show_index_info" in query:
+            return [
+                {"index_name": "code_embeddings", "label": ":CodeChunk", "property": "embedding", "dimension": 768},
+                {"index_name": "summary_embeddings", "label": ":Code", "property": "summary_embedding",
+                 "dimension": 768},
+            ]
+        return [
+            _FakeRecord({"index type": "label+property_vector", "label": ":CodeChunk", "property": "embedding"}),
+            _FakeRecord({"index type": "label+property_vector", "label": ":Code", "property": "summary_embedding"}),
         ]

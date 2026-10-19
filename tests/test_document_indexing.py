@@ -390,6 +390,10 @@ _NEW_DOCUMENT_FILES: dict[str, tuple[str, str]] = {
     ".zsh": ("scripts/dev.zsh", "autoload -Uz compinit\ncompinit\n"),
     ".fish": ("scripts/dev.fish", "set -x PYTHONPATH .\n"),
     ".ps1": ("scripts/dev.ps1", "$env:PYTHONPATH = '.'\n"),
+    ".proto": ("proto/search.proto", "service Search {\n  rpc Search(Query) returns (Page);\n}\n"),
+    ".sql": ("sql/queries/search.sql", "-- name: Search :many\nSELECT id FROM items WHERE tsv @@ $1 ORDER BY rank;\n"),
+    ".graphql": ("schema.graphql", "type Query {\n  search(q: String!): [Item!]!\n}\n"),
+    ".gql": ("queries/search.gql", "query Search($q: String!) { search(q: $q) { id } }\n"),
 }
 
 # The same idea for the files a suffix cannot identify at all.
@@ -413,6 +417,23 @@ def test_styles_markup_and_config_are_document_extensions(extension: str) -> Non
     assert extension in DEFAULT_DOCUMENT_EXTENSIONS
     assert extension in DocumentParser().get_supported_extensions()
     assert extension in GraphBuilder(repo=None, llm=None, config=_NO_LLM).extensions
+
+
+def test_every_document_extension_has_its_own_labels() -> None:
+    """A type added to the registry is labelled in chunks and priced by name in the preview.
+
+    Without its entries a new ``.sql`` file is chunked as untyped text and priced under a bare
+    suffix — the preview is the one output whose job is to make the bill legible.
+    """
+    from inflorescence.code_indexer.graph_builder import _PREVIEW_LANGUAGES
+    from inflorescence.config import DOCUMENT_EXTENSION_GROUPS
+    from inflorescence.rag.chunker import _document_language
+
+    grouped = [ext for group in DOCUMENT_EXTENSION_GROUPS.values() for ext in group]
+    assert grouped == DEFAULT_DOCUMENT_EXTENSIONS
+    unlabelled = [ext for ext in DEFAULT_DOCUMENT_EXTENSIONS if _document_language(f"x{ext}") is None]
+    unpriced = [ext for ext in DEFAULT_DOCUMENT_EXTENSIONS if ext not in _PREVIEW_LANGUAGES]
+    assert (unlabelled, unpriced) == ([], [])
 
 
 @pytest.mark.parametrize("name", sorted(_NAMED_DOCUMENT_FILES))

@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 from inflorescence import janitor
 from inflorescence.code_indexer.graph_builder import GraphBuilder
-from inflorescence.code_indexer.models import IndexerConfig
+from inflorescence.code_indexer.models import DECLARATION_NODE_TYPES, IndexerConfig
 from inflorescence.config import Settings
 from inflorescence.db.connection import MemgraphConnection
 from inflorescence.db.repository import GraphRepository
@@ -20,8 +20,10 @@ from inflorescence.feedback import FeedbackStore
 from inflorescence.llm_client import LLMClient
 from inflorescence.project_manager import ProjectManager
 from inflorescence.rag.indexer import RAGIndexer
+from inflorescence.tools import descriptions as doc
 from inflorescence.tools.cypher import register_cypher_tools
 from inflorescence.tools.feedback import register_feedback_tools
+from inflorescence.tools.find import register_find_tools
 from inflorescence.tools.graph import register_graph_tools
 from inflorescence.tools.indexing import register_indexing_tools
 from inflorescence.tools.search import register_search_tools
@@ -108,6 +110,7 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
     """
     components = create_components()
     settings = components.settings
+    declarations = " and ".join(sorted(t.value for t in DECLARATION_NODE_TYPES))
 
     # Server-level instructions are injected into consuming agents' context — this is
     # the only place an agent learns what the server is FOR before picking a tool.
@@ -115,19 +118,17 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
         "inflorescence",
         instructions=(
             "Code intelligence over indexed repositories: a code graph in Memgraph "
-            "(functions/classes/modules/directories with CALLS / IMPORTS / INHERITS / "
-            "IMPLEMENTS / CONTAINS edges), LLM-written summaries for every entity, and "
-            "embeddings for search.\n\n"
+            "(functions/classes/methods/modules/directories, plus top-level constants, "
+            "variables and type aliases, with CALLS / IMPORTS / INHERITS / IMPLEMENTS / "
+            "CONTAINS edges), LLM-written summaries for every entity except those top-level "
+            f"declarations (node types {declarations}: they carry their first line as "
+            "`signature` instead, and cost nothing to index), and embeddings for search.\n\n"
             "The index is not only code. Non-code files are indexed whole as `document` "
-            "entities — prose (.md, .markdown, .mdx, .rst, .txt, .text, .adoc, .asciidoc, "
-            ".org), stylesheets (.css, .scss, .sass, .less, .styl), markup (.html, .htm), "
-            "configuration (.json, .jsonc, .yaml, .yml, .toml, .ini, .cfg, .conf), shell "
-            "and operator scripts (.sh, .bash, .zsh, .fish, .ps1) and the build files named "
-            "rather than suffixed (Makefile, GNUmakefile, Dockerfile, Containerfile, "
-            "Justfile, Procfile, Rakefile, Brewfile, .env.example/.sample/.template/.dist) — "
+            f"entities — by default {doc.DOCUMENT_TYPES} — "
             "with their body split into overlapping windows, so a CSS media query, an "
-            "index.html meta tag, a build-config key or the exact flags a wrapper script "
-            "passes to a runner is findable by its own text (search_text) and by meaning "
+            "index.html meta tag, a build-config key, a gRPC contract, the SQL behind a "
+            "search, or the exact flags a wrapper script passes to a runner is findable by "
+            "its own text (search_text, find_text) and by meaning "
             "(search_semantic). Shell scripts matter more than their size suggests: the "
             "operational recipe — which env vars, which flags, and the comment saying why — "
             "usually exists only there. They are not parsed for structure, so they own no "
@@ -145,12 +146,68 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
             "Use this server instead of grepping the filesystem when the question is about "
             "code structure, relationships, or purpose: find code by meaning "
             "(search_semantic), by exact identifier / string literal / error text "
-            "(search_text), by name (search_entities), or by code-vector similarity "
-            "(search_code, search_hybrid). Deep-dive a found entity with "
-            "get_entity_context / get_entity_structure, trace callers/callees and imports "
-            "with get_related_entities (which takes either a node_id or a name= substring, "
-            "so \"who calls X\" is one call), and answer arbitrary structural questions with "
-            "a read-only cypher_query (call graph_schema first).\n\n"
+            "(search_text — ranked, whole words), by name (search_entities), or by "
+            "code-vector similarity (search_code, search_hybrid). When the answer must be "
+            "COMPLETE rather than ranked — every use of a name before a rename, every "
+            "occurrence of a CSS token or config key, partial words and punctuation-heavy "
+            "literals — use find_text: it reads the files line by line (literal or regex), "
+            "exhaustively, and ties each hit to the entity whose span holds it. search_text "
+            "has no stemming in any language (`running` does not match `run`); only a word "
+            "that matched nothing at all is retried within one or two edits, and those hits "
+            "carry \"fuzzy\": true — so name the inflection you mean, or use find_text with "
+            "a regex. Deep-dive a found entity with get_entity_context / "
+            "get_entity_structure (which also takes a directory as file_path), trace "
+            "callers/callees and imports with get_related_entities (which takes either a "
+            "node_id or a name= — the exact name wins over names that merely contain it, "
+            "and an ambiguous name fails with the candidates instead of guessing — so "
+            "\"who calls X\" is one call), and answer arbitrary structural questions with "
+            "a read-only cypher_query (call graph_schema first). An IMPORTS row carries "
+            "the statement as written (`import`: specifier, line, names, and "
+            "dynamic/type_only/reexport when true), and a named JS/TS import also points at "
+            "the symbol itself, so incoming IMPORTS on a constant answer \"who reads it\" "
+            "and \"which imports are lazy import() chunks\" needs no file reading.\n\n"
+            "WHEN YOU DO NOT KNOW WHERE SOMETHING LIVES, WALK DOWN THE SUMMARIES instead of "
+            "searching blind or listing everything. Every directory has an LLM summary of what "
+            "its subtree is for — purpose, capabilities, entry points — written from the "
+            "summaries of what it contains, so a few cheap calls narrow a repository to one "
+            "file: get_entity_structure(directory) shows the root's summary and its top-level "
+            "files and directories; get_entity_structure(directory, file_path=\"src/pkg\") "
+            "does the same one level down (file_path takes a directory as well as a file); "
+            "get_entity_structure(directory, file_path=\"src/pkg/providers/openai.py\") lists "
+            "that file's classes and functions with line ranges and one-line summaries — then "
+            "read only those lines. Each step is one small page, where "
+            "list_entities(node_types=[\"module\"]) over a big package is one page of every "
+            "file at once (a field report measured ~17k tokens for 56 modules). When the tree "
+            "is too wide to read, jump by meaning instead: search_semantic(query, "
+            "node_types=[\"directory\"]) ranks directories against directories (\"which "
+            "part of this repo handles X\"), node_types=[\"module\"] ranks whole files; then "
+            "scope the fine-grained search to that subtree with include_paths=[\"<path>\"].\n\n"
+            "A SEARCH IS A FEW CALLS, NOT ONE. A repository holds many copies of the "
+            "vocabulary you search for that are not the code you want — tests, mocks and "
+            "fixtures, prototypes, sample data, reports, an old copy of a feature, a second app "
+            "in the same monorepo — and they can out-rank it. Every search and find_text "
+            "response carries meta.facets: over all the candidates the page was drawn from, not "
+            "just the page, how many sit under each directory (one level below the directory "
+            "they all share), of which node types, and how many are test code. Read it, decide "
+            "which trees are not your answer, and call again with exclude_paths for them — or "
+            "include_paths for the one that is; the facets of the narrowed call then split that "
+            "tree one level deeper. Two scoped calls are cheaper and more reliable than reading "
+            "a crowded page, and when you already know the area, scope the first call. "
+            "include_paths / exclude_paths are globs, and a path without a glob character covers "
+            "everything under it. Listings (list_entities, get_entity_structure, "
+            "get_related_entities, search_entities) take the same filters, plus "
+            "full_summaries=true when the whole module summaries are what you want to read. A "
+            "tree that is never the answer for anyone belongs in the repository's "
+            ".inflorescenceignore — then it is not indexed at all.\n\n"
+            "What this server does not answer, so you can go straight to the right tool: "
+            "it indexes checked-out trees (a main checkout and its git worktrees), not git "
+            "refs — comparing branches or asking what origin/main contains is `git diff` / "
+            "`git show`, or a worktree of that ref passed as directory. Whether every "
+            "consumer of a widened union type or enum handles the new case is a question "
+            "for the typechecker or an exhaustiveness linter; the graph gives you the "
+            "consumers (incoming IMPORTS/CALLS), not the exhaustiveness. Documents are not "
+            "parsed, so counting or aggregating values inside JSON/YAML is a job for jq/yq "
+            "on the file the search found.\n\n"
             "An ordinary project must be indexed before anything else works: call "
             "index_directory(path, preview=true) to see the estimated dollar cost, then "
             "preview=false to build. A git worktree of an already-indexed checkout is the "
@@ -199,21 +256,17 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
             "was weak — that is the closest thing to \"this code does not exist here\" a "
             "vector search can say, so confirm with search_text on exact terms rather than "
             "trusting the top hit.\n\n"
-            "EXCLUDE TEST CODE WHEN YOU ARE LOOKING FOR AN IMPLEMENTATION — this is the "
-            "single most effective thing you can do to the ranking of a semantic search. A "
-            "test's summary restates the vocabulary of the code it exercises (\"Verifies "
-            "that retrying a failed upload reuses the original storage key\"), so tests "
-            "out-embed the implementation on exactly the "
-            "\"what does X do\" queries you use to find it: a field report measured 11 of 15 "
-            "hits from tests/ while the runner named in the query never reached page 1. "
-            "Hits from test-like paths carry \"is_test\": true (a path heuristic over "
-            "tests/, spec/, test_*.py, *_test.go, conftest.py, *.test.ts …). Pass "
-            "include_tests=false to drop them: "
-            "search_semantic(directory=\"/repo\", query=\"job runner start stop\", "
-            "include_tests=false). For a layout the heuristic does not catch, name the "
-            "directories: exclude_paths=[\"tests/**\", \"fixtures/**\"]. Search the tests "
-            "deliberately (include_tests=true, the default) when the test IS what you want — "
-            "usage examples, expected behaviour, a repro.\n\n"
+            "TESTS IN PARTICULAR: a test's summary restates the vocabulary of the code it "
+            "exercises (\"Verifies that retrying a failed upload reuses the original storage "
+            "key\"), so on the \"what does X do\" queries you use to find an implementation "
+            "tests out-rank it — a field report measured 11 of 15 hits from tests/ while the "
+            "runner named in the query never reached page 1. Hits from test-like paths carry "
+            "\"is_test\": true and meta.facets.tests counts them. include_tests=false is a "
+            "shortcut that drops the common naming conventions (tests/, spec/, test_*.py, "
+            "*_test.go, conftest.py, *.test.ts …), including test files that sit next to the "
+            "code they test; for any other layout name the trees yourself: "
+            "exclude_paths=[\"e2e/\", \"**/*.cy.ts\"]. Keep tests in (the default) when the "
+            "test IS what you want — usage examples, expected behaviour, a repro.\n\n"
             "AN EMPTY RESULT IS NOT PROOF OF ABSENCE, and the response now says which it is: "
             "an empty first page carries meta.index_coverage, which re-checks the "
             "directories this index knows against the filesystem and either names files that "
@@ -253,6 +306,7 @@ def create_server(*, enable_watcher: bool = True) -> tuple[FastMCP, MemgraphConn
     register_indexing_tools(mcp, manager, watcher if enable_watcher else None, repo)
     register_graph_tools(mcp, manager, repo)
     register_search_tools(mcp, manager, repo, settings)
+    register_find_tools(mcp, manager, repo)
     register_cypher_tools(mcp, manager, conn)
     register_feedback_tools(mcp, components.feedback)
 
@@ -281,7 +335,7 @@ async def startup(
     healthy = await conn.health_check()
     if healthy:
         logger.info("Memgraph connection OK")
-        await setup_schema(conn)
+        await setup_schema(conn, dimension=(settings or Settings()).embedding_dimension)
         if enable_janitor:
             await start_worktree_janitor(conn, repo=repo, settings=settings)
     elif allow_degraded:

@@ -13,6 +13,7 @@ left exactly as written: the caller spelled out what they meant.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from fnmatch import fnmatch, fnmatchcase
 
@@ -85,8 +86,21 @@ def path_is_allowed(file_path: str, config: PathFilterConfig) -> bool:
     return not any(_matches(normalized, pattern) for pattern in config.exclude)
 
 
+def record_path(record: Mapping[str, object]) -> str:
+    """The file a row is about: its own ``file_path``, or its ``entity``'s for a relation row.
+
+    Relation rows (``{relation, direction, entity}``) keep the path one level down; reading
+    only the top level made every such row pathless — ``exclude_paths`` removed nothing and
+    ``include_paths`` removed everything (field report, 15.09.2026).
+    """
+    path = record.get("file_path")
+    if path is None and isinstance(record.get("entity"), Mapping):
+        path = record["entity"].get("file_path")  # type: ignore[union-attr]
+    return str(path or "")
+
+
 def filter_records_by_path(records: list[dict[str, object]], config: PathFilterConfig) -> list[dict[str, object]]:
-    return [record for record in records if path_is_allowed(str(record.get("file_path", "")), config)]
+    return [record for record in records if path_is_allowed(record_path(record), config)]
 
 
 def _matches(path: str, pattern: str) -> bool:

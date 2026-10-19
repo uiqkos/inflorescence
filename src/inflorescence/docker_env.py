@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 MEMGRAPH_IMAGE = "memgraph/memgraph-mage:latest"
 MEMGRAPH_CONTAINER = "inflorescence-memgraph"
 MEMGRAPH_VOLUME = "inflorescence_mg_data"
+# A populated graph writes a multi-GB snapshot on SIGTERM. Docker's default 10s
+# stop timeout killed that write, leaving a truncated snapshot and a slow recovery.
+MEMGRAPH_STOP_TIMEOUT = 600
 
 _DOCKER_CALL_TIMEOUT = 30.0
 # `docker run`/`docker start` on a daemon that just booted can take well over the
@@ -193,6 +196,7 @@ def memgraph_run_argv(port: int) -> list[str]:
         "docker", "run", "-d",
         "--name", MEMGRAPH_CONTAINER,
         "--restart", "unless-stopped",
+        "--stop-timeout", str(MEMGRAPH_STOP_TIMEOUT),
         "-p", f"127.0.0.1:{port}:7687",
         "-v", f"{MEMGRAPH_VOLUME}:/var/lib/memgraph",
         MEMGRAPH_IMAGE,
@@ -256,11 +260,15 @@ def _wait_for_port(port: int, deadline_seconds: float) -> bool:
     return False
 
 
-def ensure_memgraph(memgraph_url: str, *, wait_seconds: float = _BOLT_OPEN_TIMEOUT) -> bool:
+def ensure_memgraph(
+    memgraph_url: str, *, auto_start: bool = True, wait_seconds: float = _BOLT_OPEN_TIMEOUT
+) -> bool:
     """Make a local Memgraph reachable, starting the container if needed.
 
     Returns True when the bolt port accepts connections. Fast path — an already-listening
     port — costs one loopback connect, so this is cheap enough to call on every startup.
+    With ``auto_start=False`` this is only a port probe: even Docker's desktop app must
+    stay stopped. An MCP client opening another session must not undo a deliberate stop.
 
     Never creates a *second* container for a database that already has one. The container
     this manages by name is only half the story: `docker compose up` in a checkout of this
@@ -272,6 +280,8 @@ def ensure_memgraph(memgraph_url: str, *, wait_seconds: float = _BOLT_OPEN_TIMEO
         return False
     if port_open(port):
         return True
+    if not auto_start:
+        return False
     if not docker_cli_present():
         return False
     if not ensure_docker_daemon():

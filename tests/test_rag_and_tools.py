@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from mcp.server.fastmcp import FastMCP
 from inflorescence.code_indexer.models import CodeNode, NodeType
 from inflorescence.config import Settings
 from inflorescence.db import queries
-from inflorescence.db.repository import GraphRepository
+from inflorescence.db.repository import GraphRepository, ProjectHits
 from inflorescence.db.schema import setup_schema
 from inflorescence.rag.chunker import Chunk
 from inflorescence.rag.embeddings import EmbeddingClient
@@ -23,6 +24,7 @@ from inflorescence.tools.graph import register_graph_tools
 from inflorescence.tools.indexing import register_indexing_tools
 from inflorescence.tools.path_filters import PathFilterConfig, is_test_path, path_is_allowed
 from inflorescence.tools.responses import (
+    FULL_SUMMARY_MAX_LIMIT,
     NAV_SUMMARY_MAX_CHARS,
     entity_ref,
     error_response,
@@ -356,6 +358,18 @@ async def test_setup_schema_creates_text_indexes_for_symbols_and_chunk_content()
     assert any("chunk_content_text ON :CodeChunk(content)" in query for query in text_index_writes)
 
 
+@pytest.mark.asyncio
+async def test_setup_schema_creates_vector_indexes_at_the_configured_dimension() -> None:
+    """EMBEDDING_DIMENSION used to be documented and ignored: every index was 1536 wide."""
+    conn = RecordingSchemaConnection()
+
+    await setup_schema(conn, dimension=64)
+
+    vector_writes = [query for query, _params in conn.writes if "CREATE VECTOR INDEX" in query]
+    assert vector_writes
+    assert all('"dimension": 64' in query for query in vector_writes)
+
+
 def test_property_indexes_include_node_type() -> None:
     from inflorescence.db.schema import PROPERTY_INDEXES
 
@@ -430,7 +444,10 @@ def test_text_search_queries_use_search_all_and_join_chunks_to_entities() -> Non
     for query in (queries.TEXT_SEARCH_SUMMARY, queries.TEXT_SEARCH_SYMBOL, queries.TEXT_SEARCH_CODE):
         assert "score AS score" in query
         assert "WHERE node.project = $project" in query
-        assert "LIMIT $top_k" in query
+        # The window is always explicit: left out, the procedure stops at 1000 rows across
+        # every project, before the project filter runs (INV-9).
+        assert "{limit: $fetch}" in query
+        assert "ORDER BY score DESC" in query
 
 
 def test_rag_indexer_default_chunker_inherits_settings_size_limit() -> None:
@@ -659,7 +676,7 @@ async def test_search_code_returns_error_without_calling_repo_when_embedding_fai
     register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
 
     tool = mcp._tool_manager.get_tool("search_code")
-    monkeypatch.setattr(tool.fn.__closure__[0].cell_contents, "embed", lambda texts: [None])
+    monkeypatch.setattr(_closure_cell_with_attr(tool.fn, "model"), "embed", lambda texts: [None])
 
     payload = _payload(await mcp.call_tool("search_code", {"directory": "/tmp/project", "query": "anything"}))
 
@@ -921,6 +938,22 @@ async def test_get_entity_structure_resolves_file_root_and_paginates_children() 
 
 
 @pytest.mark.asyncio
+async def test_get_entity_structure_takes_an_absolute_path_inside_the_project() -> None:
+    class Recording(FakeGraphRepositoryV2):
+        async def get_structure_root(self, project, node_id=None, file_path=None):
+            self.asked = file_path
+            return await super().get_structure_root(project, node_id=node_id, file_path=file_path)
+
+    mcp = FastMCP("test")
+    repo = Recording()
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    await mcp.call_tool("get_entity_structure", {"directory": "/tmp/project", "file_path": "/tmp/project/pkg"})
+
+    assert repo.asked == "pkg"
+
+
+@pytest.mark.asyncio
 async def test_get_entity_structure_returns_structured_not_found_error(tmp_path: Path) -> None:
     """A path that is in neither the index nor the filesystem says so — and says both halves.
 
@@ -940,7 +973,7 @@ async def test_get_entity_structure_returns_structured_not_found_error(tmp_path:
 
     assert payload["error"]["code"] == "not_found"
     message = payload["error"]["message"]
-    assert "missing.py" in message and "no such file on disk" in message
+    assert "missing.py" in message and "no such file or directory on disk" in message
 
 
 @pytest.mark.asyncio
@@ -1182,7 +1215,7 @@ async def test_write_counters_report_rows_the_db_wrote_not_submitted(caplog) -> 
 @pytest.mark.asyncio
 async def test_repository_get_stored_summaries_maps_by_node_id() -> None:
     conn = RecordingQueryConnection([
-        {"id": "a.py::foo", "summary": "does foo", "summary_input_hash": "h1",
+        {"id": "a.py::foo", "summary": "does foo", "summary_input_hash": "h1", "summary_prompt_version": "2.ab",
          "summary_embedding": [0.1, 0.2], "summary_embedding_hash": "h1"},
         {"id": "a.py", "summary": "module a", "summary_input_hash": "h2",
          "summary_embedding": None, "summary_embedding_hash": None},
@@ -1195,7 +1228,7 @@ async def test_repository_get_stored_summaries_maps_by_node_id() -> None:
     # summary_embedding_hash comes along so the caller can tell a fresh vector from a stale
     # one (matching vs mismatched hash) when deciding whether to reuse it (finding 8a).
     assert stored["a.py::foo"] == {
-        "summary": "does foo", "summary_input_hash": "h1",
+        "summary": "does foo", "summary_input_hash": "h1", "summary_prompt_version": "2.ab",
         "summary_embedding": [0.1, 0.2], "summary_embedding_hash": "h1",
     }
     assert stored["a.py"]["summary_embedding"] is None
@@ -1222,8 +1255,9 @@ async def test_repository_light_summaries_carry_freshness_without_the_vectors() 
     stored = await repo.get_stored_summaries_light("project-id")
 
     assert conn.params == {"project": "project-id"}
+    # A row written before prompt versions were recorded reads as "" — unrecorded, not absent.
     assert stored["a.py::foo"] == {
-        "summary": "does foo", "summary_input_hash": "h1",
+        "summary": "does foo", "summary_input_hash": "h1", "summary_prompt_version": "",
         "summary_embedding_hash": "h1", "has_embedding": True,
     }
     assert stored["a.py"]["has_embedding"] is False
@@ -1281,7 +1315,10 @@ async def test_repository_list_entities_passes_pagination_and_returns_compact_re
     assert conn.params["node_types"] == ["function"]
     assert conn.params["limit"] == 11
     assert conn.params["offset"] == 7
-    assert "n.node_type" not in conn.query
+    # Filtered on the canonical node_type property (a label lowercased is "typealias", never
+    # "type_alias"); the compact ref itself still carries no node_type column.
+    assert "n.node_type IN $node_types" in conn.query
+    assert "node_type" not in conn.query.split("RETURN", 1)[1]
     assert "labels(n) AS `n.labels`" in conn.query
 
 
@@ -1348,7 +1385,10 @@ async def test_repository_get_entity_structure_formats_depth_without_touching_cy
     assert result == [entity("pkg/a.py::Worker", "Worker", "class", "pkg/a.py", 5, 20, "Worker.")]
     assert "[:CONTAINS*1..2]" in conn.query
     assert "{project: $project, id: $root_id}" in conn.query
-    assert "n.node_type" not in conn.query
+    # Filtered on the canonical node_type property (a label lowercased is "typealias", never
+    # "type_alias"); the compact ref itself still carries no node_type column.
+    assert "n.node_type IN $node_types" in conn.query
+    assert "node_type" not in conn.query.split("RETURN", 1)[1]
     assert conn.params == {"project": "project-id", "root_id": "pkg/a.py", "node_types": None, "limit": 11, "offset": 7}
 
 
@@ -1395,7 +1435,7 @@ async def test_repository_search_summary_text_returns_compact_refs_with_score() 
     result = await repo.search_summary_text("project-id", "runs", top_k=25)
 
     assert result == [{**entity("pkg/a.py::run", "run", "function", "pkg/a.py", 2, 4, "Runs."), "score": 3.5}]
-    assert conn.params == {"query": "runs", "top_k": 25, "project": "project-id"}
+    assert conn.params == {"query": "runs", "fetch": 1000, "project": "project-id"}
     assert "text_search.search_all('summary_text'" in conn.query
 
 
@@ -1413,7 +1453,7 @@ async def test_repository_search_symbol_text_returns_compact_refs_with_score() -
     result = await repo.search_symbol_text("project-id", "run", top_k=25)
 
     assert result == [{**entity("pkg/a.py::run", "run", "function", "pkg/a.py", 2, 4, "Runs."), "score": 8.0}]
-    assert conn.params == {"query": "run", "top_k": 25, "project": "project-id"}
+    assert conn.params == {"query": "run", "fetch": 1000, "project": "project-id"}
     assert "text_search.search_all('code_symbols_text'" in conn.query
 
 
@@ -1436,7 +1476,7 @@ async def test_repository_search_code_text_joins_chunks_to_entities_with_match_l
         "score": 2.0, "chunk_id": "chunk:1", "chunk_kind": "function_body",
         "match_start_line": 2, "match_end_line": 3,
     }]
-    assert conn.params == {"query": "runs", "top_k": 25, "project": "project-id"}
+    assert conn.params == {"query": "runs", "fetch": 1000, "project": "project-id"}
     assert "MATCH (code:Code {id: node.node_id, project: $project})" in conn.query
 
 
@@ -1459,6 +1499,163 @@ async def test_repository_get_structure_root_serializes_root_prefixed_record() -
     result = await repo.get_structure_root("project-id", node_id="pkg/a.py")
 
     assert result == entity("pkg/a.py", "a", "module", "pkg/a.py", 1, 30, "Module a.")
+
+
+@pytest.mark.asyncio
+async def test_repository_structure_root_by_path_accepts_directories() -> None:
+    """A directory path is a structure root too — the natural first step of a top-down walk.
+
+    Field reports (14.09, 15.09): get_entity_structure(file_path="frontend/src/proto/engine")
+    answered "exists on disk but is NOT in this index, run index_directory" over a fully
+    indexed directory, because only modules and documents were looked up by path.
+    """
+    conn = RecordingQueryConnection([])
+    repo = GraphRepository(conn)
+
+    await repo.get_structure_root("project-id", file_path="src/pkg")
+    assert conn.query == queries.GET_STRUCTURE_ROOT_BY_FILE
+    assert "root:Directory" in conn.query
+    assert conn.params == {"project": "project-id", "file_path": "src/pkg"}
+
+    await repo.get_structure_root("project-id", file_path=".")
+    assert conn.query == queries.GET_PROJECT_ROOT
+
+
+@pytest.mark.parametrize(
+    ("typed", "stored"),
+    [
+        ("src/pkg", "src/pkg"), ("src/pkg/", "src/pkg"), ("./src/pkg", "src/pkg"), ("pkg/a.py", "pkg/a.py"),
+        (".", "."), ("./", "."), (" ./ ", "."), ("src\\pkg", "src/pkg"),
+    ],
+)
+def test_structure_paths_are_normalized_once_to_the_stored_form(tmp_path: Path, typed: str, stored: str) -> None:
+    from inflorescence.tools.graph import _tree_path
+
+    assert _tree_path(str(tmp_path), typed) == stored
+
+
+def test_an_absolute_structure_path_inside_the_project_is_relative_and_outside_is_refused(tmp_path: Path) -> None:
+    from inflorescence.tools.graph import _tree_path
+
+    project = tmp_path / "repo"
+    (project / "src").mkdir(parents=True)
+    link = tmp_path / "link"
+    link.symlink_to(project)
+
+    assert _tree_path(str(project), str(project / "src")) == "src"
+    assert _tree_path(str(project), str(project)) == "."
+    assert _tree_path(str(link), str(project / "src")) == "src", "a symlinked project root still matches"
+    assert _tree_path(str(project), str(tmp_path / "elsewhere")) is None
+
+
+class _IndexInfo(dict):
+    def data(self) -> dict[str, object]:
+        return dict(self)
+
+
+class LevelIndexConnection:
+    """A Memgraph stand-in with named vector indexes: SHOW INDEX INFO lists *present* (by label),
+    and each index answers with its own rows."""
+
+    def __init__(self, present_labels: set[str], rows_by_index: dict[str, list[dict[str, object]]]) -> None:
+        self.present_labels = present_labels
+        self.rows_by_index = rows_by_index
+        self.searched: list[str] = []
+
+    async def execute_query(self, query: str, params: dict[str, object] | None = None) -> list[object]:
+        if query.startswith("SHOW INDEX INFO"):
+            return [
+                _IndexInfo({"index type": "label+property_vector", "label": label, "property": "summary_embedding"})
+                for label in sorted(self.present_labels)
+            ]
+        index = re.search(r"vector_search\.search\('([^']+)'", query).group(1)
+        rows = self.rows_by_index.get(index, [])
+        if "AS scanned" in query:
+            return [{"scanned": len(rows)}]
+        self.searched.append(index)
+        return rows
+
+
+def _summary_row(node_id: str, node_type: str, score: float) -> dict[str, object]:
+    return {"id": node_id, "name": node_id, "labels": ["Code", node_type.capitalize()], "file_path": node_id,
+            "line_start": 0, "line_end": 0, "score": score, "summary": ""}
+
+
+@pytest.mark.asyncio
+async def test_summary_search_ranks_directories_in_their_own_index() -> None:
+    """Directories compete with directories, not with every function of every project."""
+    conn = LevelIndexConnection(
+        {"Code", "Directory", "Module"},
+        {"directory_summary_embeddings": [_summary_row("dir:src/a", "directory", 0.4)]},
+    )
+
+    found = await GraphRepository(conn).vector_hits("summary", "project-id", [0.1], 5, node_types=["directory"])
+
+    assert conn.searched == ["directory_summary_embeddings"]
+    assert [row["id"] for row in found.rows] == ["dir:src/a"]
+    assert found.complete and found.fallback_from == ()
+
+
+@pytest.mark.asyncio
+async def test_summary_search_merges_level_indexes_by_score() -> None:
+    conn = LevelIndexConnection({"Directory", "Module"}, {
+        "directory_summary_embeddings": [_summary_row("dir:src", "directory", 0.3)],
+        "module_summary_embeddings": [_summary_row("src/m.py", "module", 0.7)],
+    })
+
+    found = await GraphRepository(conn).vector_hits(
+        "summary", "project-id", [0.1], 5, node_types=["directory", "module"]
+    )
+
+    assert sorted(conn.searched) == ["directory_summary_embeddings", "module_summary_embeddings"]
+    assert [row["id"] for row in found.rows] == ["src/m.py", "dir:src"]
+
+
+@pytest.mark.asyncio
+async def test_summary_search_uses_the_shared_index_for_other_types() -> None:
+    conn = LevelIndexConnection({"Code", "Directory"}, {"summary_embeddings": []})
+
+    found = await GraphRepository(conn).vector_hits(
+        "summary", "project-id", [0.1], 5, node_types=["directory", "function"]
+    )
+
+    assert conn.searched == ["summary_embeddings"]
+    assert found.fallback_from == (), "no narrower index was asked for, so nothing fell back"
+
+
+@pytest.mark.asyncio
+async def test_summary_search_says_so_when_a_level_index_is_missing() -> None:
+    """A database set up before the level indexes existed keeps answering — and says how."""
+    conn = LevelIndexConnection({"Code"}, {"summary_embeddings": [_summary_row("dir:src", "directory", 0.5)]})
+
+    found = await GraphRepository(conn).vector_hits("summary", "project-id", [0.1], 5, node_types=["directory"])
+
+    assert conn.searched == ["summary_embeddings"]
+    assert [row["id"] for row in found.rows] == ["dir:src"]
+    assert found.fallback_from == ("directory_summary_embeddings",)
+
+
+@pytest.mark.asyncio
+async def test_search_semantic_hands_node_types_down_and_reports_a_fallback(tmp_path: Path, monkeypatch) -> None:
+    class FallbackRepository(FakeGraphRepositoryV2):
+        async def vector_hits(self, kind, project, embedding, needed, keep=lambda rows: rows, node_types=None):  # noqa: ANN001, ANN201
+            self.vector_node_types = node_types
+            return ProjectHits([], complete=True, fallback_from=("directory_summary_embeddings",))
+
+    repo = FallbackRepository()
+    mcp = FastMCP("test")
+    register_search_tools(mcp, FakeManager(), repo, Settings(_env_file=None))
+    tool = mcp._tool_manager.get_tool("search_semantic")
+    monkeypatch.setattr(_closure_cell_with_attr(tool.fn, "model"), "embed", lambda texts: [[0.1, 0.2]])
+
+    payload = _payload(await mcp.call_tool(
+        "search_semantic", {"directory": str(tmp_path), "query": "auth", "node_types": ["directory"]}
+    ))
+
+    assert repo.vector_node_types == ["directory"]
+    assert payload["meta"]["summary_index_fallback"] == {
+        "missing": ["directory_summary_embeddings"], "searched": "summary_embeddings",
+    }
 
 
 @pytest.mark.asyncio
@@ -1592,6 +1789,34 @@ class StoredChecksums:
     async def get_watch_state(self, project: str) -> dict[str, object]:
         self.watch_state_calls += 1
         return dict(self.watch_state)
+
+    async def get_indexed_head(self, project: str) -> str | None:
+        return None
+
+    # The tools ask the repository for a project's hits through the widening entry points;
+    # these fakes answer them from the per-field methods each test fake already defines, so a
+    # test states *what the index holds* once and every tool reads it the same way.
+    # A fake cannot widen its window, so it reports what the real repository would report at
+    # its ceiling: a window that came back full while the filters left the request unfilled is
+    # an incomplete answer; anything else is the whole answer.
+    async def vector_hits(self, kind, project, embedding, needed, keep=lambda rows: rows, node_types=None):  # noqa: ANN001, ANN201
+        self.vector_node_types = node_types
+        method = self.search_code_vectors if kind == "code" else self.search_summary_vectors
+        raw = [dict(row) for row in await method(project, embedding, needed)]
+        kept = keep(raw)
+        return ProjectHits(kept[:needed], complete=not (len(raw) >= needed and len(kept) < needed))
+
+    async def text_hits(self, kind, project, query, needed, keep=lambda rows: rows, fuzzy_distance=0):  # noqa: ANN001, ANN201
+        if fuzzy_distance:
+            return ProjectHits([], complete=True)
+        method = {
+            "summary": self.search_summary_text,
+            "symbol": self.search_symbol_text,
+            "code": self.search_code_text,
+        }[kind]
+        raw = [dict(row) for row in await method(project, query, needed)]
+        kept = keep(raw)
+        return ProjectHits(kept[:needed], complete=not (len(raw) >= needed and len(kept) < needed))
 
 
 class FakeEmbedder:
@@ -1940,6 +2165,10 @@ class RecordingQueryConnection:
         self.write_params: dict[str, object] = {}
 
     async def execute_query(self, query: str, params: dict[str, object]) -> list[dict[str, object]]:
+        if "AS scanned" in query:
+            # The search window probe: this fake's index holds exactly `records`, so a window
+            # of any size comes back with that many rows and the search stops widening.
+            return [{"scanned": len(self.records)}]
         self.query = query
         self.params = params
         return self.records
@@ -2201,7 +2430,10 @@ async def test_search_text_sanitizes_tantivy_metacharacters_before_querying() ->
         {"directory": "/tmp/project", "query": "ValueError: invalid literal (arr[0])"},
     ))
 
-    assert repo.received_queries == ["ValueError invalid literal arr 0"] * 3
+    # Lower-cased too: the index lower-cases every token anyway, and an upper-case AND/OR/NOT
+    # in pasted text must not become a boolean operator. (Later entries are the per-word
+    # probes that tell an unmatched word from a filtered one.)
+    assert repo.received_queries[:3] == ["valueerror invalid literal arr 0"] * 3
 
 
 @pytest.mark.asyncio
@@ -2451,7 +2683,7 @@ async def test_an_empty_search_says_what_the_index_does_not_cover(tmp_path: Path
     assert payload["items"] == []
     coverage = payload["meta"]["index_coverage"]
     assert coverage["not_indexed"] == ["wave_queue.py"]
-    assert "NOT evidence of absence" in coverage["note"]
+    assert "may be a coverage gap" in coverage["note"]
 
 
 LONG_SUMMARY = "A long multi-paragraph summary. " * 20  # 640 chars, over the preview bound
@@ -3131,7 +3363,8 @@ async def test_list_entities_reports_a_fresh_page_with_no_item_flags(tmp_path: P
     }
     assert payload["items"] == [
         entity("pkg/a.py::run", "run", "function", "pkg/a.py", 2, 4, "Runs."),
-        entity("tests/test_a.py::test_run", "test_run", "function", "tests/test_a.py", 1, 3, "Tests."),
+        # Not a freshness flag: the path heuristic every listing applies, as search does.
+        {**entity("tests/test_a.py::test_run", "test_run", "function", "tests/test_a.py", 1, 3, "Tests."), "is_test": True},
     ]
     assert repo.checksum_calls == 1  # one get_checksums per tool call, whole project
 
@@ -3997,7 +4230,7 @@ async def test_get_related_entities_resolves_a_unique_name() -> None:
 async def test_get_related_entities_refuses_an_ambiguous_name_with_candidates() -> None:
     mcp = FastMCP("test")
     repo = _NameResolvingRepository([
-        entity("pkg/a.py::run", "run", "function", "pkg/a.py", 2, 4, "Runs."),
+        entity("pkg/a.py::run_all", "run_all", "function", "pkg/a.py", 2, 4, "Runs."),
         entity("pkg/b.py::Runner.run", "Runner.run", "method", "pkg/b.py", 9, 11, "Runs."),
     ])
     register_graph_tools(mcp, FakeManager(), repo)
@@ -4006,9 +4239,141 @@ async def test_get_related_entities_refuses_an_ambiguous_name_with_candidates() 
 
     assert payload["error"]["code"] == "ambiguous_name"
     message = payload["error"]["message"]
-    for fragment in ("pkg/a.py::run", "function", "pkg/b.py::Runner.run", "method", "pkg/b.py"):
+    for fragment in ("pkg/a.py::run_all", "function", "pkg/b.py::Runner.run", "method", "pkg/b.py"):
         assert fragment in message
     assert repo.related_node_ids == [], "an ambiguous name must not pick one silently"
+
+
+@pytest.mark.asyncio
+async def test_an_exactly_spelled_name_wins_over_substring_matches() -> None:
+    """Field report: name="TASKS" listed ten `readTasks`-like candidates and not the constant."""
+    mcp = FastMCP("test")
+    repo = _NameResolvingRepository([
+        entity("backend/jobs.go::readTasks", "readTasks", "function", "backend/jobs.go", 1, 9, "Reads."),
+        entity("backend/jobs.go::TaskSource", "TaskSource", "interface", "backend/jobs.go", 11, 15, "Source."),
+        entity("web/tasks/index.ts::TASKS", "TASKS", "variable", "web/tasks/index.ts", 3, 40, ""),
+        entity("web/tasks/list.ts::tasks", "tasks", "variable", "web/tasks/list.ts", 1, 1, ""),
+    ])
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool(
+        "get_related_entities", {"directory": "/tmp/project", "name": "TASKS", "direction": "incoming"}
+    ))
+
+    assert repo.related_node_ids == ["web/tasks/index.ts::TASKS"]
+    assert payload["meta"]["resolved_node_id"] == "web/tasks/index.ts::TASKS"
+    assert payload["meta"]["name_match"] == "exact"
+
+    ignoring_case = _payload(await mcp.call_tool(
+        "get_related_entities", {"directory": "/tmp/project", "name": "Tasks"}
+    ))
+    assert ignoring_case["error"]["code"] == "ambiguous_name"
+    message = ignoring_case["error"]["message"]
+    assert "is the name (ignoring case) of" in message
+    assert "readTasks" not in message, "only the exact-ignoring-case names are candidates"
+
+
+@pytest.mark.asyncio
+async def test_path_filters_narrow_an_ambiguous_name_and_filter_the_related_rows() -> None:
+    mcp = FastMCP("test")
+    repo = _NameResolvingRepository([
+        entity("mocks/tasks.ts::TASKS", "TASKS", "variable", "mocks/tasks.ts", 1, 5, ""),
+        entity("web/tasks/index.ts::TASKS", "TASKS", "variable", "web/tasks/index.ts", 3, 40, ""),
+    ])
+
+    async def related(project, node_id, direction, relation_types, limit, offset):
+        repo.related_node_ids.append(node_id)
+        return [
+            {"relation": "IMPORTS", "direction": "incoming",
+             "entity": entity("web/board.ts", "board", "module", "web/board.ts", 1, 90, "Board.")},
+            {"relation": "IMPORTS", "direction": "incoming",
+             "entity": entity("mocks/fake.ts", "fake", "module", "mocks/fake.ts", 1, 9, "Fake.")},
+            {"relation": "IMPORTS", "direction": "incoming",
+             "entity": entity("web/board.test.ts", "board.test", "module", "web/board.test.ts", 1, 9, "Test.")},
+        ]
+
+    repo.get_related_entities = related  # type: ignore[method-assign]
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("get_related_entities", {
+        "directory": "/tmp/project", "name": "TASKS", "direction": "incoming",
+        "exclude_paths": ["mocks/"], "include_tests": False,
+    }))
+
+    assert payload["meta"]["name_match"] == "exact_within_path_filters"
+    assert repo.related_node_ids == ["web/tasks/index.ts::TASKS"]
+    # The rows are relation rows — the path sits under `entity`, and the filters must see it.
+    assert [item["entity"]["id"] for item in payload["items"]] == ["web/board.ts"]
+
+
+@pytest.mark.asyncio
+async def test_structure_of_a_directory_path_resolves_to_its_directory_node(tmp_path: Path) -> None:
+    (tmp_path / "src" / "lib").mkdir(parents=True)
+    seen: list[dict[str, object]] = []
+
+    class DirectoryRepository(FakeGraphRepositoryV2):
+        async def get_structure_root(self, project, node_id=None, file_path=None):
+            seen.append({"node_id": node_id, "file_path": file_path})
+            if file_path == "src/lib":
+                return entity("dir:src/lib", "lib", "directory", "src/lib", None, None, "Lib.")
+            return None
+
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), DirectoryRepository())
+
+    payload = _payload(await mcp.call_tool(
+        "get_entity_structure", {"directory": str(tmp_path), "file_path": "./src/lib/"}
+    ))
+
+    assert payload["root"]["id"] == "dir:src/lib"
+    assert seen == [{"node_id": None, "file_path": "src/lib"}], "one lookup, by the normalized path"
+
+    outside = _payload(await mcp.call_tool(
+        "get_entity_structure", {"directory": str(tmp_path / "src"), "file_path": str(tmp_path / "other")}
+    ))
+    assert outside["error"]["code"] == "invalid_argument"
+
+    (tmp_path / "empty").mkdir()
+    missing = _payload(await mcp.call_tool("get_entity_structure", {"directory": str(tmp_path), "file_path": "empty"}))
+    assert missing["error"]["code"] == "not_found"
+    assert "is a directory on disk" in missing["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_listings_drop_tests_on_request_and_return_whole_summaries(tmp_path: Path) -> None:
+    long_summary = "Capabilities: sheet construction, candidate extraction. " * 10
+
+    class InventoryRepository(FakeGraphRepositoryV2):
+        async def list_entities(self, project, node_types, limit, offset):
+            return [
+                entity("legacy/old.ts", "old", "module", "legacy/old.ts", 1, 9, long_summary),
+                entity("src/rules.ts", "rules", "module", "src/rules.ts", 1, 90, long_summary),
+                entity("src/rules.test.ts", "rules.test", "module", "src/rules.test.ts", 1, 9, "Tests."),
+                entity("src/rules.ts::R23", "R23", "variable", "src/rules.ts", 4, 9, "", ),
+            ]
+
+    repo = InventoryRepository()
+    mcp = FastMCP("test")
+    register_graph_tools(mcp, FakeManager(), repo)
+
+    payload = _payload(await mcp.call_tool("list_entities", {
+        "directory": str(tmp_path), "include_tests": False, "full_summaries": True, "limit": 100,
+    }))
+
+    ids = [item["id"] for item in payload["items"]]
+    assert ids == ["legacy/old.ts", "src/rules.ts", "src/rules.ts::R23"], "path order kept, tests dropped"
+    assert all("archived" not in item for item in payload["items"])
+    assert payload["items"][1]["summary"] == long_summary
+    assert payload["meta"]["full_summaries"] is True and payload["meta"]["include_tests"] is False
+    assert payload["page"]["limit"] == FULL_SUMMARY_MAX_LIMIT
+
+
+def test_entity_refs_show_the_signature_only_where_there_is_no_summary() -> None:
+    declaration = {**entity("a.ts::MAX", "MAX", "variable", "a.ts", 1, 1, ""), "signature": "export const MAX = 3"}
+    function = {**entity("a.ts::run", "run", "function", "a.ts", 3, 9, "Runs."), "signature": "function run()"}
+
+    assert entity_ref(declaration)["signature"] == "export const MAX = 3"
+    assert "signature" not in entity_ref(function)
 
 
 @pytest.mark.asyncio

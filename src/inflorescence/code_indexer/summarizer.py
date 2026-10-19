@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 
 from inflorescence.code_indexer import prompts
-from inflorescence.code_indexer.models import CodeNode, Edge, EdgeType, NodeType
+from inflorescence.code_indexer.models import DECLARATION_NODE_TYPES, CodeNode, Edge, EdgeType, NodeType
 from inflorescence.llm_client import LLMClient
 from inflorescence.progress import ProgressReporter, resolve
 
@@ -23,6 +23,89 @@ def _child_descriptor(child: CodeNode) -> str:
     sig_part = f" `{child.signature}`" if child.signature else ""
     summary_part = f" — {child.summary}" if child.summary else ""
     return f"  [{kind}]{sig_part} {child.name}{summary_part}"
+
+
+# How much of a module's header (its docstring, or the comment block a JS/TS/Go/Rust file opens
+# with) a container prompt quotes. The header is where a file says what it is FOR — "the
+# reconciliation job's retry policy" — which its members' summaries, each written about one
+# function, never state; a module summary written without it restates the members.
+MODULE_HEADER_MAX_CHARS = 800
+# The same header, shorter, in front of every function/class summarized from that file. A field
+# report (15.09.2026) found a math module summarized as "a cryptographic sum structure using a
+# signature path": its header comment said "tap on an operator sign", the function bodies did
+# not, and the agent stopped trusting semantic search on that code. The first lines of a
+# header name the domain; the cap keeps the added cost to a few dozen tokens per summary.
+LEAF_HEADER_MAX_CHARS = 300
+
+_COMMENT_PREFIXES = ("//", "/*", "*", "#!")
+
+
+def _where(node: CodeNode) -> str:
+    """Where a node lives, for a prompt: the path is context a name alone does not carry.
+
+    ``run`` in ``billing/retry.ts`` and ``run`` in ``cli/main.ts`` are summarized from the same
+    few lines of code; the path is what lets the summary say which subsystem it belongs to —
+    and that vocabulary is what a semantic search for the subsystem later matches.
+    """
+    if not node.file_path:
+        return ""
+    noun = "directory" if node.node_type == NodeType.DIRECTORY else "file"
+    return f" in the {noun} '{node.file_path}'"
+
+
+def _leading_comment(root_path: Path, file_path: str) -> str:
+    """The comment block a file opens with (after a shebang and blank lines), or ""."""
+    try:
+        with (root_path / file_path).open(encoding="utf-8", errors="replace") as handle:
+            head = handle.read(MODULE_HEADER_MAX_CHARS * 2)
+    except OSError:
+        return ""
+    lines: list[str] = []
+    for raw in head.splitlines():
+        line = raw.strip()
+        if not line:
+            if lines:
+                break
+            continue
+        if not line.startswith(_COMMENT_PREFIXES):
+            break
+        if not line.startswith("#!"):
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def module_header(node: CodeNode, root_path: Path | None) -> str:
+    """What a module says about itself: its docstring, else its leading comment, capped.
+
+    Read for the prompt only — never part of :func:`summary_input_hash`, so quoting it costs
+    no re-summarization of an index built before it was quoted.
+    """
+    if node.node_type != NodeType.MODULE:
+        return ""
+    header = node.docstring.strip()
+    if not header and root_path is not None:
+        header = _leading_comment(root_path, node.file_path)
+    return header[:MODULE_HEADER_MAX_CHARS]
+
+
+# Bump when the *user message* a summary is generated from changes shape — what is quoted
+# around the code (the path, the module header), not the code itself. The system prompts are
+# hashed in below, so editing a prompt string needs no bump.
+PROMPT_LAYOUT = 2
+
+
+def _prompt_version() -> str:
+    texts = sorted((name, value) for name, value in vars(prompts).items() if name.endswith("_SYSTEM_PROMPT"))
+    digest = hashlib.sha256("\x00".join(f"{name}={value}" for name, value in texts).encode("utf-8"))
+    return f"{PROMPT_LAYOUT}.{digest.hexdigest()[:8]}"
+
+
+# Which prompts wrote a summary, stored on the node as ``summary_prompt_version``. Deliberately
+# NOT part of :func:`summary_input_hash`: a prompt edit must never re-buy every summary in every
+# project on its own. It is a record — which summaries predate a prompt change, so a deliberate,
+# priced rebuild of one project can be decided from data (an empty value = written before
+# versions were recorded).
+SUMMARY_PROMPT_VERSION = _prompt_version()
 
 
 def summary_input_hash(node: CodeNode, children: list[CodeNode], source: str = "") -> str:
@@ -60,13 +143,18 @@ async def summarize_hierarchy(
     """
     stored = stored or {}
     bar = resolve(progress)
+    # Declarations (DECLARATION_NODE_TYPES) are neither summarized nor part of their parent's
+    # summary input — so a module that declares constants hashes exactly as it did before they
+    # became nodes, and one that declares nothing else stays a leaf summarized from its source.
+    declarations = {n.id for n in nodes if n.node_type in DECLARATION_NODE_TYPES}
+    nodes = [n for n in nodes if n.id not in declarations]
     node_map = {n.id: n for n in nodes}
 
     children_map: dict[str, list[str]] = defaultdict(list)
     parent_map: dict[str, str] = {}
     parent_set: set[str] = set()
     for e in edges:
-        if e.edge_type == EdgeType.CONTAINS:
+        if e.edge_type == EdgeType.CONTAINS and e.target not in declarations:
             children_map[e.source].append(e.target)
             parent_map[e.target] = e.source
             parent_set.add(e.source)
@@ -103,6 +191,7 @@ async def summarize_hierarchy(
         if prev and prev.get("summary_input_hash") == input_hash and prev.get("summary"):
             node.summary = str(prev["summary"])
             node.summary_input_hash = input_hash
+            node.summary_prompt_version = str(prev.get("summary_prompt_version") or "")
             return True
         return False
 
@@ -119,6 +208,7 @@ async def summarize_hierarchy(
         prev_summary = str(prev["summary"]) if prev and prev.get("summary") else ""
         node.summary = prev_summary or fallback
         node.summary_input_hash = ""
+        node.summary_prompt_version = str(prev.get("summary_prompt_version") or "") if prev_summary and prev else ""
         if not prev_summary:
             dirty.add(node.id)
 
@@ -131,7 +221,10 @@ async def summarize_hierarchy(
         for i in range(0, len(gen), batch_size):
             batch = gen[i : i + batch_size]
             results = await asyncio.gather(
-                *[_summarize_container(n, children_map, node_map, llm, max_source_chars) for n in batch],
+                *[
+                    _summarize_container(n, children_map, node_map, llm, max_source_chars, root_path=root_path)
+                    for n in batch
+                ],
                 return_exceptions=True,
             )
             for node, result in zip(batch, results, strict=True):
@@ -140,6 +233,7 @@ async def summarize_hierarchy(
                     _keep_stale_on_failure(node, fallback="")
                 else:
                     node.summary = str(result)
+                    node.summary_prompt_version = SUMMARY_PROMPT_VERSION
                     dirty.add(node.id)
             if on_batch is not None:
                 await on_batch(batch)
@@ -175,6 +269,18 @@ async def summarize_hierarchy(
                     gen.append(node)
             await _generate_containers(gen, "drained containers")
 
+    modules = {n.file_path: n for n in nodes if n.node_type == NodeType.MODULE}
+    headers: dict[str, str] = {}
+
+    def _leaf_header(node: CodeNode) -> str:
+        """The enclosing module's header for a member's prompt (a module leaf quotes its own source)."""
+        module = modules.get(node.file_path)
+        if module is None or module.id == node.id:
+            return ""
+        if node.file_path not in headers:
+            headers[node.file_path] = module_header(module, root_path)[:LEAF_HEADER_MAX_CHARS]
+        return headers[node.file_path]
+
     # Phase 1: leaves (source-based hash), concurrent generation in batches.
     to_generate: list[CodeNode] = []
     for node in leaves:
@@ -192,7 +298,7 @@ async def summarize_hierarchy(
     for i in range(0, len(to_generate), batch_size):
         batch = to_generate[i : i + batch_size]
         results = await asyncio.gather(
-            *[_summarize_leaf(n, root_path, llm, max_source_chars) for n in batch],
+            *[_summarize_leaf(n, root_path, llm, max_source_chars, header=_leaf_header(n)) for n in batch],
             return_exceptions=True,
         )
         for node, result in zip(batch, results, strict=True):
@@ -201,6 +307,7 @@ async def summarize_hierarchy(
                 _keep_stale_on_failure(node, fallback=node.docstring or "")
             else:
                 node.summary = str(result)
+                node.summary_prompt_version = SUMMARY_PROMPT_VERSION
                 dirty.add(node.id)
             attempted.add(node.id)
         if on_batch is not None:
@@ -258,7 +365,7 @@ async def summarize_single(
     if children:
         children_map = {node.id: [c.id for c in children]}
         node_map = {c.id: c for c in children}
-        return await _summarize_container(node, children_map, node_map, llm, max_source_chars)
+        return await _summarize_container(node, children_map, node_map, llm, max_source_chars, root_path=root_path)
     return await _summarize_leaf(node, root_path, llm, max_source_chars)
 
 
@@ -267,8 +374,14 @@ async def _summarize_leaf(
     root_path: Path,
     llm: LLMClient,
     max_source_chars: int,
+    *,
+    header: str = "",
 ) -> str:
-    """Summarize a leaf node from its source code. Returns summary text."""
+    """Summarize a leaf node from its source code. Returns summary text.
+
+    *header* is the enclosing module's header (see :data:`LEAF_HEADER_MAX_CHARS`) — prompt
+    context only, never part of the input hash.
+    """
     source = node_source(node, root_path)
     if not source:
         return node.docstring or ""
@@ -283,8 +396,10 @@ async def _summarize_leaf(
     else:
         system_prompt = prompts.LEAF_SYSTEM_PROMPT
         map_prompt, reduce_prompt = prompts.MAP_SYSTEM_PROMPT, prompts.REDUCE_SYSTEM_PROMPT
+        context = f"The file opens with this header:\n{header}\n\n" if header else ""
         prompt = (
-            f"Summarize this {node.node_type.value} named '{node.name}':\n\n"
+            f"Summarize this {node.node_type.value} named '{node.name}'{_where(node)}:\n\n"
+            f"{context}"
             f"Signature: {node.signature}\n"
             f"Docstring: {node.docstring}\n\n"
             f"```\n{source}\n```"
@@ -306,6 +421,8 @@ async def _summarize_container(
     node_map: dict[str, CodeNode],
     llm: LLMClient,
     max_chars: int = 12000,
+    *,
+    root_path: Path | None = None,
 ) -> str:
     """Summarize a container node from its children's summaries. Returns summary text.
 
@@ -325,11 +442,15 @@ async def _summarize_container(
     if not child_descriptions:
         return ""
 
+    header = module_header(node, root_path)
+    intro = f"Summarize this {node.node_type.value} '{node.name}'{_where(node)} based on its contents"
+    if header:
+        intro += f".\n\nIt opens with this header:\n{header}\n\nIts contents"
     contents = "\n".join(child_descriptions)
     if len(contents) > max_chars:
-        return await _map_reduce_container(node, child_descriptions, llm, max_chars)
+        return await _map_reduce_container(node, child_descriptions, llm, max_chars, intro=intro)
 
-    prompt = f"Summarize this {node.node_type.value} '{node.name}' based on its contents:\n\n{contents}"
+    prompt = f"{intro}:\n\n{contents}"
     summary = await llm.generate(prompt, system_prompt=prompts.CONTAINER_SYSTEM_PROMPT)
     return summary.strip()
 
@@ -339,6 +460,8 @@ async def _map_reduce_container(
     child_descriptions: list[str],
     llm: LLMClient,
     max_chars: int,
+    *,
+    intro: str = "",
 ) -> str:
     """Summarize a wide container via map-reduce over batches of child descriptors.
 
@@ -364,7 +487,7 @@ async def _map_reduce_container(
         contents = "\n".join(batch)
         prompt = (
             f"Summarize group {i + 1}/{len(batches)} of the contents of "
-            f"{node.node_type.value} '{node.name}':\n\n{contents}"
+            f"{node.node_type.value} '{node.name}'{_where(node)}:\n\n{contents}"
         )
         result = await llm.generate(prompt, system_prompt=prompts.CONTAINER_MAP_SYSTEM_PROMPT)
         return result.strip()
@@ -372,7 +495,8 @@ async def _map_reduce_container(
     partials = await asyncio.gather(*[_map_batch(i, b) for i, b in enumerate(batches)])
 
     combined = "\n".join(f"  [group] {p}" for p in partials)
-    prompt = f"Summarize this {node.node_type.value} '{node.name}' based on its contents:\n\n{combined}"
+    intro = intro or f"Summarize this {node.node_type.value} '{node.name}'{_where(node)} based on its contents"
+    prompt = f"{intro}:\n\n{combined}"
     summary = await llm.generate(prompt, system_prompt=prompts.CONTAINER_SYSTEM_PROMPT)
     return summary.strip()
 
@@ -399,7 +523,7 @@ async def _map_reduce_summarize(
     # Map phase — parallel
     async def _map_chunk(i: int, chunk: str) -> str:
         prompt = (
-            f"Summarize chunk {i + 1}/{len(chunks)} of {node.node_type.value} '{node.name}':\n\n"
+            f"Summarize chunk {i + 1}/{len(chunks)} of {node.node_type.value} '{node.name}'{_where(node)}:\n\n"
             f"```\n{chunk}\n```"
         )
         result = await llm.generate(prompt, system_prompt=map_prompt)

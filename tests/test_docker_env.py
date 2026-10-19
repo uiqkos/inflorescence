@@ -30,6 +30,33 @@ def test_run_argv_binds_loopback_and_keeps_a_named_volume() -> None:
     assert "memgraph-mage" in de.MEMGRAPH_IMAGE, "vector indexes do not exist on plain memgraph"
 
 
+def test_stop_grace_period_allows_a_full_exit_snapshot() -> None:
+    from pathlib import Path
+
+    argv = de.memgraph_run_argv(7687)
+    timeout = argv[argv.index("--stop-timeout") + 1]
+    assert int(timeout) >= 600, "the observed multi-GB snapshot cannot finish in Docker's default 10s"
+    compose = (Path(__file__).parents[1] / "docker-compose.yml").read_text()
+    assert f"stop_grace_period: {timeout}s" in compose
+
+
+def test_manual_stop_mode_never_calls_docker_or_launches_its_app(monkeypatch) -> None:
+    monkeypatch.setattr(de, "port_open", lambda *a, **k: False)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("autostart is disabled; even consulting Docker is unnecessary")
+
+    monkeypatch.setattr(de, "docker_cli_present", forbidden)
+    monkeypatch.setattr(de, "ensure_docker_daemon", forbidden)
+    monkeypatch.setattr(de, "_run", forbidden)
+    assert de.ensure_memgraph("bolt://localhost:7687", auto_start=False) is False
+
+
+def test_manual_stop_mode_can_use_an_already_running_database(monkeypatch) -> None:
+    monkeypatch.setattr(de, "port_open", lambda *a, **k: True)
+    assert de.ensure_memgraph("bolt://localhost:7687", auto_start=False) is True
+
+
 def test_docker_available_requires_a_server_version_not_just_exit_zero(monkeypatch) -> None:
     """`docker info` exits 0 even with the daemon down (the error goes to stderr), so the
     old exit-code check reported a dead daemon as available — and the daemon-launch path

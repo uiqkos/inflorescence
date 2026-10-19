@@ -35,6 +35,29 @@ def _find_children_by_type(node: TSNode, *types: str) -> list[TSNode]:
     return [c for c in node.children if c.type in types]
 
 
+# A declaration's signature is its first source line, cut here (see javascript_parser).
+_DECLARATION_SIGNATURE_CHARS = 200
+
+
+def _first_line(text: str) -> str:
+    stripped = text.strip()
+    line = stripped.splitlines()[0].rstrip() if stripped else ""
+    if len(line) > _DECLARATION_SIGNATURE_CHARS:
+        return line[: _DECLARATION_SIGNATURE_CHARS - 1] + "…"
+    return line
+
+
+def _value_specs(node: TSNode) -> list[TSNode]:
+    """The ``var_spec``/``const_spec`` of a declaration, grouped (``var ( ... )``) or not."""
+    specs: list[TSNode] = []
+    for child in node.named_children:
+        if child.type in ("var_spec", "const_spec"):
+            specs.append(child)
+        elif child.type == "var_spec_list":
+            specs.extend(c for c in child.named_children if c.type == "var_spec")
+    return specs
+
+
 def _get_doc_comment(node: TSNode, source_bytes: bytes) -> str:
     """Extract Go doc comment (consecutive // lines before a declaration)."""
     comments: list[str] = []
@@ -171,6 +194,7 @@ class GoParser(BaseParser):
                 # Top-level initializers can call functions; attribute them to the module
                 # node so a scripty file never reads as "calls nothing".
                 self._extract_calls(child, mod_id, source_bytes, edges)
+                self._handle_value_decl(child, mod_id, rel, source_bytes, nodes, edges)
 
         return nodes, edges, facts
 
@@ -276,6 +300,44 @@ class GoParser(BaseParser):
         facts.local_names[meth_id] = _collect_local_names(node, source_bytes)
         self._extract_calls(node, meth_id, source_bytes, edges)
 
+    def _handle_value_decl(
+        self,
+        node: TSNode,
+        mod_id: str,
+        rel: str,
+        source_bytes: bytes,
+        nodes: list[CodeNode],
+        edges: list[Edge],
+    ) -> None:
+        """Top-level ``var``/``const`` -> one VARIABLE node per declared name."""
+        keyword = "var" if node.type == "var_declaration" else "const"
+        specs = _value_specs(node)
+        for spec in specs:
+            names = [n for n in spec.children_by_field_name("name") if n.type == "identifier"]
+            doc = _get_doc_comment(spec if len(specs) > 1 else node, source_bytes)
+            span = node if len(specs) == 1 else spec
+            for name_node in names:
+                name = _node_text(name_node, source_bytes)
+                if name == "_":
+                    continue  # `var _ Iface = (*T)(nil)` is a compile-time assertion, not a binding
+                var_id = f"{rel}::{name}"
+                if any(existing.id == var_id for existing in nodes):
+                    continue
+                nodes.append(
+                    CodeNode(
+                        id=var_id,
+                        name=name,
+                        node_type=NodeType.VARIABLE,
+                        file_path=rel,
+                        line_start=span.start_point[0] + 1,
+                        line_end=span.end_point[0] + 1,
+                        signature=f"{keyword} {_first_line(_node_text(spec, source_bytes))}",
+                        docstring=doc,
+                        parent_id=mod_id,
+                    )
+                )
+                edges.append(Edge(source=mod_id, target=var_id, edge_type=EdgeType.CONTAINS))
+
     def _handle_type_decl(
         self,
         node: TSNode,
@@ -286,7 +348,8 @@ class GoParser(BaseParser):
         edges: list[Edge],
         facts: FileFacts,
     ) -> None:
-        for spec in _find_children_by_type(node, "type_spec"):
+        specs = _find_children_by_type(node, "type_spec", "type_alias")
+        for spec in specs:
             name_node = _find_child_by_type(spec, "type_identifier")
             if not name_node:
                 continue
@@ -377,6 +440,28 @@ class GoParser(BaseParser):
                             )
                         )
 
+            else:
+                # `type Status string`, `type Handler func(...)`, `type ID = string`: a named type
+                # that is neither a struct nor an interface.
+                type_id = f"{rel}::{name}"
+                if any(existing.id == type_id for existing in nodes):
+                    continue
+                span = node if len(specs) == 1 else spec
+                nodes.append(
+                    CodeNode(
+                        id=type_id,
+                        name=name,
+                        node_type=NodeType.TYPE_ALIAS,
+                        file_path=rel,
+                        line_start=span.start_point[0] + 1,
+                        line_end=span.end_point[0] + 1,
+                        signature=f"type {_first_line(_node_text(spec, source_bytes))}",
+                        docstring=doc,
+                        parent_id=mod_id,
+                    )
+                )
+                edges.append(Edge(source=mod_id, target=type_id, edge_type=EdgeType.CONTAINS))
+
     def _handle_import(
         self, node: TSNode, mod_id: str, source_bytes: bytes, edges: list[Edge], facts: FileFacts
     ) -> None:
@@ -385,7 +470,12 @@ class GoParser(BaseParser):
             if not path_node:
                 return
             target = _node_text(path_node, source_bytes).strip('"')
-            edges.append(Edge(source=mod_id, target=target, edge_type=EdgeType.IMPORTS))
+            edges.append(
+                Edge(
+                    source=mod_id, target=target, edge_type=EdgeType.IMPORTS,
+                    specifier=target, line=spec.start_point[0] + 1, names=["*"],
+                )
+            )
             alias_node = _find_child_by_type(spec, "package_identifier")
             if alias_node is not None:
                 alias = _node_text(alias_node, source_bytes)

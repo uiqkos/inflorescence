@@ -8,18 +8,24 @@ import logging
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 from inflorescence.code_indexer.graph_builder import BuildResult, GraphBuilder
 from inflorescence.config import Settings
-from inflorescence.cost import IndexCostExceededError, estimate_index_cost
+from inflorescence.cost import (
+    IndexCostExceededError,
+    estimate_index_cost,
+    estimate_rechunk_cost,
+    price_largest_files,
+)
 from inflorescence.db.connection import MemgraphConnection
 from inflorescence.db.lease import project_lease
 from inflorescence.db.repository import GraphRepository
-from inflorescence.db.schema import missing_search_indexes
+from inflorescence.db.schema import REQUIRED_SEARCH_VECTORS, mismatched_vector_dimensions, missing_search_indexes
 from inflorescence.progress import ProgressReporter
 from inflorescence.rag.indexer import RAGIndexer
-from inflorescence.worktree import worktree_main_root
+from inflorescence.worktree import head_sha, worktree_main_root
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +66,17 @@ class SearchUnavailableError(IndexPreflightError):
     A subclass of :class:`IndexPreflightError` so existing "refuse to index" handlers catch
     it, while callers that care can distinguish a broken search circuit from bad credentials.
     """
+
+
+def _relative_to(path: str, root: Path) -> str:
+    """*path* relative to *root* when it is absolute and inside it (watcher events are absolute)."""
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return str(candidate)
+    try:
+        return str(candidate.resolve().relative_to(root.resolve()))
+    except (ValueError, OSError):
+        return str(candidate)
 
 
 def _project_name(path: Path) -> str:
@@ -153,6 +170,18 @@ class ProjectManager:
                 "MAGE image, or set REQUIRE_SEARCH_INDEXES=false to index anyway (search stays "
                 "degraded and the missing indexes are logged at ERROR)."
             )
+        mismatched = await mismatched_vector_dimensions(self._conn, self._settings.embedding_dimension)
+        required = {name for _label, _prop, name in REQUIRED_SEARCH_VECTORS}
+        wrong = {name: width for name, width in mismatched.items() if name in required}
+        if wrong:
+            listed = ", ".join(f"{name} is {width} wide" for name, width in sorted(wrong.items()))
+            raise SearchUnavailableError(
+                f"Vector indexes do not match EMBEDDING_DIMENSION={self._settings.embedding_dimension} "
+                f"({listed}) — refusing to index because every embedding would be paid for and then "
+                "rejected by the index. Set EMBEDDING_DIMENSION to the index width, or drop those "
+                "indexes (the server recreates them at the configured width on its next start) and "
+                "re-index."
+            )
 
     async def _persist_scope(
         self,
@@ -163,26 +192,53 @@ class ProjectManager:
         """Record this explicit index's include/exclude so a watcher update reproduces it."""
         await self._repo.set_project_scope(project, include_patterns or [], exclude_patterns or [])
 
-    def _gate_update_cost(self, root_path: Path, changed_files: list[str]) -> None:
+    async def _rechunk_backlog(
+        self, project: str, root: Path, exclude: Iterable[str]
+    ) -> tuple[list[str], float]:
+        """Unchanged files this run will re-chunk, and what embedding their new chunks costs.
+
+        A run re-chunks every file whose coverage marker is stale — including files whose
+        bytes never moved but whose chunks were cut by an older chunker (``CHUNK_FORMAT``).
+        The checksum-based gates never see those files, so without this the first run after
+        a chunker upgrade would embed new chunks across the whole project unpriced — small
+        money (embeddings only), but spent by a background flush that priced one file, which
+        is exactly what INV-10 forbids. *exclude* holds files already priced as changed.
+        """
+        excluded = {str(Path(p)) for p in exclude}
+        stale = await self._repo.get_files_with_stale_chunks(project)
+        backlog = sorted(path for path in stale if path not in excluded)
+        if not backlog:
+            return [], 0.0
+        preview = self._builder.estimate_paths(root, backlog)
+        return backlog, estimate_rechunk_cost(preview, self._settings)["usd"]
+
+    async def _gate_update_cost(self, project: str, root_path: Path, changed_files: list[str]) -> None:
         """Abort a background watcher update whose changed set would exceed the cost cap.
 
         A ``git checkout`` touching thousands of files fires one debounced flush that would
         re-summarize and re-embed them all. INV-10 forbids the background from silently spending
         more than an explicit index, so the same cap gates it — estimated over just the
-        changed files (deletes cost nothing). No cap configured (``None``) means no gate.
+        changed files (deletes cost nothing), plus the unchanged files whose chunks this run
+        will re-cut (:meth:`_rechunk_backlog`). No cap configured (``None``) means no gate.
         """
         limit = self._settings.max_index_cost_usd
         if limit is None:
             return
         preview = self._builder.estimate_paths(root_path, changed_files)
-        estimate = estimate_index_cost(preview, self._settings)
-        if estimate["usd"] > limit:
+        estimate = estimate_index_cost(preview, self._settings)["usd"]
+        changed_rel = [_relative_to(p, root_path) for p in changed_files]
+        backlog, backlog_usd = await self._rechunk_backlog(project, root_path, changed_rel)
+        total = round(estimate + backlog_usd, 4)
+        if total > limit:
             logger.error(
                 "Watcher update for project rooted at %s would cost ~$%.4f (limit $%.2f) over "
-                "%d changed path(s) — refusing to auto-spend; re-index explicitly to raise the cap",
-                root_path, estimate["usd"], limit, len(changed_files),
+                "%d changed path(s) and %d re-chunked file(s) — refusing to auto-spend; re-index "
+                "explicitly to raise the cap",
+                root_path, total, limit, len(changed_files), len(backlog),
             )
-            raise IndexCostExceededError(estimate["usd"], limit, changed_files=len(changed_files))
+            raise IndexCostExceededError(
+                total, limit, changed_files=len(changed_files), rechunk_files=len(backlog)
+            )
 
     async def _gate_reindex_cost(
         self,
@@ -214,16 +270,20 @@ class ProjectManager:
         changed = await self._builder.pending_change_paths(
             project, root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
         )
-        if not changed:
+        backlog, backlog_usd = await self._rechunk_backlog(project, root, changed)
+        if not changed and not backlog:
             return
-        preview = self._builder.estimate_paths(root, changed)
-        estimate = estimate_index_cost(preview, self._settings)
+        preview = self._builder.estimate_paths(root, changed) if changed else {}
+        total = round(estimate_index_cost(preview, self._settings)["usd"] + backlog_usd, 4)
         logger.info(
-            "Estimated re-index cost for project=%s: $%.4f (limit $%.2f) over %d changed file(s)",
-            project, estimate["usd"], limit, len(changed),
+            "Estimated re-index cost for project=%s: $%.4f (limit $%.2f) over %d changed file(s) "
+            "and %d re-chunked file(s)",
+            project, total, limit, len(changed), len(backlog),
         )
-        if estimate["usd"] > limit:
-            raise IndexCostExceededError(estimate["usd"], limit, changed_files=len(changed))
+        if total > limit:
+            raise IndexCostExceededError(
+                total, limit, changed_files=len(changed), rechunk_files=len(backlog)
+            )
 
     # ------------------------------------------------------------------
     # Git worktrees: index as a separate project, pay only for what differs
@@ -260,6 +320,18 @@ class ProjectManager:
         await self._repo.set_project_worktree_meta(
             project, self.get_project(str(main_root)), str(main_root)
         )
+
+    async def _stamp_indexed_head(self, project: str, root: Path) -> None:
+        """Record the commit the index now matches the disk at. Never fails the run.
+
+        Called only where the run leaves every scanned file indexed as it is on disk, so the
+        stamp is a true statement; read tools compare it with the checkout's HEAD to notice a
+        tree that moved on without the index (``index_freshness.drift``).
+        """
+        try:
+            await self._repo.set_indexed_head(project, head_sha(root))
+        except Exception:  # noqa: BLE001 — provenance must not fail an index that succeeded
+            logger.warning("Could not stamp indexed_head for project=%s", project, exc_info=True)
 
     async def _donor_project(self, project: str, main_root: Path | None) -> str | None:
         """The indexed main-checkout project whose cache this first index may reuse.
@@ -450,6 +522,7 @@ class ProjectManager:
                 "left to index", project, donor_project,
             )
 
+        await self._stamp_indexed_head(project, root)
         db_stats = await self._repo.get_project_stats(project)
         stats: dict[str, object] = {
             "project": project,
@@ -494,6 +567,7 @@ class ProjectManager:
                 "node_id": node.id,
                 "summary": node.summary,
                 "summary_input_hash": node.summary_input_hash,
+                "summary_prompt_version": node.summary_prompt_version,
             }
             for node in result.nodes
             if node.summary and node.id not in result.dirty_summary_ids
@@ -780,6 +854,7 @@ class ProjectManager:
                     await self._stamp_worktree_meta(project, main_root)
                     await self._persist_scope(project, include_patterns, exclude_patterns)
                     repaired = await self._repair_incomplete_index(project, root, progress)
+                    await self._stamp_indexed_head(project, root)
                     stats: dict[str, object] = {
                         "project": project,
                         "directory": str(root),
@@ -880,6 +955,7 @@ class ProjectManager:
                 progress=progress,
             )
 
+            await self._stamp_indexed_head(project, root)
             # Report what the database actually holds now, not just what this run
             # submitted — a partially failed run is visible in the delta.
             db_stats = await self._repo.get_project_stats(project)
@@ -1004,7 +1080,7 @@ class ProjectManager:
         if donor is not None:
             coverage = await self._donor_coverage(root, donor, include_patterns, exclude_patterns)
             uncovered, scanned = coverage.uncovered, coverage.scanned
-            paths_preview = self._builder.estimate_paths(root, uncovered)
+            paths_preview = price_largest_files(self._builder.estimate_paths(root, uncovered), self._settings)
             paths_estimate = estimate_index_cost(paths_preview, self._settings)
             return {
                 "project": project,
@@ -1019,8 +1095,9 @@ class ProjectManager:
                 "donor_covered_files": scanned - len(uncovered),
                 "uncovered_files": len(uncovered),
             }
-        preview = self._builder.preview(
-            root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
+        preview = price_largest_files(
+            self._builder.preview(root, include_patterns=include_patterns, exclude_patterns=exclude_patterns),
+            self._settings,
         )
         estimate = estimate_index_cost(preview, self._settings)
         return {
@@ -1036,17 +1113,26 @@ class ProjectManager:
         directory: str,
         indexed_paths: Iterable[str],
         scope: Sequence[str] | None = None,
+        max_examples: int | None = None,
     ) -> dict[str, object]:
         """Which files under *directory* the index does not hold — see
-        :meth:`GraphBuilder.scan_uncovered`.
+        :meth:`GraphBuilder.scan_uncovered`. *max_examples* raises how many are named
+        (``find_text`` reads every one it is given).
 
         Read tools call this when their answer is empty, to keep "nothing matched" apart from
         "that file was never indexed". Off the event loop, because it is `scandir` I/O and
         this process also serves a dashboard whose health endpoint must keep answering
         (the same reason ``_scan_for_changes`` threads its walk).
         """
+        if max_examples is None:
+            return await asyncio.to_thread(
+                self._builder.scan_uncovered, Path(directory), indexed_paths, scope
+            )
         return await asyncio.to_thread(
-            self._builder.scan_uncovered, Path(directory), indexed_paths, scope
+            partial(self._builder.scan_uncovered, max_examples=max_examples),
+            Path(directory),
+            indexed_paths,
+            scope,
         )
 
     async def update_project(self, project: str, changed_files: list[str]) -> dict[str, object]:
@@ -1090,7 +1176,7 @@ class ProjectManager:
             # (finding 5c) as the explicit index that created the project: gate the changed set,
             # then reproduce the persisted include/exclude so vendor/** excluded at index time is
             # not silently re-scanned, parsed, summarized and embedded on the first file save.
-            self._gate_update_cost(root_path, changed_files)
+            await self._gate_update_cost(project, root_path, changed_files)
             result = await self._builder.update(
                 project,
                 root_path,
@@ -1128,6 +1214,7 @@ class ProjectManager:
                 dirty_ids=result.dirty_summary_ids,
             )
 
+            await self._stamp_indexed_head(project, root_path)
             db_stats = await self._repo.get_project_stats(project)
             stats: dict[str, object] = {
                 "project": project,

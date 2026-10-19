@@ -252,6 +252,30 @@ def _ref_sha(git_dir: Path, ref: str) -> str | None:
     return None
 
 
+def head_sha(root: Path) -> str | None:
+    """The full object id *root* is checked out at, or ``None`` when it cannot be read.
+
+    The same archaeology as :func:`head_description`, returning the commit rather than a
+    label: an index records the commit it was last brought up to date at, and a later answer
+    compares the two to notice that the checkout has moved on (a merge, a rebase, a checkout)
+    since. Total like everything here — any doubt is ``None``, never a guess.
+    """
+    try:
+        start = Path(root).resolve()
+    except (OSError, ValueError, RuntimeError):
+        return None
+    git_dir = _git_dir(start)
+    if git_dir is None:
+        return None
+    head = _first_line(git_dir / "HEAD")
+    if head is None:
+        return None
+    if not head.startswith("ref:"):
+        return head if len(head) >= 7 else None
+    ref = head[len("ref:"):].strip()
+    return _ref_sha(git_dir, ref) if ref else None
+
+
 def head_description(root: Path) -> str | None:
     """Name the commit *root* is checked out at: ``"main @ a1b2c3d"``, or ``None``.
 
