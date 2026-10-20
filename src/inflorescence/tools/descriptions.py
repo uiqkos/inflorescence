@@ -119,9 +119,11 @@ EMPTY_PAGE = (
 WEAK = (
     "A vector search always returns its nearest neighbours, so low scores still look like results: "
     "a hit below the weak-similarity threshold carries ``\"weak\": true``, and ``meta.weak_results`` "
-    "is set when *every* hit on the page is weak — nothing "
-    "matched closely, so the code probably is not there, or is named differently; confirm with "
-    "``search_text`` on exact terms or ``find_text`` for a literal. (This only labels; "
+    "is set when *every* hit on the page is weak — no candidate matched closely. That is a fact "
+    "about similarity, not about presence: a long descriptive query often tops out below the "
+    "threshold with the right code on the page, and the code may equally be absent or named "
+    "differently. Read the top hits before concluding either; "
+    "``search_text`` on exact terms or ``find_text`` for a literal settles it. (This only labels; "
     "``min_score`` is the separate hard cut-off.)"
 )
 

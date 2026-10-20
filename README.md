@@ -175,9 +175,11 @@ trust a page that carries nothing:
 - The scan stopped at an internal ceiling → `page.truncated: true`, so a short page there is not
   evidence that nothing matches.
 - The hits were far away → `"weak": true` on each hit below `SEMANTIC_WEAK_THRESHOLD` (0.5 by
-  default), and `meta.weak_results: true` when *every* hit on the page was weak. That is the
-  closest a vector search can honestly get to "this code is not here". `search_text` never sets
-  it: BM25 scores are unbounded relevance, not similarities.
+  default), and `meta.weak_results: true` when *every* hit on the page was weak. That is a fact
+  about similarity, not about presence: a long descriptive query often tops out below the
+  threshold with the right code on the page (measured: 0.43–0.49 for the correct handlers of a
+  one-sentence question), and the code may equally be absent — `search_text` / `find_text`
+  settle which. `search_text` never sets it: BM25 scores are unbounded relevance, not similarities.
 - An empty page gets neither flag, because no hits is not the same claim as "the hits were far
   away".
 - The file was never indexed at all → `meta.index_coverage` on every empty first page. This is
