@@ -409,7 +409,9 @@ async def plan_summaries(
     One assumption makes it an upper bound rather than a replay: a regenerated summary is
     taken to differ from the stored one, so every container above it is counted. A real
     model virtually never returns the old text word for word, and a newly recognized entity
-    changes its parent's input whatever its summary says.
+    changes its parent's input whatever its summary says. The bound holds for the tree as it
+    stands now: leaves read their source from disk when summarized, so a file saved between
+    this plan and the real pass can add the entities it touches.
     """
     saved = [(n, n.summary, n.summary_input_hash, n.summary_prompt_version) for n in nodes]
     counter = _CountingLLM(placeholder_chars)

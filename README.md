@@ -350,8 +350,10 @@ never moved. A price per changed file cannot see that, so every gated run also p
 **summary plan**: the summarization pass itself, run against a counting stand-in for the LLM
 right after the parse, which yields exactly which summaries would be regenerated and the prompts
 they would send. That price plus the code chunks is held against the cap; a refusal says how many
-summaries it counted and leaves the graph untouched. The plan adds about a second per 10k
-entities to a run. `--dry-run` prices files by size and does not count it.
+summaries it counted and leaves the graph untouched. The plan is exact for the tree as it
+stands when it runs: summaries read source from disk, so a file saved while a long run is
+still summarizing can add the few entities it touches on top. The plan adds about a second
+per 10k entities to a run. `--dry-run` prices files by size and does not count it.
 
 ### Narrowing a scope: `prune`
 

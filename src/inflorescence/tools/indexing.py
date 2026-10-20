@@ -111,7 +111,9 @@ Args:
         run — which includes every file a widened extension set newly admits. Every run is
         then priced again after its parse, before any write or LLM request, over the exact
         summaries it will regenerate (entities an upgraded parser newly recognizes in
-        unchanged files included); the error says how many it counted.
+        unchanged files included), counted on the tree as it stands then — a file saved
+        while the run is still summarizing can add the entities it touches; the error says
+        how many it counted.
     force_rebuild: Re-parse and re-resolve the whole project even when no file changed —
         needed to pick up indexer upgrades (e.g. new CALLS resolution / node properties)
         on an unchanged project, which the checksum-based incremental path would skip.
