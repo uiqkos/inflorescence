@@ -485,6 +485,7 @@ class RecordingRepository:
         self.upserted_nodes = []
         self.upserted_edges = []
         self.checksums: set[str] = set()
+        self.checksum_values: dict[str, str] = {}
         self.deleted_node_ids: list[str] = []
         self.deleted_code_edges = 0
         self.deleted_edge_keys: list[dict] = []
@@ -531,6 +532,7 @@ class RecordingRepository:
         self.calls.append("update_checksums")
         for item in items:
             self.checksums.add(item["node_id"])
+            self.checksum_values[item["node_id"]] = item["checksum"]
         return len(items)
 
     async def get_stored_summaries(self, project: str) -> dict[str, dict[str, object]]:
@@ -1789,6 +1791,49 @@ async def test_update_skips_stored_structural_edges_but_always_remerges_calls(tm
     repo.upserted_edges = []
     await builder.update("fixture", tmp_path)
     assert {(e.source, e.edge_type.value.upper(), e.target) for e in repo.upserted_edges} == calls
+
+
+@pytest.mark.asyncio
+async def test_a_file_edited_mid_run_is_seen_as_changed_by_the_next_run(tmp_path: Path) -> None:
+    """INV-3: the stored checksum may lag the stored rows, never lead them.
+
+    Field case: a rebase landed while a watcher flush was summarizing. The run had parsed (or,
+    for a file its scan called unchanged, skipped writing) the old content, then re-read every
+    checksum from disk at its end — so the new bytes were vouched for by the store, every later
+    scan found the file "unchanged", and the old rows were served for good.
+    """
+    _two_file_project(tmp_path)
+    facts, edge_keys, node_ids = await _seed_store(tmp_path)
+    old_a = FileChecksum.compute(tmp_path / "a.py", tmp_path).md5
+    checksums = {"a.py": old_a, "b.py": "stale"}
+    repo = RebuildRepository(checksums, node_ids=node_ids)
+    repo.stored_call_facts = facts
+    repo.stored_edges = edge_keys
+    builder = GraphBuilder(repo=repo, llm=None, config=_INCREMENTAL_CONFIG)
+
+    parse = builder._parse_single_file
+    parsed: list[str] = []
+
+    async def parse_then_edit(f: Path, root: Path):  # type: ignore[no-untyped-def]
+        result = await parse(f, root)
+        parsed.append(f.name)
+        if len(parsed) == 2:  # both files are parsed: the edits land after the parse
+            (tmp_path / "a.py").write_text("import b\n\ndef call():\n    return b.target() + 1\n", encoding="utf-8")
+            (tmp_path / "b.py").write_text("def target():\n    return 3\n", encoding="utf-8")
+        return result
+
+    builder._parse_single_file = parse_then_edit  # type: ignore[method-assign]
+    await builder.update("fixture", tmp_path)
+
+    # a.py was unchanged at scan time and its rows were not written: its checksum stays put.
+    assert "a.py" not in repo.checksum_values
+    # b.py was written from the bytes parsed before the edit, and is stamped with those.
+    assert repo.checksum_values["b.py"] != FileChecksum.compute(tmp_path / "b.py", tmp_path).md5
+
+    checksums.update(repo.checksum_values)
+    builder._parse_single_file = parse  # type: ignore[method-assign]
+    result = await builder.update("fixture", tmp_path)
+    assert result.changed_files == {"a.py", "b.py"}, "a mid-run edit must not be laundered into 'unchanged'"
 
 
 @pytest.mark.asyncio

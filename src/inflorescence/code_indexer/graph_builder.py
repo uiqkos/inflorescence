@@ -438,6 +438,14 @@ class GraphBuilder:
             root, include_patterns=include_patterns, exclude_patterns=exclude_patterns
         )
         logger.info("Scanned %d files for project=%s", len(files), project)
+        # Checksums are taken BEFORE the parse, never after the run: the stored checksum is the
+        # claim "the graph reflects these bytes", so it may only be older than what was parsed,
+        # never newer. Read at the end — minutes later, after summarization — a file edited
+        # mid-run (a rebase landing during a flush) got its new checksum stamped over nodes
+        # parsed from, or skipped as, its old content; every later scan then saw it as
+        # unchanged and the stale rows were served for good (INV-3). Taken here, such a file
+        # merely looks changed on the next run, which re-processes it.
+        snapshot = [(f, ck) for f in files if (ck := FileChecksum.try_compute(f, root)) is not None]
 
         all_nodes: list[CodeNode] = []
         all_edges: list[Edge] = []
@@ -603,13 +611,15 @@ class GraphBuilder:
             logger.info("Skipping LLM summarization")
             dirty_summary_ids = {n.id for n in all_nodes}
 
-        # Update checksums (batched). A file that turned unreadable since the scan is
-        # skipped rather than crashing the run — its checksum stays as-is, so the next run
-        # sees a mismatch and re-processes it (self-healing, INV-3).
+        # Update checksums (batched) from the pre-parse snapshot. A file unreadable at snapshot
+        # time is skipped rather than crashing the run — its checksum stays as-is, so the next
+        # run sees a mismatch and re-processes it (self-healing, INV-3). A file the incremental
+        # path proved unchanged keeps the checksum it already has: its rows were not written,
+        # so stamping whatever is on disk now would vouch for bytes nobody stored.
         checksum_items = [
-            {"node_id": str(f.relative_to(root)), "checksum": ck.md5}
-            for f in files
-            if (ck := FileChecksum.try_compute(f, root)) is not None
+            {"node_id": rel, "checksum": ck.md5}
+            for f, ck in snapshot
+            if (rel := str(f.relative_to(root))) not in (unchanged_files or ())
         ]
         await self._repo.update_checksums(project, checksum_items)
 
