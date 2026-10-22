@@ -1204,13 +1204,23 @@ def write_env_file(path: Path, api_key: str) -> None:
 
 
 def resolve_console_script(name: str = "inflorescence") -> str:
-    """Absolute path to the installed console script (for a PATH-independent MCP config)."""
+    """Absolute path to the console script of the install running this command.
+
+    The running install comes first: ``init`` and ``watch install`` must register the copy
+    the user just installed and ran. PATH can hold another one — an older pip install in a
+    different interpreter — and registering that would serve every session from code the
+    user never asked for. The interpreter path is taken unresolved: a venv's ``python`` is a
+    symlink into the shared uv/pyenv install, whose ``bin`` has no such script.
+    """
+    invoked = Path(sys.argv[0])
+    if invoked.name == name and invoked.is_file():
+        return str(invoked.resolve())
+    candidate = Path(sys.executable).parent / name
+    if candidate.is_file():
+        return str(candidate.resolve())
     found = shutil.which(name)
     if found:
         return str(Path(found).resolve())
-    candidate = Path(sys.executable).resolve().parent / name
-    if candidate.exists():
-        return str(candidate)
     return name  # last resort: bare name, resolved via the client's PATH
 
 
@@ -1228,8 +1238,10 @@ def render_mcp_config_json(command: str, *, api_key: str | None = None) -> str:
 
 
 def build_claude_mcp_add_command(command: str, *, name: str = "inflorescence") -> list[str]:
-    # `claude mcp add <name> -- <command> serve`; `--` guards against flag ambiguity.
-    return ["claude", "mcp", "add", name, "--", command, "serve"]
+    # `--scope user`: Claude Code's default scope is "local" — the directory `init` happened
+    # to run in — which left the server invisible in every project the user then opened.
+    # `--` guards against flag ambiguity.
+    return ["claude", "mcp", "add", "--scope", "user", name, "--", command, "serve"]
 
 
 def _compose_file_present(cwd: Path) -> bool:
@@ -1363,7 +1375,14 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if shutil.which("claude"):
         add_cmd = build_claude_mcp_add_command(command)
         print("Registering MCP server with Claude Code:\n  " + " ".join(add_cmd))
-        subprocess.run(add_cmd, check=False)
+        if subprocess.run(add_cmd, check=False).returncode != 0:
+            # The usual cause is a re-run: a server of that name is already registered, and
+            # it may point at another install. Say so instead of implying this one is in use.
+            print(
+                "  Claude Code kept its existing registration (see the message above). To point "
+                f"it at this install ({command}):\n"
+                "  claude mcp remove --scope user inflorescence && inflorescence init"
+            )
     else:
         print(
             "Claude Code CLI not found. Add this to your Claude Desktop MCP config:\n"

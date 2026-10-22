@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from pathlib import Path
 
 
@@ -362,17 +363,53 @@ def test_write_env_file_writes_key(tmp_path) -> None:
     assert "OPENROUTER_API_KEY=sk-abc" in target.read_text()
 
 
-def test_resolve_console_script_returns_absolute_path(monkeypatch, tmp_path) -> None:
+def _script(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n")
+    return path
+
+
+def test_resolve_console_script_prefers_the_running_install_over_path(monkeypatch, tmp_path) -> None:
+    """Field case: a fresh `uv tool install` ran `init`, an older pip copy sat earlier on PATH,
+    and the PATH one was registered — every session would have served the old code."""
     from inflorescence import __main__ as m
 
-    fake = tmp_path / "bin" / "inflorescence"
-    fake.parent.mkdir(parents=True)
-    fake.write_text("#!/bin/sh\n")
-    monkeypatch.setattr(m.shutil, "which", lambda name: str(fake))
+    running = _script(tmp_path / "tool" / "bin" / "inflorescence")
+    stale = _script(tmp_path / "old" / "bin" / "inflorescence")
+    monkeypatch.setattr(m.sys, "argv", [str(running), "init"])
+    monkeypatch.setattr(m.shutil, "which", lambda name: str(stale))
 
     resolved = m.resolve_console_script()
-    assert resolved == str(fake.resolve())
+    assert resolved == str(running.resolve())
     assert Path(resolved).is_absolute()
+
+
+def test_resolve_console_script_uses_the_venv_bin_unresolved(monkeypatch, tmp_path) -> None:
+    """`python -m inflorescence`: argv[0] is not the script, so the interpreter's own bin is
+    next — taken as the venv path, since its `python` is a symlink into a shared install."""
+    from inflorescence import __main__ as m
+
+    shared = _script(tmp_path / "uv-python" / "bin" / "python3")
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").symlink_to(shared)
+    script = _script(venv_bin / "inflorescence")
+    monkeypatch.setattr(m.sys, "argv", ["-m"])
+    monkeypatch.setattr(m.sys, "executable", str(venv_bin / "python"))
+    monkeypatch.setattr(m.shutil, "which", lambda name: None)
+
+    assert m.resolve_console_script() == str(script.resolve())
+
+
+def test_resolve_console_script_falls_back_to_path(monkeypatch, tmp_path) -> None:
+    from inflorescence import __main__ as m
+
+    on_path = _script(tmp_path / "bin" / "inflorescence")
+    monkeypatch.setattr(m.sys, "argv", ["-m"])
+    monkeypatch.setattr(m.sys, "executable", str(tmp_path / "nowhere" / "python"))
+    monkeypatch.setattr(m.shutil, "which", lambda name: str(on_path))
+
+    assert m.resolve_console_script() == str(on_path.resolve())
 
 
 def test_build_mcp_config_uses_absolute_command_and_serve_args() -> None:
@@ -411,6 +448,9 @@ def test_build_claude_mcp_add_command_includes_absolute_path_and_serve() -> None
     assert cmd[:3] == ["claude", "mcp", "add"]
     assert "/abs/inflorescence" in cmd
     assert cmd[-1] == "serve"
+    # Claude Code's default "local" scope binds the server to the directory init ran in.
+    assert cmd[cmd.index("--scope") + 1] == "user"
+    assert cmd.index("--scope") < cmd.index("--")
 
 
 def _stub_memgraph(monkeypatch, started: bool = True) -> None:
@@ -469,13 +509,38 @@ def test_cmd_init_registers_via_claude_when_available(monkeypatch, tmp_path) -> 
     monkeypatch.setattr("builtins.input", lambda *a, **k: "")
     monkeypatch.setattr(m.shutil, "which", lambda name: f"/usr/bin/{name}")  # docker + claude present
     calls: list[list[str]] = []
-    monkeypatch.setattr(m.subprocess, "run", lambda cmd, *a, **k: calls.append(cmd))
+
+    def run(cmd, *a, **k):  # type: ignore[no-untyped-def]
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(m.subprocess, "run", run)
     monkeypatch.setattr(m, "_cmd_doctor", lambda settings: 0)
     _stub_memgraph(monkeypatch)
 
     m._cmd_init(argparse.Namespace(command="init"))
     # one of the subprocess calls must be the `claude mcp add ... serve` registration
     assert any(c[:3] == ["claude", "mcp", "add"] and c[-1] == "serve" for c in calls)
+
+
+def test_cmd_init_says_when_claude_kept_an_existing_registration(monkeypatch, tmp_path, capsys) -> None:
+    """A re-run: `claude mcp add` refuses a name it already has, and that registration may
+    point at another install — init must say so, not imply the new one is in use."""
+    from inflorescence import __main__ as m
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr(m.getpass, "getpass", lambda *a, **k: "sk-test")
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "")
+    monkeypatch.setattr(m.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(m.subprocess, "run", lambda cmd, *a, **k: subprocess.CompletedProcess(cmd, 1))
+    monkeypatch.setattr(m, "_cmd_doctor", lambda settings: 0)
+    _stub_memgraph(monkeypatch)
+
+    m._cmd_init(argparse.Namespace(command="init"))
+    out = capsys.readouterr().out
+    assert "kept its existing registration" in out
+    assert "claude mcp remove --scope user inflorescence" in out
 
 
 def test_settings_read_key_from_user_config_regardless_of_cwd(monkeypatch, tmp_path) -> None:

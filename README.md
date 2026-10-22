@@ -412,7 +412,9 @@ That is the whole installation. `init` walks through everything the server needs
 - pulls the **`memgraph-mage`** image (first run only, >1 GB — the vector indexes semantic
   search needs do not exist on a plain Memgraph build) and starts the `inflorescence-memgraph`
   container;
-- registers the MCP server with Claude Code, or prints the JSON block for any other client;
+- registers the MCP server with Claude Code for every project (user scope), pointing at the
+  install you just ran rather than whichever copy `PATH` finds first, or prints the JSON block
+  for any other client;
 - finishes by running `inflorescence doctor`.
 
 The only prerequisite installed by hand is [uv](https://docs.astral.sh/uv/) itself, plus Docker
@@ -449,10 +451,11 @@ inflorescence serve --allow-degraded   # start even if Memgraph is unreachable
 
 ### MCP client configuration
 
-`init` detects Claude Code and runs `claude mcp add` for you, or prints a ready-to-paste Claude
-Desktop snippet otherwise. `uv tool install` places the `inflorescence` script in uv's tool-bin
-directory, which may not be on your client's `PATH` — use the absolute path (`which
-inflorescence`):
+`init` detects Claude Code and runs `claude mcp add --scope user` for you, or prints a
+ready-to-paste Claude Desktop snippet otherwise. Re-running `init` keeps a registration that
+already exists and prints the command to replace it. `uv tool install` places the
+`inflorescence` script in uv's tool-bin directory, which may not be on your client's `PATH` —
+use the absolute path (`which inflorescence`):
 
 ```json
 {
