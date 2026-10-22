@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>inflorescence</title>
+<meta name="description" content="An MCP server that turns a repository into a code graph: parsed, summarized, embedded, kept live.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=Instrument+Serif:ital@1&family=Fraunces:ital,opsz,wght,SOFT,WONK@1,9..144,100..900,0..100,0..1&family=Doto:wght,ROND@100..900,0..100&family=Sixtyfour:BLED,SCAN@0..100,-53..100&family=Jacquarda+Bastarda+9&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23ff3aa8'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><filter id="melt" x="-10%" y="-25%" width="120%" height="150%">
+  <feTurbulence id="meltturb" type="fractalNoise" baseFrequency="0.006 0.02" numOctaves="2" seed="7" result="n"/>
+  <feDisplacementMap id="meltmap" in="SourceGraphic" in2="n" scale="0" xChannelSelector="R" yChannelSelector="G"/>
+</filter></svg>
+<section class="hero" id="s0">
+  <canvas id="hero-canvas"></canvas>
+  <div class="boxes" id="boxes"></div>
+  <div class="strip">
+    <span>#FF3AA8 CALLS</span><span>#8B7BFF IMPORTS</span><span>#E6FF3D INHERITS</span><span>#EBE8E1 CONTAINS</span><span>#000000 HAS_CHUNK</span>
+  </div>
+  <div class="title">
+    <h1 id="h1">inflorescence</h1>
+    <p class="sub">MCP server. Your repository as a graph: parsed, summarized, embedded, kept live.</p>
+  </div>
+  <div class="corner">
+    <a href="https://github.com/uiqkos/inflorescence">github ↗</a> · <a href="./">the walk ↗</a><br>
+    <span style="opacity:.6">MIT · Memgraph · OpenRouter</span>
+  </div>
+</section>
+
+<section class="paper fig" id="s1">
+  <header class="fig-head">
+    <div class="fig-num"><small>PARSE</small>FIG. 01</div>
+    <div class="fig-meta" id="fig1-meta">src/inflorescence/code_indexer/graph_builder.py</div>
+  </header>
+  <div class="stage" id="morph-stage"></div>
+  <p class="fig-cap">One file, read the way the server reads it. Import lines become <b>IMPORTS</b> edges to the symbols they name, definitions become nodes, the file becomes a module. Click to replay.</p>
+</section>
+
+<section class="fig dark" id="s2">
+  <header class="fig-head">
+    <div class="fig-num"><small>GRAPH</small>FIG. 02</div>
+    <div class="fig-meta" id="fig2-meta"></div>
+  </header>
+  <div class="stage" id="radial-stage"></div>
+  <div class="row legend" id="legend"></div>
+  <div class="row chips" id="chips"></div>
+  <p class="fig-cap">This repository, as the server holds it. Hover a node to trace <span style="color:var(--pink)">who calls it</span> and <span style="color:var(--blue)">what it calls</span>. Pick a question to watch a search land on the ring.</p>
+</section>
+
+<section class="fig dark" id="s3">
+  <header class="fig-head">
+    <div class="fig-num"><small>SUMMARY</small>FIG. 03</div>
+    <div class="fig-meta">one summary per node · written once · embedded for search by meaning</div>
+  </header>
+  <div class="flower-row">
+    <canvas id="flower"></canvas>
+    <ul class="entity-list" id="entities"></ul>
+  </div>
+  <p class="fig-cap">What the graph knows about a node, in its own words. Unchanged code keeps its summary; an edit re-summarizes only the path from that file to the root.</p>
+</section>
+
+<section class="install" id="s4">
+  <canvas id="install-canvas"></canvas>
+  <div class="label">— INSTALL</div>
+  <div class="inset">
+    <pre><span>$</span> <b>uv tool install</b> git+https://github.com/uiqkos/inflorescence
+<span>$</span> <b>inflorescence init</b></pre>
+    <p>Needs uv, Docker and an OpenRouter key. <code>init</code> starts Memgraph, registers the MCP server with Claude Code, and runs <code>doctor</code>.</p>
+  </div>
+</section>
+
+<footer id="s5">
+  <canvas id="end-canvas"></canvas>
+  <div class="foot">
+    <div class="tools" id="tools"></div>
+    <div class="r">
+      <a href="https://github.com/uiqkos/inflorescence">github.com/uiqkos/inflorescence</a><br>
+      <span style="opacity:.6">MIT license</span>
+    </div>
+  </div>
+</footer>
+
+<div class="pager" id="pager">00</div>
+
+<script src="data/graph.js"></script>
+<script src="data/src.js"></script>
+<script src="js/dirt.js"></script>
+<script src="js/typelab.js"></script>
+<script src="js/morph.js"></script>
+<script src="js/radial.js"></script>
+<script src="js/wordflower.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>

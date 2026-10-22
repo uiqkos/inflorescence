@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>inflorescence — the walk</title>
+<meta name="description" content="The inflorescence repository as the server holds it: every page of this site is a node of the graph, every step between pages a real edge.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&family=Instrument+Serif:ital@1&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="walk.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='7' fill='%23ff3aa8'/%3E%3C/svg%3E">
+</head>
+<body class="walk">
+
+<div class="spacer" id="spacer"></div>
+
+<div class="graph" id="graph"></div>
+<div class="markers" id="markers"></div>
+
+<div class="strip">
+  <span>#FF3AA8 CALLS</span><span>#8B7BFF IMPORTS</span><span>#E6FF3D INHERITS</span><span>#EBE8E1 CONTAINS</span><span>#000000 HAS_CHUNK</span>
+</div>
+
+<div class="hero-ov" id="hero">
+  <div class="title">
+    <h1 id="h1">inflorescence</h1>
+    <p class="sub">MCP server. Your repository as a graph: parsed, summarized, embedded, kept live.</p>
+    <p class="sub dim" id="hero-counts"></p>
+  </div>
+</div>
+<div class="corner" id="corner">
+  <a href="https://github.com/uiqkos/inflorescence">github ↗</a> · <a href="plates.html">plates ↗</a><br>
+  <span style="opacity:.6">MIT · Memgraph · OpenRouter</span>
+</div>
+<div class="hint" id="hint">scroll ↓ walks the graph · drag pans · hover a node · click pins it</div>
+
+<!-- ============ 01 PARSE ============ -->
+<aside class="sheet paper" id="ch1" hidden>
+  <header class="fig-head">
+    <div class="fig-num"><small>PARSE</small>FIG. 01</div>
+    <div class="fig-meta" id="fig1-meta"></div>
+  </header>
+  <div class="stage" id="morph-stage"></div>
+  <p class="fig-cap">One file, read the way the server reads it. Import lines become <b>IMPORTS</b> edges to the symbols they name, definitions become nodes, the file becomes a module.</p>
+  <p class="fig-hint">Click the figure to replay.</p>
+  <div class="anchor" id="anchor1"></div>
+  <div class="route" id="route1"></div>
+</aside>
+
+<!-- ============ 02 GRAPH ============ -->
+<aside class="sheet" id="ch2" hidden>
+  <header class="fig-head">
+    <div class="fig-num"><small>GRAPH</small>FIG. 02</div>
+    <div class="fig-meta" id="fig2-meta"></div>
+  </header>
+  <div class="row legend" id="legend"></div>
+  <p class="fig-cap">Nesting is <b>CONTAINS</b>: a method inside its class, a class inside its file, a file inside its directory. The curves are <span style="color:var(--pink)">CALLS</span>, <span style="color:var(--violet)">IMPORTS</span> and <span style="color:var(--acid)">INHERITS</span>, bundled through the discs they cross.</p>
+  <p class="fig-hint">Hover any node to trace <span style="color:var(--pink)">who calls it</span> and <span style="color:var(--blue)">what it calls</span>. Click a legend entry to hide that edge type.</p>
+  <div class="anchor" id="anchor2"></div>
+  <div class="route" id="route2"></div>
+</aside>
+
+<!-- ============ 03 SUMMARY ============ -->
+<aside class="sheet" id="ch3" hidden>
+  <header class="fig-head">
+    <div class="fig-num"><small>SUMMARY</small>FIG. 03</div>
+    <div class="fig-meta">one summary per node · written once · embedded for search by meaning</div>
+  </header>
+  <div class="flower-row">
+    <canvas id="flower"></canvas>
+    <ul class="entity-list" id="entities"></ul>
+  </div>
+  <p class="fig-cap">What the graph knows about a node, in its own words. Unchanged code keeps its summary; an edit re-summarizes only the path from that file to the root.</p>
+  <p class="fig-hint">Click any node on the graph to typeset its summary.</p>
+  <div class="anchor" id="anchor3"></div>
+  <div class="route" id="route3"></div>
+</aside>
+
+<!-- ============ 04 SEARCH ============ -->
+<aside class="sheet" id="ch4" hidden>
+  <header class="fig-head">
+    <div class="fig-num"><small>SEARCH</small>FIG. 04</div>
+    <div class="fig-meta">search_semantic · search_text · search_entities · search_code · search_hybrid</div>
+  </header>
+  <div class="row chips" id="chips"></div>
+  <p class="fig-cap">Three questions the server answered on 2026-09-10, replayed here: the hits land on the graph in rank order. Hits the server itself marked <em>weak</em> are dashed.</p>
+  <p class="fig-hint">The fourth question is structural and is computed from the export on this page.</p>
+  <div class="anchor" id="anchor4"></div>
+  <div class="route" id="route4"></div>
+</aside>
+
+<!-- ============ 05 WATCH ============ -->
+<aside class="sheet" id="ch5" hidden>
+  <header class="fig-head">
+    <div class="fig-num"><small>WATCH</small>FIG. 05</div>
+    <div class="fig-meta">watcher.py · debounced · re-indexes only what changed</div>
+  </header>
+  <p class="fig-cap">A file changes on disk; the watcher lets the burst settle, re-parses that one file and rewrites its summary and the summaries on its path to the root. Nothing else is touched.</p>
+  <p class="fig-hint">On the graph: a file flashes <span style="color:var(--acid)">changed</span>, then each disc above it flashes <b>summary ↻</b>. The files are picked at random; the path is real.</p>
+  <div class="anchor" id="anchor5"></div>
+  <div class="route" id="route5"></div>
+</aside>
+
+<!-- ============ 06 COST ============ -->
+<aside class="sheet" id="ch6" hidden>
+  <header class="fig-head">
+    <div class="fig-num"><small>COST</small>FIG. 06</div>
+    <div class="fig-meta">index_directory(preview=true) · no DB writes · no LLM calls</div>
+  </header>
+  <table class="ledger">
+    <tr><td>directory</td><td>this repository</td></tr>
+    <tr><td>files</td><td>189</td></tr>
+    <tr><td>bytes</td><td>2 333 263</td></tr>
+    <tr><td>languages</td><td>python 86 · typescript 68 · javascript 9 · markdown 9 · json 7 · yaml 4 · css 3 · html 2 · toml 1</td></tr>
+    <tr><td>estimated nodes</td><td>5 553</td></tr>
+    <tr><td>estimated tokens</td><td>583 315</td></tr>
+    <tr><td>skipped, too large</td><td>site/data/graph.js · site/data/graph.json</td></tr>
+    <tr class="sum"><td>estimated cost</td><td>$1.86</td></tr>
+  </table>
+  <p class="fig-cap">The answer the server gave for this repository on 2026-09-10, before anything was spent. A re-index pays only for the files that changed.</p>
+  <div class="anchor" id="anchor6"></div>
+  <div class="route" id="route6"></div>
+</aside>
+
+<!-- ============ 07 INSTALL ============ -->
+<aside class="sheet cyan" id="ch7" hidden>
+  <header class="fig-head">
+    <div class="fig-num"><small>INSTALL</small>FIG. 07</div>
+    <div class="fig-meta">uv · Docker · OpenRouter key</div>
+  </header>
+  <canvas class="plate" id="install-canvas"></canvas>
+  <pre class="cmd"><span>$</span> <b>uv tool install</b> git+https://github.com/uiqkos/inflorescence
+<span>$</span> <b>inflorescence init</b></pre>
+  <p class="fig-cap"><code>init</code> asks for the key, starts Memgraph, registers the MCP server with Claude Code and runs <code>doctor</code>. Nothing else to configure.</p>
+  <div class="anchor" id="anchor7"></div>
+  <div class="route" id="route7"></div>
+</aside>
+
+<!-- ============ 08 TOOLS ============ -->
+<aside class="sheet paper" id="ch8" hidden>
+  <header class="fig-head">
+    <div class="fig-num"><small>TOOLS</small>FIG. 08</div>
+    <div class="fig-meta">13 MCP tools · stdio · one server per machine</div>
+  </header>
+  <canvas class="plate" id="end-canvas"></canvas>
+  <div class="tools" id="tools"></div>
+  <p class="fig-cap">The catalogue card. Every tool answers from the graph on this page; a call that finds nothing says so instead of returning an empty list.</p>
+  <div class="anchor" id="anchor8"></div>
+  <div class="route" id="route8"></div>
+  <p class="foot-links"><a href="https://github.com/uiqkos/inflorescence">github.com/uiqkos/inflorescence</a> · <a href="plates.html">the plates</a> · <span style="opacity:.6">MIT license</span></p>
+</aside>
+
+<div class="pager" id="pager">00 / 08</div>
+
+<script src="data/graph.js"></script>
+<script src="data/src.js"></script>
+<script src="js/dirt.js"></script>
+<script src="js/morph.js"></script>
+<script src="js/wordflower.js"></script>
+<script src="js/pack.js"></script>
+<script src="js/walk.js"></script>
+</body>
+</html>

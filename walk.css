@@ -1,0 +1,134 @@
+/* walk.css — the graph is the page. Builds on style.css: same two fonts, same palette, same lab-protocol furniture. */
+body.walk{overflow-x:hidden;background:var(--bg);transition:background .8s}
+body.walk.paper{background:var(--paper);color:var(--paper-ink)}
+.spacer{width:1px;height:900vh;pointer-events:none}
+
+/* the graph, full screen behind everything */
+.graph{position:fixed;inset:0;z-index:1;overflow:hidden}
+.graph canvas{position:absolute;top:0;left:0;cursor:default}
+.graph:after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:repeating-linear-gradient(0deg,rgba(0,0,0,.16) 0 1px,transparent 1px 3px);mix-blend-mode:multiply}
+.graph .note{z-index:3}
+.paper .graph .note{background:rgba(198,200,195,.9);border-color:rgba(17,17,17,.55);color:var(--paper-ink)}
+.paper .graph .note:before,.paper .graph .note:after{border-color:rgba(17,17,17,.8)}
+
+/* chapter markers on anchor nodes: numbered corner brackets with a label */
+.markers{position:fixed;inset:0;z-index:2;pointer-events:none}
+.mk{position:absolute;width:22px;height:22px;margin:-11px 0 0 -11px;border:1px solid rgba(235,232,225,.75);opacity:0;transition:opacity .35s;cursor:pointer;pointer-events:none}
+.mk:before,.mk:after{content:"";position:absolute;width:7px;height:7px;border:1px solid rgba(235,232,225,.95);background:var(--bg)}
+.mk:before{left:-4px;top:-4px}
+.mk:after{right:-4px;bottom:-4px}
+.mk.on{opacity:1;pointer-events:auto}
+.mk.cur{border-color:var(--pink)}
+.mkl{position:absolute;transform:translateY(-55%);font-size:10px;letter-spacing:.08em;white-space:nowrap;color:rgba(235,232,225,.92);background:var(--bg);padding:1px 5px 1px 4px;
+  opacity:0;pointer-events:none;cursor:pointer;transition:opacity .35s}
+.mkl b{font-weight:500;padding-right:6px}
+.mkl.flip{transform:translate(-100%,-55%)}
+.mkl.on{pointer-events:auto}
+.mkl.cur{color:var(--pink)}
+.mkl:hover{color:var(--pink)}
+.leaders{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.leaders line{stroke:rgba(235,232,225,.7);stroke-width:1;stroke-dasharray:3 3}
+.paper .mk{border-color:rgba(17,17,17,.75)}
+.paper .mk:before,.paper .mk:after{border-color:rgba(17,17,17,.9);background:var(--paper)}
+.paper .mkl{color:rgba(17,17,17,.92);background:var(--paper)}
+.paper .mk.cur{border-color:var(--pink)} .paper .mkl.cur{color:var(--pink)}
+.paper .leaders line{stroke:rgba(17,17,17,.6)}
+
+/* hero overlay (00) */
+.strip{position:fixed;z-index:5;transition:color .8s}
+.paper .strip{color:rgba(17,17,17,.75)}
+.hero-ov{position:fixed;inset:0;z-index:3;pointer-events:none;transition:opacity .3s}
+.hero-ov .title{pointer-events:none}
+.hero-ov .title .sub{pointer-events:auto}
+.hero-ov .sub.dim{opacity:.6;margin-top:8px;max-width:60ch}
+.corner{position:fixed;z-index:5;transition:color .8s}
+.corner a{border:0}
+.paper .corner{color:var(--paper-ink)}
+.hint{position:fixed;left:22px;top:38px;z-index:5;font-size:10px;letter-spacing:.06em;opacity:.55;transition:opacity .4s,color .8s;pointer-events:none}
+.paper .hint{color:var(--paper-ink)}
+
+/* sheets: one per chapter, pinned to the right, the graph keeps the rest of the screen */
+.sheet{position:fixed;top:0;right:0;bottom:0;width:min(560px,46vw);z-index:4;padding:26px 22px 30px;overflow-y:auto;
+  background:var(--bg);color:var(--ink);border-left:1px solid rgba(235,232,225,.18);opacity:0;transform:translateX(18px);will-change:opacity,transform}
+.sheet.paper{background:var(--paper);color:var(--paper-ink);border-left-color:rgba(17,17,17,.25)}
+.sheet.paper a{border-bottom-color:rgba(17,17,17,.35)}
+.sheet.cyan{background:#06082a;color:#dfe6ff;border-left-color:rgba(223,230,255,.2)}
+.sheet .fig-head{align-items:flex-start}
+.sheet .fig-num{font-size:clamp(30px,3.4vw,44px)}
+.sheet .fig-meta{max-width:30ch}
+.sheet .stage{margin-top:16px}
+#morph-stage{height:clamp(360px,54vh,600px);cursor:pointer}
+.sheet .fig-cap{margin-top:18px}
+.fig-hint{max-width:58ch;font-size:10.5px;letter-spacing:.02em;opacity:.6;margin:8px 0 0}
+.fig-hint b{font-weight:500}
+.sheet .row.legend{margin-top:22px}
+.sheet .chips{margin-top:18px}
+.sheet .flower-row{flex-direction:column;gap:14px;margin-top:14px}
+.sheet #flower{width:100%;aspect-ratio:1}
+.sheet .entity-list{flex:none;width:100%;max-width:none;font-size:10.5px;columns:2;column-gap:18px}
+.sheet .entity-list li{break-inside:avoid;padding:6px 0}
+.sheet .entity-list li:last-child{border-bottom:0}
+
+/* the real node behind the page */
+.anchor{margin-top:22px;padding:12px 12px 10px;border:1px solid rgba(235,232,225,.35);position:relative;font-size:11px;line-height:1.5}
+.anchor:before,.anchor:after{content:"";position:absolute;width:7px;height:7px;border:1px solid currentColor}
+.anchor:before{left:-1px;top:-1px;border-right:0;border-bottom:0}
+.anchor:after{right:-1px;bottom:-1px;border-left:0;border-top:0}
+.anchor .k{font-size:9.5px;letter-spacing:.1em;opacity:.55;margin-bottom:6px}
+.anchor .n{font-weight:500;font-size:12px;word-break:break-all}
+.anchor .t{opacity:.6;font-size:10px;letter-spacing:.06em;margin:2px 0 6px;word-break:break-all}
+.anchor .s{opacity:.9}
+.anchor .d{margin-top:6px;font-size:10px;letter-spacing:.04em}
+.anchor .d i{font-style:normal;padding-right:10px}
+.anchor .d .in{color:var(--pink)} .anchor .d .out{color:var(--blue)}
+.paper .anchor,.sheet.paper .anchor{border-color:rgba(17,17,17,.4)}
+.sheet.cyan .anchor{border-color:rgba(223,230,255,.35)}
+.sheet.cyan .anchor .d .out{color:#9db4ff}
+
+/* how the walk got here: the real edges between the previous anchor and this one */
+.route{margin-top:16px;font-size:10.5px;line-height:1.7;letter-spacing:.02em}
+.route small{display:block;font-size:9.5px;letter-spacing:.1em;opacity:.55;margin-bottom:4px}
+.route div{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.route em{font-style:normal;font-size:9.5px;letter-spacing:.08em;white-space:nowrap}
+.route span{word-break:break-all}
+.route .P{opacity:.7}
+
+/* 06 ledger */
+.ledger{border-collapse:collapse;width:100%;margin-top:20px;font-size:11px}
+.ledger td{padding:6px 0;border-top:1px solid rgba(235,232,225,.18);vertical-align:top}
+.ledger td:first-child{opacity:.6;letter-spacing:.06em;font-size:10px;width:38%;padding-right:12px}
+.ledger tr:last-child td{border-bottom:1px solid rgba(235,232,225,.18)}
+.ledger .sum td{font-weight:500;font-size:13px}
+.ledger .sum td:first-child{font-weight:400;font-size:10px}
+
+/* 07 / 08 plates inside the sheet */
+.plate{width:100%;height:clamp(200px,30vh,320px);margin-top:18px;display:block}
+.cmd{margin:18px 0 0;font:inherit;font-size:13px;line-height:1.7;white-space:pre-wrap;word-break:break-all}
+.cmd b{color:#fff;font-weight:500}
+.cmd span{opacity:.45}
+.sheet.cyan .fig-cap{opacity:.8}
+.sheet.cyan code{color:#fff}
+.sheet .tools{margin-top:16px;font-size:10.5px;letter-spacing:.04em;line-height:1.9;display:flex;flex-wrap:wrap;gap:0 14px;opacity:.9}
+.sheet .tools span{white-space:nowrap}
+.sheet .tools em{flex-basis:100%;font-style:normal;opacity:.6}
+.foot-links{margin:22px 0 0;font-size:10.5px;letter-spacing:.04em;line-height:1.8}
+
+/* pager, as on the plates page */
+.pager{transition:opacity .3s}
+
+@media (max-width:720px){
+  .sheet{top:auto;left:0;right:0;bottom:0;width:100%;height:56vh;border-left:0;border-top:1px solid rgba(235,232,225,.18);padding:18px 16px 24px;transform:translateY(18px)}
+  .sheet .fig-num{font-size:28px}
+  #morph-stage{height:44vh}
+  .sheet #flower{width:min(220px,100%)}
+  .hero-ov .title{bottom:20px}
+  .corner{top:36px;right:16px;bottom:auto;left:auto;line-height:1.6}
+  .hero-ov .title h1{font-size:clamp(56px,17vw,120px)}
+  .hint{display:none}
+  .mkl{display:none}
+  .leaders{display:none}
+  .strip span:nth-child(n+4){display:none}
+  .spacer{height:900vh}
+}
+@media (prefers-reduced-motion:reduce){ .sheet{transition:none} }
